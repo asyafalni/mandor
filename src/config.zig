@@ -19,10 +19,13 @@ pub const FileConfig = struct {
     health_n: u8 = 0,
     health_interval_ms: ?u64 = null,
     restart_on_unhealthy: ?bool = null,
+    /// "dependent=dependency" worker-name pairs.
+    start_after: [cli.max_workers]cli.HealthSpec = undefined,
+    start_after_n: u8 = 0,
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health };
+const ArrayTarget = enum { none, workers, health, start_after };
 
 pub const ParseError = error{ Syntax, BadValue, TooManyWorkers };
 
@@ -97,8 +100,12 @@ pub fn parse(
                 false
             else
                 return error.BadValue;
-        } else if (std.mem.eql(u8, key, "workers") or std.mem.eql(u8, key, "health")) {
-            const this_target: ArrayTarget = if (key[0] == 'w') .workers else .health;
+        } else if (std.mem.eql(u8, key, "workers") or std.mem.eql(u8, key, "health") or
+            std.mem.eql(u8, key, "start_after"))
+        {
+            const this_target: ArrayTarget = if (key[0] == 'w')
+                .workers
+            else if (key[0] == 'h') .health else .start_after;
             if (value.len == 0 or value[0] != '[') return error.BadValue;
             var rest = std.mem.trim(u8, value[1..], " \t");
             const closed = std.mem.endsWith(u8, rest, "]");
@@ -139,6 +146,13 @@ fn appendItem(
             if (cfg.health_n == cli.max_health) return error.BadValue;
             cfg.health[cfg.health_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
             cfg.health_n += 1;
+        },
+        .start_after => {
+            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
+            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
+            if (cfg.start_after_n == cli.max_workers) return error.BadValue;
+            cfg.start_after[cfg.start_after_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
+            cfg.start_after_n += 1;
         },
         .none => unreachable, // callers always pass a real target
     }
@@ -196,6 +210,15 @@ test "health, ready_fd and restart_on_unhealthy keys" {
     try t.expectEqual(@as(u8, 1), cfg.health_n);
     try t.expectEqualStrings("api", cfg.health[0].worker);
     try t.expectEqualStrings("/bin/check --fast", cfg.health[0].cmd);
+}
+
+test "start_after key" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const cfg = try parse("start_after = [\"worker=api\", \"cron=worker\"]", &storage);
+    try t.expectEqual(@as(u8, 2), cfg.start_after_n);
+    try t.expectEqualStrings("worker", cfg.start_after[0].worker);
+    try t.expectEqualStrings("api", cfg.start_after[0].cmd);
+    try t.expectError(error.BadValue, parse("start_after = [\"nodeps\"]", &storage));
 }
 
 test "stop_grace and expected_exit keys" {

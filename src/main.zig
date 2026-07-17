@@ -113,6 +113,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 cfg.health = file_cfg.health;
                 cfg.health_n = file_cfg.health_n;
             }
+            cfg.start_after = file_cfg.start_after;
+            cfg.start_after_n = file_cfg.start_after_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {

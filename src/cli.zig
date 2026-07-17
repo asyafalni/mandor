@@ -37,6 +37,9 @@ pub const Config = struct {
     health_interval_ms: u64 = 30_000,
     health_interval_set: bool = false,
     restart_on_unhealthy: bool = false,
+    /// "dependent=dependency" ordering pairs (TOML-only; no CLI flag).
+    start_after: [max_workers]HealthSpec = undefined,
+    start_after_n: u8 = 0,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,

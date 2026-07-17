@@ -235,6 +235,22 @@ if grep -q "2 incident(s)" "$TMP/20" && grep -q "exit:3" "$TMP/20" && grep -q "s
 else bad "incident history recall" "$(cat "$TMP/20" | head -5)"; fi
 unset MANDOR_STATE_DIR
 
+# 21. start_after defers the dependent until the dependency is up
+cat > "$TMP/order.toml" <<'TOML'
+workers = [
+  "bash -c 'sleep 2'",
+  "sh -c 'echo B-run; sleep 1'",
+]
+start_after = ["sh=bash"]
+TOML
+timeout 15 "$MANDOR" --config="$TMP/order.toml" >"$TMP/21" 2>&1
+c=$?
+waits=$(grep -n "sh waits for bash" "$TMP/21" | head -1 | cut -d: -f1)
+spawn_b=$(grep -n "spawned sh" "$TMP/21" | head -1 | cut -d: -f1)
+if [ $c -eq 0 ] && [ -n "$waits" ] && [ -n "$spawn_b" ] && [ "$spawn_b" -gt "$waits" ]; then
+  ok "start_after defers dependent start"
+else bad "start_after ordering" "exit $c: $(head -6 "$TMP/21")"; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

@@ -66,6 +66,34 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
 
     incident.initSnapshot(environ);
 
+    // start-after ordering: dep_of[i] = worker index i must wait for.
+    var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
+    var waiting: [cli.max_workers]bool = .{false} ** cli.max_workers;
+    for (cfg.start_after[0..cfg.start_after_n]) |pair| {
+        var dependent: ?usize = null;
+        var dependency: ?usize = null;
+        for (workers, 0..) |*w, i| {
+            if (std.mem.eql(u8, w.nameSlice(), pair.worker)) dependent = i;
+            if (std.mem.eql(u8, w.nameSlice(), pair.cmd)) dependency = i;
+        }
+        if (dependent == null or dependency == null or dependent.? == dependency.?) {
+            std.debug.print("[mandor] start_after: bad pair {s}={s}\n", .{ pair.worker, pair.cmd });
+            return 2;
+        }
+        dep_of[dependent.?] = @intCast(dependency.?);
+    }
+    for (0..workers.len) |start_i| {
+        var cur = dep_of[start_i];
+        var steps: usize = 0;
+        while (cur) |c| : (steps += 1) {
+            if (steps > workers.len) {
+                std.debug.print("[mandor] start_after: dependency cycle\n", .{});
+                return 2;
+            }
+            cur = dep_of[c];
+        }
+    }
+
     var shutting_down = false;
     var kill_escalated = false;
     var shutdown_deadline_ms: u64 = 0;
@@ -81,16 +109,27 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         break :blk srv;
     } else null;
 
-    for (workers) |*w| spawnWorker(w, envp, path_env, cfg.ready_fd);
+    for (workers, 0..) |*w, i| {
+        if (dep_of[i] != null) {
+            waiting[i] = true;
+            std.debug.print("[mandor] {s} waits for {s}\n", .{
+                w.nameSlice(), workers[dep_of[i].?].nameSlice(),
+            });
+        } else {
+            spawnWorker(w, envp, path_env, cfg.ready_fd);
+        }
+    }
     report.writeState(state_dir, workers, nowMs());
 
     while (true) {
         var live: usize = 0;
         var pending: usize = 0;
         var next_deadline: u64 = 0;
-        for (workers) |*w| {
+        for (workers, 0..) |*w, i| {
             if (w.pid != 0) {
                 live += 1;
+            } else if (waiting[i]) {
+                pending += 1;
             } else if (!w.done and w.next_restart_ms != 0) {
                 pending += 1;
                 if (next_deadline == 0 or w.next_restart_ms < next_deadline)
@@ -98,6 +137,25 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             }
         }
         if (live == 0 and (shutting_down or pending == 0)) break;
+
+        // Deferred starts: a dependency is "up" once ready (readiness fd) or
+        // simply alive for 1 s; a permanently-dead dependency unblocks its
+        // dependents rather than deadlocking them.
+        if (!shutting_down) {
+            const now_dep = nowMs();
+            for (workers, 0..) |*w, i| {
+                if (!waiting[i]) continue;
+                const dep = &workers[dep_of[i].?];
+                const up = dep.ready or (dep.pid > 0 and now_dep -| dep.last_start_ms >= 1000);
+                if (up or dep.done) {
+                    if (dep.done) std.debug.print("[mandor] {s} is gone; starting {s} anyway\n", .{
+                        dep.nameSlice(), w.nameSlice(),
+                    });
+                    waiting[i] = false;
+                    spawnWorker(w, envp, path_env, cfg.ready_fd);
+                }
+            }
+        }
 
         // Before computing the poll timeout so first probes schedule
         // immediately after a (re)spawn.
@@ -120,6 +178,16 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         if (shutting_down and !kill_escalated and shutdown_deadline_ms != 0 and
             shutdown_deadline_ms < wake_at)
             wake_at = shutdown_deadline_ms;
+        if (!shutting_down) {
+            for (0..workers.len) |i| {
+                if (!waiting[i]) continue;
+                const dep = &workers[dep_of[i].?];
+                if (dep.pid > 0) {
+                    const t = dep.last_start_ms + 1000;
+                    if (t < wake_at) wake_at = t;
+                }
+            }
+        }
         const now_for_timeout = nowMs();
         const timeout: i32 = if (wake_at <= now_for_timeout)
             0
@@ -179,8 +247,9 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 shutdown_deadline_ms = nowMs() + cfg.stop_grace_ms;
                 std.debug.print("[mandor] SIG{t} received, forwarding to workers\n", .{sig});
                 forwardAll(workers, sig);
-                for (workers) |*w| {
+                for (workers, 0..) |*w, i| {
                     w.next_restart_ms = 0;
+                    waiting[i] = false;
                     if (w.pid == 0) w.done = true;
                 }
             } else if (!kill_escalated) {
