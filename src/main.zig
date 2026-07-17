@@ -62,8 +62,39 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 0;
     }
 
+    const environ = init.environ.block.slice;
+    const spawner = @import("spawner.zig");
+    const state_dir = cfg.state_dir orelse
+        (spawner.findEnv(environ, "MANDOR_STATE_DIR") orelse cli.default_state_dir);
+
+    if (cfg.mode == .report) return runReport(state_dir, cfg.json);
+
     const supervisor = @import("supervisor.zig");
-    return supervisor.run(cfg, init.environ.block.slice);
+    return supervisor.run(cfg, state_dir, environ);
+}
+
+var report_read_buf: [256 * 1024]u8 = undefined;
+var report_out_buf: [64 * 1024]u8 = undefined;
+var report_arena_buf: [512 * 1024]u8 = undefined;
+
+fn runReport(state_dir: []const u8, json: bool) u8 {
+    const report = @import("report.zig");
+    const supervisor = @import("supervisor.zig");
+    const text = report.readState(state_dir, &report_read_buf) catch {
+        std.debug.print("[mandor] no state at {s}/state.json — is a supervisor running with this state dir?\n", .{state_dir});
+        return 1;
+    };
+    if (json) {
+        writeOut(text);
+        return 0;
+    }
+    var fba = std.heap.FixedBufferAllocator.init(&report_arena_buf);
+    const state = report.parseState(fba.allocator(), text) orelse {
+        std.debug.print("[mandor] state file is corrupt or from an incompatible version\n", .{});
+        return 1;
+    };
+    writeOut(report.formatHuman(&report_out_buf, state, supervisor.nowMs()));
+    return 0;
 }
 
 test {
@@ -76,5 +107,6 @@ test {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");
         _ = @import("reaper.zig");
+        _ = @import("report.zig");
     }
 }

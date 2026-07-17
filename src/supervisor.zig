@@ -13,6 +13,7 @@ const reaper = @import("reaper.zig");
 const capture = @import("capture.zig");
 const ring = @import("ring.zig");
 const sampler = @import("sampler.zig");
+const report = @import("report.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -24,7 +25,7 @@ pub fn nowMs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 
-pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
+pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
     const workers = workers_buf[0..cfg.commands.len];
     spawner.initWorkers(workers, cfg.commands) catch {
         std.debug.print("[mandor] invalid command line\n", .{});
@@ -114,8 +115,9 @@ pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
         if (ev.hup) forwardAll(workers, .HUP);
 
         if (ev.chld) {
-            _ = reaper.drain(workers);
+            const reaped = reaper.drain(workers).reaped_workers;
             const now = nowMs();
+            if (reaped > 0) report.writeState(state_dir, workers, now);
             for (workers) |*w| {
                 if (w.pid != 0 or w.done or w.next_restart_ms != 0) continue;
                 const clean = switch (w.status) {
@@ -154,8 +156,11 @@ pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
             for (workers) |*w| {
                 if (w.pid > 0) sampler.sample(&w.stats, w.pid, now_sample);
             }
+            report.writeState(state_dir, workers, now_sample);
         }
     }
+
+    report.writeState(state_dir, workers, nowMs());
 
     var worst: u8 = 0;
     for (workers) |*w| worst = @max(worst, w.final_code);

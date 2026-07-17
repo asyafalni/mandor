@@ -24,6 +24,7 @@ pub const Status = union(enum) {
 pub const Worker = struct {
     name: [name_cap]u8 = undefined,
     name_len: u8 = 0,
+    cmd: []const u8 = "", // original command string (argv memory, lives forever)
     cmd_buf: [4096]u8 = undefined,
     argv: [max_args + 1]?[*:0]const u8 = undefined, // null-terminated for execve
     argc: u8 = 0,
@@ -58,6 +59,7 @@ pub fn initWorkers(workers: []Worker, commands: []const []const u8) InitError!vo
     for (commands, 0..) |cmd, idx| {
         const w = &workers[idx];
         w.* = .{};
+        w.cmd = cmd;
         var toks: [max_args][]const u8 = undefined;
         const argv = cli.tokenize(cmd, &w.cmd_buf, &toks) catch return error.BadCommand;
         for (argv, 0..) |t, i| w.argv[i] = @ptrCast(t.ptr);
@@ -92,13 +94,22 @@ fn setName(w: *Worker, argv0: []const u8, prior: []const Worker) void {
     }
 }
 
-/// PATH value from the environ block, or a sane container default.
-pub fn findPath(environ: [:null]const ?[*:0]const u8) []const u8 {
+/// Look up NAME= in the environ block.
+pub fn findEnv(environ: [:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {
     for (environ) |maybe| {
         const entry = std.mem.span(maybe orelse continue);
-        if (std.mem.startsWith(u8, entry, "PATH=")) return entry[5..];
+        if (entry.len > name.len and entry[name.len] == '=' and
+            std.mem.startsWith(u8, entry, name))
+        {
+            return entry[name.len + 1 ..];
+        }
     }
-    return default_path;
+    return null;
+}
+
+/// PATH value from the environ block, or a sane container default.
+pub fn findPath(environ: [:null]const ?[*:0]const u8) []const u8 {
+    return findEnv(environ, "PATH") orelse default_path;
 }
 
 pub const SpawnError = error{ForkFailed};

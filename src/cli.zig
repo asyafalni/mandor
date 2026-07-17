@@ -3,15 +3,21 @@
 const std = @import("std");
 
 pub const max_workers = 64;
+pub const default_state_dir = "/var/lib/mandor";
 
 pub const RestartPolicy = enum { never, on_failure, always };
+pub const Mode = enum { supervise, report };
 
 pub const Config = struct {
+    mode: Mode = .supervise,
     restart: RestartPolicy = .never,
     backoff_max_ms: u64 = 30_000,
     commands: []const []const u8 = &.{},
     help: bool = false,
     version: bool = false,
+    json: bool = false,
+    /// null = not given on the CLI; caller resolves env/default.
+    state_dir: ?[]const u8 = null,
 };
 
 pub const ParseError = error{ UnknownFlag, BadValue, NoCommands, TooManyWorkers };
@@ -20,7 +26,11 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
     var cfg: Config = .{};
     var n: usize = 0;
     var no_more_flags = false;
-    for (args) |arg| {
+    for (args, 0..) |arg, arg_idx| {
+        if (arg_idx == 0 and std.mem.eql(u8, arg, "report")) {
+            cfg.mode = .report;
+            continue;
+        }
         if (!no_more_flags and std.mem.eql(u8, arg, "--")) {
             no_more_flags = true;
             continue;
@@ -43,6 +53,13 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
             } else if (std.mem.startsWith(u8, arg, "--backoff-max=")) {
                 cfg.backoff_max_ms = parseDuration(arg["--backoff-max=".len..]) orelse
                     return error.BadValue;
+            } else if (std.mem.startsWith(u8, arg, "--state-dir=")) {
+                const v = arg["--state-dir=".len..];
+                if (v.len == 0) return error.BadValue;
+                cfg.state_dir = v;
+            } else if (std.mem.eql(u8, arg, "--json")) {
+                if (cfg.mode != .report) return error.UnknownFlag;
+                cfg.json = true;
             } else {
                 return error.UnknownFlag;
             }
@@ -53,6 +70,10 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
         n += 1;
     }
     cfg.commands = cmd_storage[0..n];
+    if (cfg.mode == .report) {
+        if (n != 0) return error.BadValue; // report takes no commands
+        return cfg;
+    }
     if (n == 0 and !cfg.help and !cfg.version) return error.NoCommands;
     return cfg;
 }
@@ -234,6 +255,17 @@ test "parse errors" {
     try expectError(error.BadValue, parse(&.{ "--restart=sometimes", "./a" }, &storage));
     try expectError(error.BadValue, parse(&.{ "--backoff-max=fast", "./a" }, &storage));
     try expectError(error.NoCommands, parse(&.{}, &storage));
+}
+
+test "parse report subcommand" {
+    var storage: [max_workers][]const u8 = undefined;
+    const cfg = try parse(&.{ "report", "--json", "--state-dir=/tmp/x" }, &storage);
+    try expectEqual(Mode.report, cfg.mode);
+    try expect(cfg.json);
+    try expectEqualStrings("/tmp/x", cfg.state_dir.?);
+    try expectError(error.BadValue, parse(&.{ "report", "./cmd" }, &storage));
+    // --json is report-only
+    try expectError(error.UnknownFlag, parse(&.{ "--json", "./cmd" }, &storage));
 }
 
 test "parse help and version short-circuit NoCommands" {
