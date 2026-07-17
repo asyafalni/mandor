@@ -1,0 +1,157 @@
+//! Worker table and fork/exec. Raw std.os.linux syscalls — no libc, no
+//! allocations: each worker owns fixed buffers sized at comptime.
+
+const std = @import("std");
+const linux = std.os.linux;
+const posix = std.posix;
+const cli = @import("cli.zig");
+
+pub const max_args = 64;
+pub const name_cap = 32;
+const default_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+pub const Status = union(enum) {
+    not_started,
+    running,
+    exited: u8,
+    signaled: u8,
+};
+
+pub const Worker = struct {
+    name: [name_cap]u8 = undefined,
+    name_len: u8 = 0,
+    cmd_buf: [4096]u8 = undefined,
+    argv: [max_args + 1]?[*:0]const u8 = undefined, // null-terminated for execve
+    argc: u8 = 0,
+    pid: i32 = 0, // 0 = not running
+    status: Status = .not_started,
+    restarts: u32 = 0,
+    cur_delay_ms: u64 = 0,
+    last_start_ms: u64 = 0,
+    next_restart_ms: u64 = 0, // 0 = no restart scheduled
+    final_code: u8 = 0,
+    done: bool = false, // permanently finished; no restart coming
+
+    pub fn nameSlice(w: *const Worker) []const u8 {
+        return w.name[0..w.name_len];
+    }
+};
+
+pub const InitError = error{BadCommand};
+
+/// Tokenize each command into its worker's fixed buffers and derive log names.
+pub fn initWorkers(workers: []Worker, commands: []const []const u8) InitError!void {
+    for (commands, 0..) |cmd, idx| {
+        const w = &workers[idx];
+        w.* = .{};
+        var toks: [max_args][]const u8 = undefined;
+        const argv = cli.tokenize(cmd, &w.cmd_buf, &toks) catch return error.BadCommand;
+        for (argv, 0..) |t, i| w.argv[i] = @ptrCast(t.ptr);
+        w.argv[argv.len] = null;
+        w.argc = @intCast(argv.len);
+        setName(w, argv[0], workers[0..idx]);
+    }
+}
+
+fn setName(w: *Worker, argv0: []const u8, prior: []const Worker) void {
+    var base = argv0;
+    if (std.mem.lastIndexOfScalar(u8, argv0, '/')) |i| base = argv0[i + 1 ..];
+    if (base.len > name_cap - 4) base = base[0 .. name_cap - 4]; // room for "-NN"
+    var dupes: usize = 0;
+    for (prior) |*p| {
+        const pn = p.nameSlice();
+        if (std.mem.eql(u8, pn, base) or
+            (pn.len > base.len + 1 and std.mem.startsWith(u8, pn, base) and pn[base.len] == '-'))
+        {
+            dupes += 1;
+        }
+    }
+    if (dupes == 0) {
+        @memcpy(w.name[0..base.len], base);
+        w.name_len = @intCast(base.len);
+    } else {
+        var fbs: []u8 = w.name[0..];
+        @memcpy(fbs[0..base.len], base);
+        const suffix = std.fmt.bufPrint(fbs[base.len..], "-{d}", .{dupes + 1}) catch
+            fbs[base.len..base.len];
+        w.name_len = @intCast(base.len + suffix.len);
+    }
+}
+
+/// PATH value from the environ block, or a sane container default.
+pub fn findPath(environ: [:null]const ?[*:0]const u8) []const u8 {
+    for (environ) |maybe| {
+        const entry = std.mem.span(maybe orelse continue);
+        if (std.mem.startsWith(u8, entry, "PATH=")) return entry[5..];
+    }
+    return default_path;
+}
+
+pub const SpawnError = error{ForkFailed};
+
+pub fn spawn(
+    w: *Worker,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+    now_ms: u64,
+) SpawnError!void {
+    const rc = linux.fork();
+    if (posix.errno(rc) != .SUCCESS) return error.ForkFailed;
+    if (rc == 0) execChild(w, envp, path_env);
+    w.pid = @intCast(rc);
+    w.status = .running;
+    w.last_start_ms = now_ms;
+    w.next_restart_ms = 0;
+}
+
+/// Child side: restore signal mask, exec (with PATH search when argv0 has no
+/// slash). On total failure: message to stderr, _exit(127).
+fn execChild(
+    w: *const Worker,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) noreturn {
+    const empty = posix.sigemptyset();
+    posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+
+    const argv: [*:null]const ?[*:0]const u8 = @ptrCast(&w.argv);
+    const argv0z = w.argv[0].?;
+    const argv0 = std.mem.span(argv0z);
+
+    if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
+        _ = linux.execve(argv0z, argv, envp);
+    } else {
+        var cand: [4200]u8 = undefined;
+        var it = std.mem.splitScalar(u8, path_env, ':');
+        while (it.next()) |dir| {
+            if (dir.len == 0 or dir.len + 1 + argv0.len + 1 > cand.len) continue;
+            @memcpy(cand[0..dir.len], dir);
+            cand[dir.len] = '/';
+            @memcpy(cand[dir.len + 1 ..][0..argv0.len], argv0);
+            cand[dir.len + 1 + argv0.len] = 0;
+            _ = linux.execve(@ptrCast(&cand), argv, envp);
+        }
+    }
+    const pre = "[mandor] exec failed: ";
+    _ = linux.write(2, pre, pre.len);
+    _ = linux.write(2, argv0.ptr, argv0.len);
+    _ = linux.write(2, "\n", 1);
+    linux.exit(127);
+}
+
+// ---------------------------------------------------------------- tests
+
+test "initWorkers derives names and dedups" {
+    var workers: [3]Worker = undefined;
+    try initWorkers(workers[0..3], &.{ "./bin/api --port 8080", "api", "/usr/bin/api -x" });
+    try std.testing.expectEqualStrings("api", workers[0].nameSlice());
+    try std.testing.expectEqualStrings("api-2", workers[1].nameSlice());
+    try std.testing.expectEqualStrings("api-3", workers[2].nameSlice());
+    try std.testing.expectEqual(@as(u8, 3), workers[0].argc);
+    try std.testing.expectEqual(@as(?[*:0]const u8, null), workers[0].argv[3]);
+}
+
+test "findPath falls back to default" {
+    const empty_env = [_:null]?[*:0]const u8{};
+    try std.testing.expectEqualStrings(default_path, findPath(&empty_env));
+}

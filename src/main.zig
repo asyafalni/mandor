@@ -10,5 +10,7 @@ test {
     _ = @import("backoff.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
+        _ = @import("spawner.zig");
+        _ = @import("reaper.zig");
     }
 }
