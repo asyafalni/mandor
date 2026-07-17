@@ -10,6 +10,12 @@ const backoff = @import("backoff.zig");
 const signals = @import("signals.zig");
 const spawner = @import("spawner.zig");
 const reaper = @import("reaper.zig");
+const capture = @import("capture.zig");
+const ring = @import("ring.zig");
+
+// Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
+// log ring, and untouched pages cost nothing until logs actually flow.
+var workers_buf: [cli.max_workers]spawner.Worker = undefined;
 
 pub fn nowMs() u64 {
     var ts: linux.timespec = undefined;
@@ -18,7 +24,6 @@ pub fn nowMs() u64 {
 }
 
 pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
-    var workers_buf: [cli.max_workers]spawner.Worker = undefined;
     const workers = workers_buf[0..cfg.commands.len];
     spawner.initWorkers(workers, cfg.commands) catch {
         std.debug.print("[mandor] invalid command line\n", .{});
@@ -61,8 +66,31 @@ pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
                 @intCast(@min(next_deadline - now, 3_600_000));
         }
 
-        var pfd = [1]posix.pollfd{.{ .fd = sigs.fd, .events = posix.POLL.IN, .revents = 0 }};
-        _ = posix.poll(&pfd, timeout) catch 0;
+        var pfds: [1 + 2 * cli.max_workers]posix.pollfd = undefined;
+        var owners: [1 + 2 * cli.max_workers]*spawner.Worker = undefined;
+        var errs: [1 + 2 * cli.max_workers]bool = undefined;
+        pfds[0] = .{ .fd = sigs.fd, .events = posix.POLL.IN, .revents = 0 };
+        var nf: usize = 1;
+        for (workers) |*w| {
+            if (w.out_r >= 0) {
+                pfds[nf] = .{ .fd = w.out_r, .events = posix.POLL.IN, .revents = 0 };
+                owners[nf] = w;
+                errs[nf] = false;
+                nf += 1;
+            }
+            if (w.err_r >= 0) {
+                pfds[nf] = .{ .fd = w.err_r, .events = posix.POLL.IN, .revents = 0 };
+                owners[nf] = w;
+                errs[nf] = true;
+                nf += 1;
+            }
+        }
+        _ = posix.poll(pfds[0..nf], timeout) catch 0;
+
+        for (pfds[1..nf], 1..) |*pfd, i| {
+            if (pfd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0)
+                readPipe(owners[i], errs[i]);
+        }
 
         const ev = sigs.drain();
 
@@ -93,6 +121,7 @@ pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
                     .signaled => false,
                     else => continue, // not_started/running: nothing new here
                 };
+                closePipes(w);
                 logDeath(w);
                 if (!shutting_down and backoff.shouldRestart(cfg.restart, clean)) {
                     const uptime = now -| w.last_start_ms;
@@ -153,4 +182,61 @@ fn forwardAll(workers: []spawner.Worker, sig: posix.SIG) void {
     for (workers) |*w| {
         if (w.pid > 0) posix.kill(w.pid, sig) catch {};
     }
+}
+
+// ------------------------------------------------------- output capture
+
+const EchoCtx = struct { w: *spawner.Worker, err: bool };
+
+/// Ring-record the line and echo it, `[name] `-prefixed, to our own
+/// stdout/stderr in a single write (atomic below PIPE_BUF).
+fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
+    _ = ctx.w.log.push(text, flags);
+    var buf: [capture.max_line + spawner.name_cap + 8]u8 = undefined;
+    const name = ctx.w.nameSlice();
+    buf[0] = '[';
+    @memcpy(buf[1..][0..name.len], name);
+    buf[1 + name.len] = ']';
+    buf[2 + name.len] = ' ';
+    @memcpy(buf[3 + name.len ..][0..text.len], text);
+    buf[3 + name.len + text.len] = '\n';
+    const fd: i32 = if (flags & ring.flag_stderr != 0) 2 else 1;
+    _ = linux.write(fd, &buf, 4 + name.len + text.len);
+}
+
+/// Drain a readable pipe until EAGAIN; on EOF flush partials and close.
+fn readPipe(w: *spawner.Worker, is_err: bool) void {
+    const fd = if (is_err) w.err_r else w.out_r;
+    if (fd < 0) return;
+    const asm_ptr = if (is_err) &w.asm_err else &w.asm_out;
+    const base_flags: u8 = if (is_err) ring.flag_stderr else 0;
+    var ctx: EchoCtx = .{ .w = w, .err = is_err };
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const rc = linux.read(fd, &chunk, chunk.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return, // EAGAIN: drained for now
+        }
+        if (rc == 0) { // EOF: writer side fully closed
+            asm_ptr.flushEof(base_flags, &ctx, echoLine);
+            if (is_err) capture.closeFd(&w.err_r) else capture.closeFd(&w.out_r);
+            return;
+        }
+        asm_ptr.feed(base_flags, chunk[0..rc], &ctx, echoLine);
+    }
+}
+
+/// Final drain + close at worker death. Data still in flight is read;
+/// grandchildren keeping the pipe open lose their audience by design.
+fn closePipes(w: *spawner.Worker) void {
+    readPipe(w, false);
+    readPipe(w, true);
+    var ctx_out: EchoCtx = .{ .w = w, .err = false };
+    w.asm_out.flushEof(0, &ctx_out, echoLine);
+    var ctx_err: EchoCtx = .{ .w = w, .err = true };
+    w.asm_err.flushEof(ring.flag_stderr, &ctx_err, echoLine);
+    capture.closeFd(&w.out_r);
+    capture.closeFd(&w.err_r);
 }

@@ -5,9 +5,12 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const cli = @import("cli.zig");
+const capture = @import("capture.zig");
+const ring = @import("ring.zig");
 
 pub const max_args = 64;
 pub const name_cap = 32;
+pub const log_ring_capacity = 256 * 1024;
 const default_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub const Status = union(enum) {
@@ -31,6 +34,15 @@ pub const Worker = struct {
     next_restart_ms: u64 = 0, // 0 = no restart scheduled
     final_code: u8 = 0,
     done: bool = false, // permanently finished; no restart coming
+
+    // v0.2: output capture. Read ends of the worker's stdout/stderr pipes
+    // (-1 = closed), per-stream line assemblers, and the log ring that
+    // survives restarts.
+    out_r: i32 = -1,
+    err_r: i32 = -1,
+    asm_out: capture.Assembler = .{},
+    asm_err: capture.Assembler = .{},
+    log: ring.Ring(log_ring_capacity) = .{},
 
     pub fn nameSlice(w: *const Worker) []const u8 {
         return w.name[0..w.name_len];
@@ -95,13 +107,40 @@ pub fn spawn(
     path_env: []const u8,
     now_ms: u64,
 ) SpawnError!void {
+    const out_p = capture.makePipe();
+    const err_p = capture.makePipe();
     const rc = linux.fork();
-    if (posix.errno(rc) != .SUCCESS) return error.ForkFailed;
-    if (rc == 0) execChild(w, envp, path_env);
+    if (posix.errno(rc) != .SUCCESS) {
+        closePair(out_p);
+        closePair(err_p);
+        return error.ForkFailed;
+    }
+    if (rc == 0) {
+        // Child: route stdout/stderr into the pipes. dup2 clears CLOEXEC on
+        // fds 1/2; the original pipe fds close automatically at execve.
+        if (out_p) |p| _ = linux.dup2(p.w, 1);
+        if (err_p) |p| _ = linux.dup2(p.w, 2);
+        execChild(w, envp, path_env);
+    }
+    if (out_p) |p| {
+        _ = linux.close(p.w);
+        w.out_r = p.r;
+    }
+    if (err_p) |p| {
+        _ = linux.close(p.w);
+        w.err_r = p.r;
+    }
     w.pid = @intCast(rc);
     w.status = .running;
     w.last_start_ms = now_ms;
     w.next_restart_ms = 0;
+}
+
+fn closePair(pair: ?capture.PipePair) void {
+    if (pair) |p| {
+        _ = linux.close(p.r);
+        _ = linux.close(p.w);
+    }
 }
 
 /// Child side: restore signal mask, exec (with PATH search when argv0 has no
