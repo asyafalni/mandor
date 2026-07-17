@@ -43,9 +43,33 @@ fixture tests.
 | 16 | Env redaction allowlist in mandor.toml | S | ● ○ ○ | Policy design > code; default-redact `*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `*KEY*` |
 | 17 | Release binaries + `ghcr.io` image publishing in CI | S | ● ● ○ | Distribution, not features — do whenever convenient |
 
+## Tier 4 — v0.8 candidates (round-2 research, 2026-07-17)
+
+From the [second landscape pass](research/2026-07-17-round2-tier4-features.md)
+(OpenRC, launchd, circus, god/eye, compose/k8s probe semantics, systemd deep
+cuts, s6 oneshots, pm2). Build order: 19+21 (XS hardening) → 18 → 20 → 22/23.
+
+| # | Feature | Cx | Value | Notes |
+|---|---------|----|-------|-------|
+| 18 | Oneshot init tasks (gates dependents via `start_after`) | S | ● ● ● ● | Migrations-before-workers; failed oneshot = LLM-fixable bundle + hard exit |
+| 19 | `max_restarts` give-up → mandor exits nonzero | XS | ● ● ● ● | Flapping becomes visible to the orchestrator; counter already exists |
+| 20 | On-incident hook (exec argv + bundle path, no shell) | XS | ● ● ● ● | Offline alerting; premium sidecar bridge (`on_incident = ["/mandor-relay"]`) |
+| 21 | Health-check `start_period` grace | XS | ● ● ● ○ | The k8s startupProbe lesson; stops false unhealthy-kills on slow booters |
+| 22 | Per-worker `env` / `cwd` | XS | ● ● ● ○ | No shell in scratch to set these; snapshot reporting already free |
+| 23 | Per-worker `user = "uid:gid"` drop (numeric) | S | ● ● ● ○ | Root PID 1 + non-root workers without gosu |
+| 24 | `replicas = N` scaling (no fd sharing) | S | ● ● ○ ○ | compose/VPS queue workers; hold until asked |
+| 25 | `oom_score_adj` / `nice` knobs | XS | ● ● ○ ○ | Steer the OOM killer; hold until asked |
+| 26 | Watchdog heartbeat over readiness fd | S | ● ○ ○ ○ | Needs app integration; hold until asked |
+
 ## Explicitly rejected (research-backed)
 
 - Log rotation to disk (ring buffers make the blocking-pipe failure class impossible)
 - PTY allocation / tmux-style attach (overmind's niche, not container PID 1)
 - rlimit *enforcement* (cgroup limits are the container runtime's job)
 - Full s6-rc-style dependency DAG / oneshot compiler
+- Socket activation (needs app cooperation; host-systemd territory)
+- File-watch auto-restart (dev-laptop workflow; prod restarts are image rollouts)
+- Control-plane API / pub-sub bus (size + attack surface; state file + report + metrics + hook suffice)
+- Condition DSLs à la god/eye (opinionated zero-config detectors beat a language)
+- pm2-style cluster fd-sharing (Node-specific; `replicas` is the honest version)
+- FDStore-style state handoff, launchd KeepAlive conditions, cron scheduling (wrong layer)
