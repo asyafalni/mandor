@@ -43,22 +43,22 @@ fixture tests.
 | 16 | Env redaction allowlist in mandor.toml | S | ● ○ ○ | Policy design > code; default-redact `*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `*KEY*` |
 | 17 | Release binaries + `ghcr.io` image publishing in CI | S | ● ● ○ | Distribution, not features — do whenever convenient |
 
-## Tier 4 — v0.8 candidates (round-2 research, 2026-07-17)
+## Tier 4 — v0.8 (round-2 research, 2026-07-17) — ordered by value ÷ effort
 
 From the [second landscape pass](research/2026-07-17-round2-tier4-features.md)
 (OpenRC, launchd, circus, god/eye, compose/k8s probe semantics, systemd deep
-cuts, s6 oneshots, pm2). Build order: 19+21 (XS hardening) → 18 → 20 → 22/23.
+cuts, s6 oneshots, pm2). Strict lowest-hanging-fruit order: build top-down.
 
 | # | Feature | Cx | Value | Notes |
 |---|---------|----|-------|-------|
-| 18 | Oneshot init tasks (gates dependents via `start_after`) | S | ● ● ● ● | Migrations-before-workers; failed oneshot = LLM-fixable bundle + hard exit |
-| 19 | `max_restarts` give-up → mandor exits nonzero | XS | ● ● ● ● | Flapping becomes visible to the orchestrator; counter already exists |
-| 20 | On-incident hook (exec argv + bundle path, no shell) | XS | ● ● ● ● | Offline alerting; premium sidecar bridge (`on_incident = ["/mandor-relay"]`) |
-| 21 | Health-check `start_period` grace | XS | ● ● ● ○ | The k8s startupProbe lesson; stops false unhealthy-kills on slow booters |
-| 22 | Per-worker `env` / `cwd` | XS | ● ● ● ○ | No shell in scratch to set these; snapshot reporting already free |
+| 18 | `max_restarts` give-up → mandor exits nonzero | XS | ● ● ● ● | Flapping becomes visible to the orchestrator; counter already exists |
+| 19 | On-incident hook (exec argv + bundle path, no shell) | XS | ● ● ● ● | Offline alerting; premium sidecar bridge (`on_incident = ["/mandor-relay"]`) |
+| 20 | Health-check `start_period` grace | XS | ● ● ● ○ | The k8s startupProbe lesson; stops false unhealthy-kills on slow booters |
+| 21 | Per-worker `env` / `cwd` | XS | ● ● ● ○ | No shell in scratch to set these; snapshot reporting already free |
+| 22 | Oneshot init tasks (gates dependents via `start_after`) | S | ● ● ● ● | Migrations-before-workers; failed oneshot = LLM-fixable bundle + hard exit |
 | 23 | Per-worker `user = "uid:gid"` drop (numeric) | S | ● ● ● ○ | Root PID 1 + non-root workers without gosu |
-| 24 | `replicas = N` scaling (no fd sharing) | S | ● ● ○ ○ | compose/VPS queue workers; hold until asked |
-| 25 | `oom_score_adj` / `nice` knobs | XS | ● ● ○ ○ | Steer the OOM killer; hold until asked |
+| 24 | `oom_score_adj` / `nice` knobs | XS | ● ● ○ ○ | Steer the OOM killer; hold until asked |
+| 25 | `replicas = N` scaling (no fd sharing) | S | ● ● ○ ○ | compose/VPS queue workers; hold until asked |
 | 26 | Watchdog heartbeat over readiness fd | S | ● ○ ○ ○ | Needs app integration; hold until asked |
 
 ## Explicitly rejected (research-backed)
