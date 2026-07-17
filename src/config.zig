@@ -31,10 +31,12 @@ pub const FileConfig = struct {
     cwd_pairs_n: u8 = 0,
     oneshot: [16][]const u8 = undefined,
     oneshot_n: u8 = 0,
+    user_pairs: [16]cli.HealthSpec = undefined,
+    user_pairs_n: u8 = 0,
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user };
 
 pub const ParseError = error{ Syntax, BadValue, TooManyWorkers };
 
@@ -118,7 +120,8 @@ pub fn parse(
                 return error.BadValue;
         } else if (std.mem.eql(u8, key, "workers") or std.mem.eql(u8, key, "health") or
             std.mem.eql(u8, key, "start_after") or std.mem.eql(u8, key, "env") or
-            std.mem.eql(u8, key, "cwd") or std.mem.eql(u8, key, "oneshot"))
+            std.mem.eql(u8, key, "cwd") or std.mem.eql(u8, key, "oneshot") or
+            std.mem.eql(u8, key, "user"))
         {
             const this_target: ArrayTarget = if (std.mem.eql(u8, key, "workers"))
                 .workers
@@ -128,7 +131,9 @@ pub fn parse(
                 .start_after
             else if (std.mem.eql(u8, key, "env"))
                 .env
-            else if (std.mem.eql(u8, key, "cwd")) .cwd else .oneshot;
+            else if (std.mem.eql(u8, key, "cwd"))
+                .cwd
+            else if (std.mem.eql(u8, key, "oneshot")) .oneshot else .user;
             if (value.len == 0 or value[0] != '[') return error.BadValue;
             var rest = std.mem.trim(u8, value[1..], " \t");
             const closed = std.mem.endsWith(u8, rest, "]");
@@ -195,6 +200,13 @@ fn appendItem(
             if (cfg.oneshot_n == cfg.oneshot.len) return error.BadValue;
             cfg.oneshot[cfg.oneshot_n] = s;
             cfg.oneshot_n += 1;
+        },
+        .user => {
+            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
+            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
+            if (cfg.user_pairs_n == cfg.user_pairs.len) return error.BadValue;
+            cfg.user_pairs[cfg.user_pairs_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
+            cfg.user_pairs_n += 1;
         },
         .none => unreachable, // callers always pass a real target
     }

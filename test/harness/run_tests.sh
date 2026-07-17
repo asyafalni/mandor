@@ -326,6 +326,20 @@ if [ $c -eq 7 ] && ! grep -q "spawned sleep" "$TMP/27" && grep -q "init task sh 
   ok "failed oneshot aborts with its exit code"
 else bad "failed oneshot abort" "exit $c: $(head -5 "$TMP/27")"; fi
 
+# 28. per-worker privilege drop (root only — runs in CI containers)
+if [ "$(id -u)" -eq 0 ]; then
+  cat > "$TMP/u.toml" <<'TOML'
+workers = ["sh -c 'id -u; id -g'"]
+user = ["sh=12345:12345"]
+TOML
+  timeout 10 "$MANDOR" --config="$TMP/u.toml" >"$TMP/28" 2>&1
+  if grep -q "^\[sh\] 12345$" "$TMP/28" && [ "$(grep -c '\[sh\] 12345' "$TMP/28")" -eq 2 ]; then
+    ok "privilege drop to uid:gid"
+  else bad "privilege drop" "$(grep '\[sh\]' "$TMP/28")"; fi
+else
+  echo "skip privilege drop (not root)"
+fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

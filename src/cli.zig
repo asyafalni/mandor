@@ -58,6 +58,9 @@ pub const Config = struct {
     cwd_pairs_n: u8 = 0,
     oneshot: [16][]const u8 = undefined,
     oneshot_n: u8 = 0,
+    /// "name=uid:gid" privilege drops (numeric only — scratch has no passwd).
+    user_pairs: [16]HealthSpec = undefined,
+    user_pairs_n: u8 = 0,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,

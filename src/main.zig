@@ -128,6 +128,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.cwd_pairs_n = file_cfg.cwd_pairs_n;
             cfg.oneshot = file_cfg.oneshot;
             cfg.oneshot_n = file_cfg.oneshot_n;
+            cfg.user_pairs = file_cfg.user_pairs;
+            cfg.user_pairs_n = file_cfg.user_pairs_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {

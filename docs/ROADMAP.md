@@ -56,7 +56,7 @@ cuts, s6 oneshots, pm2). Strict lowest-hanging-fruit order: build top-down.
 | 20 ✅ | Health-check `start_period` grace | XS | ● ● ● ○ | SHIPPED 2026-07-17 (default 10s) |
 | 21 ✅ | Per-worker `env` / `cwd` | XS | ● ● ● ○ | No shell in scratch to set these; snapshot reporting already free |
 | 22 ✅ | Oneshot init tasks (gates dependents via `start_after`) | S | ● ● ● ● | Migrations-before-workers; failed oneshot = LLM-fixable bundle + hard exit |
-| 23 | Per-worker `user = "uid:gid"` drop (numeric) | S | ● ● ● ○ | Root PID 1 + non-root workers without gosu |
+| 23 ✅ | Per-worker `user = "uid:gid"` drop (numeric) | S | ● ● ● ○ | SHIPPED 2026-07-17 — fail-closed (worker exits 126 if the drop fails) |
 | 24 | `oom_score_adj` / `nice` knobs | XS | ● ● ○ ○ | Steer the OOM killer; hold until asked |
 | 25 | `replicas = N` scaling (no fd sharing) | S | ● ● ○ ○ | compose/VPS queue workers; hold until asked |
 | 26 | Watchdog heartbeat over readiness fd | S | ● ○ ○ ○ | Needs app integration; hold until asked |

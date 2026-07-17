@@ -53,6 +53,14 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 std.debug.print("[mandor] cwd too long for {s}\n", .{pair.worker});
         } else std.debug.print("[mandor] cwd: no worker named {s}\n", .{pair.worker});
     }
+    for (cfg.user_pairs[0..cfg.user_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            if (!spawner.setUser(w, pair.cmd)) {
+                std.debug.print("[mandor] user: bad uid:gid for {s}\n", .{pair.worker});
+                return 2;
+            }
+        } else std.debug.print("[mandor] user: no worker named {s}\n", .{pair.worker});
+    }
     var oneshot_count: usize = 0;
     for (cfg.oneshot[0..cfg.oneshot_n]) |name| {
         if (findWorker(workers, name)) |w| {

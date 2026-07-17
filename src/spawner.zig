@@ -61,6 +61,8 @@ pub const Worker = struct {
     cwd_buf: [256]u8 = undefined,
     cwd_len: u16 = 0, // NUL-terminated in cwd_buf when set
     is_oneshot: bool = false,
+    drop_uid: ?u32 = null,
+    drop_gid: ?u32 = null,
     restarts: u32 = 0,
     /// Consecutive unclean deaths (reset by clean exit or stable uptime).
     fail_streak: u32 = 0,
@@ -133,6 +135,16 @@ fn resetWorker(w: *Worker) void {
     w.extra_env_used = 0;
     w.cwd_len = 0;
     w.is_oneshot = false;
+    w.drop_uid = null;
+    w.drop_gid = null;
+}
+
+/// "1000:1000" -> numeric uid/gid privilege drop for this worker.
+pub fn setUser(w: *Worker, spec: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return false;
+    w.drop_uid = std.fmt.parseInt(u32, spec[0..colon], 10) catch return false;
+    w.drop_gid = std.fmt.parseInt(u32, spec[colon + 1 ..], 10) catch return false;
+    return true;
 }
 
 /// Add one KEY=VAL to a worker's environment.
@@ -287,6 +299,25 @@ pub fn spawn(
         // s6-style readiness: the worker writes a newline to this fd.
         if (ready_p) |p| _ = linux.dup2(p.w, ready_fd.?);
         if (w.cwd_len > 0) _ = linux.chdir(@ptrCast(&w.cwd_buf));
+        // Privilege drop is fail-closed: a worker configured as non-root must
+        // never accidentally run as root. Order matters: groups, gid, uid.
+        if (w.drop_gid) |gid| {
+            const one_group = [1]linux.gid_t{gid};
+            if (posix.errno(linux.setgroups(1, &one_group)) != .SUCCESS or
+                posix.errno(linux.setgid(gid)) != .SUCCESS)
+            {
+                const msg = "[mandor] setgid failed\n";
+                _ = linux.write(2, msg, msg.len);
+                linux.exit(126);
+            }
+        }
+        if (w.drop_uid) |uid| {
+            if (posix.errno(linux.setuid(uid)) != .SUCCESS) {
+                const msg = "[mandor] setuid failed\n";
+                _ = linux.write(2, msg, msg.len);
+                linux.exit(126);
+            }
+        }
         execChild(w, child_envp, path_env);
     }
     // Parent sets it too — whichever side wins the race, the group exists
