@@ -52,13 +52,42 @@ pub const Worker = struct {
     }
 };
 
+/// Field-by-field reset. Deliberately NOT `w.* = .{}`: that would materialize
+/// a ~270 KB comptime Worker constant (ring buffer included) in .rodata.
+fn resetWorker(w: *Worker) void {
+    w.name_len = 0;
+    w.cmd = "";
+    w.argc = 0;
+    w.pid = 0;
+    w.status = .not_started;
+    w.restarts = 0;
+    w.cur_delay_ms = 0;
+    w.last_start_ms = 0;
+    w.next_restart_ms = 0;
+    w.final_code = 0;
+    w.done = false;
+    w.out_r = -1;
+    w.err_r = -1;
+    w.asm_out.len = 0;
+    w.asm_out.continued = false;
+    w.asm_err.len = 0;
+    w.asm_err.continued = false;
+    w.log.head = 0;
+    w.log.used = 0;
+    w.log.records = 0;
+    w.stats.next = 0;
+    w.stats.len = 0;
+    w.stats.prev_ticks = 0;
+    w.stats.prev_t_ms = 0;
+}
+
 pub const InitError = error{BadCommand};
 
 /// Tokenize each command into its worker's fixed buffers and derive log names.
 pub fn initWorkers(workers: []Worker, commands: []const []const u8) InitError!void {
     for (commands, 0..) |cmd, idx| {
         const w = &workers[idx];
-        w.* = .{};
+        resetWorker(w);
         w.cmd = cmd;
         var toks: [max_args][]const u8 = undefined;
         const argv = cli.tokenize(cmd, &w.cmd_buf, &toks) catch return error.BadCommand;

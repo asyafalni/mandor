@@ -75,7 +75,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
 var report_read_buf: [256 * 1024]u8 = undefined;
 var report_out_buf: [64 * 1024]u8 = undefined;
-var report_arena_buf: [512 * 1024]u8 = undefined;
 
 fn runReport(state_dir: []const u8, json: bool) u8 {
     const report = @import("report.zig");
@@ -88,12 +87,11 @@ fn runReport(state_dir: []const u8, json: bool) u8 {
         writeOut(text);
         return 0;
     }
-    var fba = std.heap.FixedBufferAllocator.init(&report_arena_buf);
-    const state = report.parseState(fba.allocator(), text) orelse {
+    const human = report.formatHuman(&report_out_buf, text, supervisor.nowMs()) orelse {
         std.debug.print("[mandor] state file is corrupt or from an incompatible version\n", .{});
         return 1;
     };
-    writeOut(report.formatHuman(&report_out_buf, state, supervisor.nowMs()));
+    writeOut(human);
     return 0;
 }
 

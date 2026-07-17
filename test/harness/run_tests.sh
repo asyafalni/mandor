@@ -69,6 +69,25 @@ wait "$mpid"; c=$?
 if [ $c -eq 0 ] && [ -f "$marker" ]; then ok "TERM forwarded to workers"
 else bad "TERM forwarded to workers" "exit $c, marker $([ -f "$marker" ] && echo yes || echo no)"; fi
 
+# 9. worker output is captured and [name]-prefixed
+timeout 10 "$MANDOR" "sh -c 'echo hello-out; echo oops >&2'" >"$TMP/9" 2>&1
+if grep -q "^\[sh\] hello-out$" "$TMP/9" && grep -q "^\[sh\] oops$" "$TMP/9"; then
+  ok "output captured with [name] prefix"
+else bad "output captured with [name] prefix" "$(cat "$TMP/9" | head -5)"; fi
+
+# 10. state file + report subcommand
+export MANDOR_STATE_DIR="$TMP/state"
+"$MANDOR" "sh -c 'sleep 7'" >"$TMP/10sup" 2>&1 &
+mpid=$!
+sleep 6
+"$MANDOR" report >"$TMP/10rep" 2>&1; rc_h=$?
+"$MANDOR" report --json >"$TMP/10json" 2>&1; rc_j=$?
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+if [ $rc_h -eq 0 ] && [ $rc_j -eq 0 ] && grep -q "^sh " "$TMP/10rep" && grep -q "\"v\":1" "$TMP/10json"; then
+  ok "report human + json from state file"
+else bad "report human + json" "rc_h=$rc_h rc_j=$rc_j $(head -3 "$TMP/10rep")"; fi
+unset MANDOR_STATE_DIR
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

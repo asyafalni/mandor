@@ -123,7 +123,7 @@ PID-1 semantics. On other systems the binary compiles for cross-target use.
 
 - [x] **v0.1** — multirun parity: spawn, forward signals, reap, restart
       policies with exponential backoff, worst-exit-code propagation
-- [ ] **v0.2** — log capture (ring buffers, `[name]` prefixes), `/proc`
+- [x] **v0.2** — log capture (ring buffers, `[name]` prefixes), `/proc`
       sampler, `mandor report`
 - [ ] **v0.3** — incident detection, heuristic summaries, Go/Rust/Python
       trace parsing, spool dir
