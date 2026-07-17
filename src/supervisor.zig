@@ -640,19 +640,38 @@ fn forwardAll(workers: []spawner.Worker, sig: posix.SIG) void {
 
 // ------------------------------------------------------- output capture
 
-const EchoCtx = struct { w: *spawner.Worker, err: bool };
+const EchoCtx = struct { w: *spawner.Worker, err: bool, t_ms: u64 = 0 };
 
 /// Ring-record the line and echo it, `[name] `-prefixed, to our own
 /// stdout/stderr in a single write (atomic below PIPE_BUF).
 var tty_out = false;
 var tty_err = false;
 
+// nanozlog-inspired batching: lines from one pipe read are formatted into a
+// shared scratch and flushed with a single writev — one syscall (and one
+// wall-clock read) per chunk instead of per line. Single-threaded, so the
+// statics are safe; flushEcho() runs before scratch or iovec can overflow.
+var echo_scratch: [64 * 1024]u8 = undefined;
+var echo_used: usize = 0;
+var echo_iov: [128]posix.iovec_const = undefined;
+var echo_iov_n: usize = 0;
+
+fn flushEcho(ctx: *EchoCtx) void {
+    if (echo_iov_n == 0) return;
+    const fd: usize = if (ctx.err) 2 else 1;
+    _ = linux.writev(@intCast(fd), &echo_iov, echo_iov_n);
+    echo_iov_n = 0;
+    echo_used = 0;
+}
+
 fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
-    _ = ctx.w.log.push(text, flags, wallMs());
-    var buf: [capture.max_line + spawner.name_cap + 24]u8 = undefined;
+    _ = ctx.w.log.push(text, flags, ctx.t_ms);
     const name = ctx.w.nameSlice();
-    const fd: i32 = if (flags & ring.flag_stderr != 0) 2 else 1;
-    const colored = if (fd == 1) tty_out else tty_err;
+    const max_needed = text.len + spawner.name_cap + 24;
+    if (echo_used + max_needed > echo_scratch.len or echo_iov_n == echo_iov.len)
+        flushEcho(ctx);
+    const buf = echo_scratch[echo_used..];
+    const colored = if (ctx.err) tty_err else tty_out;
     var p: usize = 0;
     if (colored) {
         // \x1b[3Xm[name]\x1b[0m — 8-color cycle per worker, TTY only
@@ -671,7 +690,9 @@ fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     buf[p] = ' ';
     @memcpy(buf[p + 1 ..][0..text.len], text);
     buf[p + 1 + text.len] = '\n';
-    _ = linux.write(fd, &buf, p + 2 + text.len);
+    echo_iov[echo_iov_n] = .{ .base = buf.ptr, .len = p + 2 + text.len };
+    echo_iov_n += 1;
+    echo_used += p + 2 + text.len;
 }
 
 /// Drain a readable pipe until EAGAIN; on EOF flush partials and close.
@@ -680,7 +701,8 @@ fn readPipe(w: *spawner.Worker, is_err: bool) void {
     if (fd < 0) return;
     const asm_ptr = if (is_err) &w.asm_err else &w.asm_out;
     const base_flags: u8 = if (is_err) ring.flag_stderr else 0;
-    var ctx: EchoCtx = .{ .w = w, .err = is_err };
+    var ctx: EchoCtx = .{ .w = w, .err = is_err, .t_ms = wallMs() };
+    defer flushEcho(&ctx); // one writev per drained pipe
     var chunk: [4096]u8 = undefined;
     while (true) {
         const rc = linux.read(fd, &chunk, chunk.len);
@@ -715,10 +737,13 @@ fn readReady(w: *spawner.Worker) void {
 fn closePipes(w: *spawner.Worker) void {
     readPipe(w, false);
     readPipe(w, true);
-    var ctx_out: EchoCtx = .{ .w = w, .err = false };
+    const now_wall = wallMs();
+    var ctx_out: EchoCtx = .{ .w = w, .err = false, .t_ms = now_wall };
     w.asm_out.flushEof(0, &ctx_out, echoLine);
-    var ctx_err: EchoCtx = .{ .w = w, .err = true };
+    flushEcho(&ctx_out);
+    var ctx_err: EchoCtx = .{ .w = w, .err = true, .t_ms = now_wall };
     w.asm_err.flushEof(ring.flag_stderr, &ctx_err, echoLine);
+    flushEcho(&ctx_err);
     capture.closeFd(&w.out_r);
     capture.closeFd(&w.err_r);
     capture.closeFd(&w.ready_r);

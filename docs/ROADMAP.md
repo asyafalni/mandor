@@ -76,7 +76,7 @@ Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
 | 31 ✅ | `essential` worker (leader exits ⇒ all stop, code propagates) | XS | ● ● ○ ○ | SHIPPED 2026-07-17 |
 | 32 | `pre_stop` drain hook | S | ● ● ○ ○ | Narrower than it looks (pod-level preStop covers routing drain); hold |
 | 33 ✅ | TTY color prefixes + `env_file` loading | XS | ● ○ ○ ○ | SHIPPED 2026-07-17 |
-| 34 | Ultra-low-latency capture path, nanozlog-inspired (https://github.com/wyzdwdz/nanozlog) | M | ● ● ○ ○ | User-parked 2026-07-17 — make logging MORE EFFICIENT: study nanozlog's lock-free SPSC/deferred-IO/zero-alloc techniques for the read→assemble→ring→echo hot path (batched writev echo, fewer wallMs calls, single-copy framing). Compared vs logly.zig 2026-07-17: nanozlog wins decisively (6.8 ns/msg ~147M msg/s lock-free SPSC vs logly's 8.5 µs simple path; logly is a feature-rich app logger — wrong shape for a PID-1 hot path). Reference stays nanozlog. |
+| 34 ✅ | Ultra-low-latency capture path, nanozlog-inspired (https://github.com/wyzdwdz/nanozlog) | M | ● ● ○ ○ | User-parked 2026-07-17 — make logging MORE EFFICIENT: study nanozlog's lock-free SPSC/deferred-IO/zero-alloc techniques for the read→assemble→ring→echo hot path (batched writev echo, fewer wallMs calls, single-copy framing). Compared vs logly.zig 2026-07-17: nanozlog wins decisively (6.8 ns/msg ~147M msg/s lock-free SPSC vs logly's 8.5 µs simple path; logly is a feature-rich app logger — wrong shape for a PID-1 hot path). Reference stays nanozlog. |
 
 ## Explicitly rejected (research-backed)
 
