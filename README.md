@@ -9,7 +9,7 @@
 
 [![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.16.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Static binary](https://img.shields.io/badge/binary-static%2C%20%3C500KB-success)
+![Static binary](https://img.shields.io/badge/binary-static%2C%20~210KB-success)
 ![No dependencies](https://img.shields.io/badge/dependencies-zero-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
@@ -38,7 +38,7 @@ $ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
 | Log capture with per-worker prefix | ✅ | ✅ | ✅ |
 | CPU / RSS / fd tracking | ✅ | ❌ | ❌ |
 | Crash summaries ("restart loop", "leak suspect") | ✅ | ❌ | ❌ |
-| Size | < 500 KB | ~50 KB | MBs + runtime |
+| Size | **~210 KB** | ~50 KB | MBs + runtime |
 | Network access required | **never** | never | varies |
 
 The `mandor` binary is fully offline and self-contained: no accounts, no

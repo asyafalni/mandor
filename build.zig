@@ -13,6 +13,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
+            // No error-return-trace tables: errors are handled, not dumped.
+            .error_tracing = false,
         }),
     });
     b.installArtifact(exe);

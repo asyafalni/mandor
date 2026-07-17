@@ -3,6 +3,7 @@
 //! Nothing in here may panic — PID 1 dying kills the container.
 
 const std = @import("std");
+const logmod = @import("log.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 const cli = @import("cli.zig");
@@ -38,61 +39,61 @@ pub fn wallMs() u64 {
 pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
     const workers = workers_buf[0..cfg.commands.len];
     spawner.initWorkers(workers, cfg.commands) catch {
-        std.debug.print("[mandor] invalid command line\n", .{});
+        logmod.print("[mandor] invalid command line\n", .{});
         return 2;
     };
     for (cfg.env_pairs[0..cfg.env_pairs_n]) |pair| {
         if (findWorker(workers, pair.worker)) |w| {
             if (!spawner.addEnv(w, pair.cmd))
-                std.debug.print("[mandor] env overflow for {s}\n", .{pair.worker});
-        } else std.debug.print("[mandor] env: no worker named {s}\n", .{pair.worker});
+                logmod.print("[mandor] env overflow for {s}\n", .{pair.worker});
+        } else logmod.print("[mandor] env: no worker named {s}\n", .{pair.worker});
     }
     for (cfg.cwd_pairs[0..cfg.cwd_pairs_n]) |pair| {
         if (findWorker(workers, pair.worker)) |w| {
             if (!spawner.setCwd(w, pair.cmd))
-                std.debug.print("[mandor] cwd too long for {s}\n", .{pair.worker});
-        } else std.debug.print("[mandor] cwd: no worker named {s}\n", .{pair.worker});
+                logmod.print("[mandor] cwd too long for {s}\n", .{pair.worker});
+        } else logmod.print("[mandor] cwd: no worker named {s}\n", .{pair.worker});
     }
     for (cfg.user_pairs[0..cfg.user_pairs_n]) |pair| {
         if (findWorker(workers, pair.worker)) |w| {
             if (!spawner.setUser(w, pair.cmd)) {
-                std.debug.print("[mandor] user: bad uid:gid for {s}\n", .{pair.worker});
+                logmod.print("[mandor] user: bad uid:gid for {s}\n", .{pair.worker});
                 return 2;
             }
-        } else std.debug.print("[mandor] user: no worker named {s}\n", .{pair.worker});
+        } else logmod.print("[mandor] user: no worker named {s}\n", .{pair.worker});
     }
     for (cfg.oom_pairs[0..cfg.oom_pairs_n]) |pair| {
         if (findWorker(workers, pair.worker)) |w| {
             w.oom_adj = std.fmt.parseInt(i16, pair.cmd, 10) catch {
-                std.debug.print("[mandor] oom_score_adj: bad value for {s}\n", .{pair.worker});
+                logmod.print("[mandor] oom_score_adj: bad value for {s}\n", .{pair.worker});
                 return 2;
             };
-        } else std.debug.print("[mandor] oom_score_adj: no worker named {s}\n", .{pair.worker});
+        } else logmod.print("[mandor] oom_score_adj: no worker named {s}\n", .{pair.worker});
     }
     for (cfg.nice_pairs[0..cfg.nice_pairs_n]) |pair| {
         if (findWorker(workers, pair.worker)) |w| {
             w.nice_val = std.fmt.parseInt(i8, pair.cmd, 10) catch {
-                std.debug.print("[mandor] nice: bad value for {s}\n", .{pair.worker});
+                logmod.print("[mandor] nice: bad value for {s}\n", .{pair.worker});
                 return 2;
             };
-        } else std.debug.print("[mandor] nice: no worker named {s}\n", .{pair.worker});
+        } else logmod.print("[mandor] nice: no worker named {s}\n", .{pair.worker});
     }
     for (cfg.max_rss_pairs[0..cfg.max_rss_pairs_n]) |pair| {
         if (findWorker(workers, pair.worker)) |w| {
             const mb = std.fmt.parseInt(u64, pair.cmd, 10) catch {
-                std.debug.print("[mandor] max_rss_mb: bad value for {s}\n", .{pair.worker});
+                logmod.print("[mandor] max_rss_mb: bad value for {s}\n", .{pair.worker});
                 return 2;
             };
             w.max_rss_kb = mb * 1024;
-        } else std.debug.print("[mandor] max_rss_mb: no worker named {s}\n", .{pair.worker});
+        } else logmod.print("[mandor] max_rss_mb: no worker named {s}\n", .{pair.worker});
     }
     for (cfg.lifetime_pairs[0..cfg.lifetime_pairs_n]) |pair| {
         if (findWorker(workers, pair.worker)) |w| {
             w.max_lifetime_ms = cli.parseDuration(pair.cmd) orelse {
-                std.debug.print("[mandor] max_lifetime: bad value for {s}\n", .{pair.worker});
+                logmod.print("[mandor] max_lifetime: bad value for {s}\n", .{pair.worker});
                 return 2;
             };
-        } else std.debug.print("[mandor] max_lifetime: no worker named {s}\n", .{pair.worker});
+        } else logmod.print("[mandor] max_lifetime: no worker named {s}\n", .{pair.worker});
     }
     for (cfg.restart_pairs[0..cfg.restart_pairs_n]) |pair| {
         if (findWorker(workers, pair.worker)) |w| {
@@ -103,24 +104,24 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             else if (std.mem.eql(u8, pair.cmd, "always"))
                 .always
             else {
-                std.debug.print("[mandor] restart: bad value for {s}\n", .{pair.worker});
+                logmod.print("[mandor] restart: bad value for {s}\n", .{pair.worker});
                 return 2;
             };
-        } else std.debug.print("[mandor] restart: no worker named {s}\n", .{pair.worker});
+        } else logmod.print("[mandor] restart: no worker named {s}\n", .{pair.worker});
     }
     var oneshot_count: usize = 0;
     for (cfg.oneshot[0..cfg.oneshot_n]) |name| {
         if (findWorker(workers, name)) |w| {
             w.is_oneshot = true;
             oneshot_count += 1;
-        } else std.debug.print("[mandor] oneshot: no worker named {s}\n", .{name});
+        } else logmod.print("[mandor] oneshot: no worker named {s}\n", .{name});
     }
     for (cfg.health[0..cfg.health_n]) |spec| {
         var matched = false;
         for (workers) |*w| {
             if (std.mem.eql(u8, w.nameSlice(), spec.worker)) {
                 spawner.setHealth(w, spec.cmd) catch {
-                    std.debug.print("[mandor] invalid health command for {s}\n", .{spec.worker});
+                    logmod.print("[mandor] invalid health command for {s}\n", .{spec.worker});
                     return 2;
                 };
                 matched = true;
@@ -128,29 +129,29 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             }
         }
         if (!matched)
-            std.debug.print("[mandor] --health: no worker named {s}\n", .{spec.worker});
+            logmod.print("[mandor] --health: no worker named {s}\n", .{spec.worker});
     }
     const path_env = spawner.findPath(environ);
     const envp: [*:null]const ?[*:0]const u8 = environ.ptr;
 
     const sigs = signals.Signals.init() catch {
-        std.debug.print("[mandor] cannot create signalfd\n", .{});
+        logmod.print("[mandor] cannot create signalfd\n", .{});
         return 2;
     };
 
     incident.initSnapshot(state_dir, environ);
     if (cfg.on_incident) |cmd| {
         if (!incident.setHook(cmd)) {
-            std.debug.print("[mandor] invalid on-incident command\n", .{});
+            logmod.print("[mandor] invalid on-incident command\n", .{});
             return 2;
         }
     }
     if (cfg.photon) |endpoint| {
         if (@import("relay.zig").parseHostPort(endpoint) == null or !incident.setPhoton(endpoint)) {
-            std.debug.print("[mandor] invalid photon endpoint (want ip:port)\n", .{});
+            logmod.print("[mandor] invalid photon endpoint (want ip:port)\n", .{});
             return 2;
         }
-        std.debug.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
+        logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
     }
     var give_up_code: ?u8 = null;
 
@@ -165,7 +166,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             if (std.mem.eql(u8, w.nameSlice(), pair.cmd)) dependency = i;
         }
         if (dependent == null or dependency == null or dependent.? == dependency.?) {
-            std.debug.print("[mandor] start_after: bad pair {s}={s}\n", .{ pair.worker, pair.cmd });
+            logmod.print("[mandor] start_after: bad pair {s}={s}\n", .{ pair.worker, pair.cmd });
             return 2;
         }
         dep_of[dependent.?] = @intCast(dependency.?);
@@ -175,7 +176,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         var steps: usize = 0;
         while (cur) |c| : (steps += 1) {
             if (steps > workers.len) {
-                std.debug.print("[mandor] start_after: dependency cycle\n", .{});
+                logmod.print("[mandor] start_after: dependency cycle\n", .{});
                 return 2;
             }
             cur = dep_of[c];
@@ -191,16 +192,16 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     const metrics_server: ?metrics.Server = if (cfg.metrics_port) |port| blk: {
         const srv = metrics.Server.init(port);
         if (srv == null)
-            std.debug.print("[mandor] cannot bind metrics port {d}; continuing without\n", .{port})
+            logmod.print("[mandor] cannot bind metrics port {d}; continuing without\n", .{port})
         else
-            std.debug.print("[mandor] metrics on 127.0.0.1:{d}\n", .{port});
+            logmod.print("[mandor] metrics on 127.0.0.1:{d}\n", .{port});
         break :blk srv;
     } else null;
 
     for (workers, 0..) |*w, i| {
         if (dep_of[i] != null or (oneshot_count > 0 and !w.is_oneshot)) {
             waiting[i] = true;
-            std.debug.print("[mandor] {s} waits for {s}\n", .{
+            logmod.print("[mandor] {s} waits for {s}\n", .{
                 w.nameSlice(),
                 if (dep_of[i]) |di| workers[di].nameSlice() else "init tasks",
             });
@@ -239,7 +240,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     const dep = &workers[di];
                     const up = dep.ready or
                         (dep.pid > 0 and now_dep -| dep.last_start_ms >= 1000);
-                    if (dep.done and !up) std.debug.print("[mandor] {s} is gone; starting {s} anyway\n", .{
+                    if (dep.done and !up) logmod.print("[mandor] {s} is gone; starting {s} anyway\n", .{
                         dep.nameSlice(), w.nameSlice(),
                     });
                     ok = up or dep.done;
@@ -341,7 +342,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             if (!shutting_down) {
                 shutting_down = true;
                 shutdown_deadline_ms = nowMs() + cfg.stop_grace_ms;
-                std.debug.print("[mandor] SIG{t} received, forwarding to workers\n", .{sig});
+                logmod.print("[mandor] SIG{t} received, forwarding to workers\n", .{sig});
                 forwardAll(workers, sig);
                 for (workers, 0..) |*w, i| {
                     w.next_restart_ms = 0;
@@ -350,7 +351,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 }
             } else if (!kill_escalated) {
                 kill_escalated = true;
-                std.debug.print("[mandor] second signal, sending SIGKILL\n", .{});
+                logmod.print("[mandor] second signal, sending SIGKILL\n", .{});
                 forwardAll(workers, .KILL);
             }
         }
@@ -358,7 +359,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             nowMs() >= shutdown_deadline_ms)
         {
             kill_escalated = true;
-            std.debug.print("[mandor] stop-grace expired, sending SIGKILL\n", .{});
+            logmod.print("[mandor] stop-grace expired, sending SIGKILL\n", .{});
             forwardAll(workers, .KILL);
         }
         for (ev.pass[0..ev.pass_n]) |sig| forwardAll(workers, sig);
@@ -404,9 +405,9 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     // failure takes the whole container down, visibly.
                     w.done = true;
                     if (clean) {
-                        std.debug.print("[mandor] init task {s} completed\n", .{w.nameSlice()});
+                        logmod.print("[mandor] init task {s} completed\n", .{w.nameSlice()});
                     } else if (!shutting_down) {
-                        std.debug.print("[mandor] init task {s} failed, shutting down\n", .{w.nameSlice()});
+                        logmod.print("[mandor] init task {s} failed, shutting down\n", .{w.nameSlice()});
                         give_up_code = w.final_code;
                         shutting_down = true;
                         shutdown_deadline_ms = now + cfg.stop_grace_ms;
@@ -427,7 +428,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 if (!shutting_down and backoff.shouldRestart(w.restart_override orelse cfg.restart, clean)) {
                     if (cfg.max_restarts > 0 and w.fail_streak > cfg.max_restarts) {
                         // give up: make the failure visible to the orchestrator
-                        std.debug.print("[mandor] {s} failed {d} consecutive restarts, giving up\n", .{
+                        logmod.print("[mandor] {s} failed {d} consecutive restarts, giving up\n", .{
                             w.nameSlice(), cfg.max_restarts,
                         });
                         w.done = true;
@@ -443,7 +444,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     } else {
                         w.cur_delay_ms = backoff.next(w.cur_delay_ms, now -| w.last_start_ms, cfg.backoff_max_ms);
                         w.next_restart_ms = now + w.cur_delay_ms;
-                        std.debug.print("[mandor] restarting {s} in {d}ms\n", .{
+                        logmod.print("[mandor] restarting {s} in {d}ms\n", .{
                             w.nameSlice(), w.cur_delay_ms,
                         });
                     }
@@ -505,7 +506,7 @@ fn checkRecycle(w: *spawner.Worker, now_ms: u64) void {
         }
     }
     if (reason) |r| {
-        std.debug.print("[mandor] recycling {s}: {s}\n", .{ w.nameSlice(), r });
+        logmod.print("[mandor] recycling {s}: {s}\n", .{ w.nameSlice(), r });
         w.recycling = true;
         posix.kill(-w.pid, .TERM) catch {};
     }
@@ -551,14 +552,14 @@ fn runHealth(
                 // start-period grace: slow booters aren't failures yet
             } else {
                 w.health_fails += 1;
-                std.debug.print("[mandor] health check failed for {s} ({d}/{d})\n", .{
+                logmod.print("[mandor] health check failed for {s} ({d}/{d})\n", .{
                     w.nameSlice(), w.health_fails, health_fail_threshold,
                 });
                 if (w.health_fails >= health_fail_threshold and w.pid > 0) {
                     w.health_fails = 0;
                     incident.onUnhealthy(state_dir, workers, w, health_fail_threshold, now);
                     if (cfg.restart_on_unhealthy) {
-                        std.debug.print("[mandor] {s} unhealthy, sending SIGTERM\n", .{w.nameSlice()});
+                        logmod.print("[mandor] {s} unhealthy, sending SIGTERM\n", .{w.nameSlice()});
                         posix.kill(-w.pid, .TERM) catch {};
                     }
                 }
@@ -586,20 +587,20 @@ fn spawnWorker(
     ready_fd: ?u8,
 ) void {
     spawner.spawn(w, envp, path_env, nowMs(), ready_fd) catch {
-        std.debug.print("[mandor] fork failed for {s}\n", .{w.nameSlice()});
+        logmod.print("[mandor] fork failed for {s}\n", .{w.nameSlice()});
         w.done = true;
         w.final_code = 125;
         return;
     };
-    std.debug.print("[mandor] spawned {s} (pid {d})\n", .{ w.nameSlice(), w.pid });
+    logmod.print("[mandor] spawned {s} (pid {d})\n", .{ w.nameSlice(), w.pid });
 }
 
 fn logDeath(w: *const spawner.Worker) void {
     switch (w.status) {
-        .exited => |code| std.debug.print("[mandor] {s} exited with code {d}\n", .{
+        .exited => |code| logmod.print("[mandor] {s} exited with code {d}\n", .{
             w.nameSlice(), code,
         }),
-        .signaled => |sig| std.debug.print("[mandor] {s} killed by signal {d}\n", .{
+        .signaled => |sig| logmod.print("[mandor] {s} killed by signal {d}\n", .{
             w.nameSlice(), sig,
         }),
         else => {},
@@ -666,7 +667,7 @@ fn readReady(w: *spawner.Worker) void {
     var byte: [16]u8 = undefined;
     const rc = linux.read(w.ready_r, &byte, byte.len);
     if (posix.errno(rc) == .SUCCESS and rc > 0) {
-        if (!w.ready) std.debug.print("[mandor] {s} is ready\n", .{w.nameSlice()});
+        if (!w.ready) logmod.print("[mandor] {s} is ready\n", .{w.nameSlice()});
         w.ready = true;
     }
     capture.closeFd(&w.ready_r); // one-shot either way

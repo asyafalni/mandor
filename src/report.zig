@@ -3,6 +3,7 @@
 //! renders it. Serialization is pure and unit-tested; file IO is Linux-only.
 
 const std = @import("std");
+const logmod = @import("log.zig");
 const builtin = @import("builtin");
 const spawner = @import("spawner.zig");
 const sampler = @import("sampler.zig");
@@ -192,7 +193,7 @@ pub fn writeState(state_dir: []const u8, workers: []const spawner.Worker, now_ms
     if (posix.errno(rc) != .SUCCESS) {
         if (!warned_unwritable) {
             warned_unwritable = true;
-            std.debug.print("[mandor] state dir {s} not writable; report disabled\n", .{state_dir});
+            logmod.print("[mandor] state dir {s} not writable; report disabled\n", .{state_dir});
         }
         return;
     }

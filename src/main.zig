@@ -1,12 +1,27 @@
 const std = @import("std");
+const logmod = @import("log.zig");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
 
 /// Size diet: a panic is a bug (the supervision path never panics by
 /// design), so skip std.debug's DWARF/ELF/decompression stack-trace
 /// machinery (~100 KB) — print the message and trap.
-pub const panic = std.debug.simple_panic;
+pub const panic = std.debug.FullPanic(rawPanic);
 pub const std_options: std.Options = .{ .enable_segfault_handler = false };
+
+/// Raw-syscall panic: message to stderr, immediate exit. Avoids
+/// std.debug's stderr lock machinery (Progress + Io.Threaded vtable orbit).
+fn rawPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    _ = first_trace_addr;
+    if (comptime builtin.os.tag == .linux) {
+        const pre = "panic: ";
+        _ = std.os.linux.write(2, pre, pre.len);
+        _ = std.os.linux.write(2, msg.ptr, msg.len);
+        _ = std.os.linux.write(2, "\n", 1);
+        std.os.linux.exit(127);
+    }
+    @trap();
+}
 
 const version = "0.1.0-dev";
 
@@ -40,7 +55,7 @@ fn writeOut(text: []const u8) void {
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     if (comptime builtin.os.tag != .linux) {
-        std.debug.print("mandor supervises processes on Linux only\n", .{});
+        logmod.print("mandor supervises processes on Linux only\n", .{});
         return 2;
     }
 
@@ -62,7 +77,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var cmd_storage: [cli.max_workers][]const u8 = undefined;
     var cfg = cli.parse(args, &cmd_storage) catch |err| {
-        std.debug.print("[mandor] {s}\n\n", .{switch (err) {
+        logmod.print("[mandor] {s}\n\n", .{switch (err) {
             error.UnknownFlag => "unknown flag",
             error.BadValue => "bad flag value",
             error.TooManyWorkers => "too many workers (max 64)",
@@ -91,7 +106,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var text: ?[]const u8 = null;
         if (cfg.config_path) |path| {
             text = readSmallFile(path, &config_buf) orelse {
-                std.debug.print("[mandor] cannot read config file {s}\n", .{path});
+                logmod.print("[mandor] cannot read config file {s}\n", .{path});
                 return 2;
             };
         } else {
@@ -99,7 +114,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         if (text) |txt| {
             file_cfg = config.parse(txt, &file_cmds) catch |err| {
-                std.debug.print("[mandor] invalid config file: {s}\n", .{@errorName(err)});
+                logmod.print("[mandor] invalid config file: {s}\n", .{@errorName(err)});
                 return 2;
             };
             if (!cfg.restart_set) {
@@ -157,7 +172,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {
-            std.debug.print("[mandor] no worker commands given\n\n", .{});
+            logmod.print("[mandor] no worker commands given\n\n", .{});
             writeOut(usage_text);
             return 2;
         }
@@ -187,7 +202,7 @@ fn runIncidentList(state_dir: []const u8) u8 {
     const linux = std.os.linux;
     const n = spool.listIncidents(state_dir, &incident_entries);
     if (n == 0) {
-        std.debug.print("[mandor] no incidents in {s}/incidents\n", .{state_dir});
+        logmod.print("[mandor] no incidents in {s}/incidents\n", .{state_dir});
         return 0;
     }
     var out_pos: usize = 0;
@@ -237,7 +252,7 @@ fn runReport(state_dir: []const u8, json: bool) u8 {
     const report = @import("report.zig");
     const supervisor = @import("supervisor.zig");
     const text = report.readState(state_dir, &report_read_buf) catch {
-        std.debug.print("[mandor] no state at {s}/state.json — is a supervisor running with this state dir?\n", .{state_dir});
+        logmod.print("[mandor] no state at {s}/state.json — is a supervisor running with this state dir?\n", .{state_dir});
         return 1;
     };
     if (json) {
@@ -245,7 +260,7 @@ fn runReport(state_dir: []const u8, json: bool) u8 {
         return 0;
     }
     const human = report.formatHuman(&report_out_buf, text, supervisor.nowMs()) orelse {
-        std.debug.print("[mandor] state file is corrupt or from an incompatible version\n", .{});
+        logmod.print("[mandor] state file is corrupt or from an incompatible version\n", .{});
         return 1;
     };
     writeOut(human);
