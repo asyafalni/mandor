@@ -225,6 +225,16 @@ if [ -n "$f" ] && grep -q '"kind":"unhealthy"' "$f" && grep -q 'alive but unheal
 else bad "health probe incident" "file=$f $(head -c 200 "$f" 2>/dev/null) log: $(tail -3 "$TMP/19")"; fi
 unset MANDOR_STATE_DIR
 
+# 20. incident history survives supervisor restarts; report --incidents recalls it
+export MANDOR_STATE_DIR="$TMP/state20"
+timeout 10 "$MANDOR" "sh -c 'exit 3'" >/dev/null 2>&1
+timeout 10 "$MANDOR" "sh -c 'kill -SEGV \$\$'" >/dev/null 2>&1
+"$MANDOR" report --incidents >"$TMP/20" 2>&1
+if grep -q "2 incident(s)" "$TMP/20" && grep -q "exit:3" "$TMP/20" && grep -q "signal:SIGSEGV" "$TMP/20"; then
+  ok "incident history recall across restarts"
+else bad "incident history recall" "$(cat "$TMP/20" | head -5)"; fi
+unset MANDOR_STATE_DIR
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

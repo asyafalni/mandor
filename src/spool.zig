@@ -252,7 +252,12 @@ const posix = std.posix;
 var bundle_buf: [128 * 1024]u8 = undefined;
 var seq: u32 = 0;
 
-/// Serialize + write `<state_dir>/incidents/<ts>-<name>-<seq>.json` atomically.
+/// Keep the spool bounded on persistent volumes: newest N incidents win.
+pub const max_incidents = 200;
+
+/// Serialize + write `<state_dir>/incidents/<epoch_ms>-<name>-<seq>.json`
+/// atomically (epoch-ms so supervisor restarts can't collide), then prune
+/// the oldest files beyond max_incidents.
 pub fn write(state_dir: []const u8, in: BundleInput) void {
     const json = serialize(&bundle_buf, in) orelse return;
 
@@ -264,10 +269,14 @@ pub fn write(state_dir: []const u8, in: BundleInput) void {
     _ = linux.mkdirat(linux.AT.FDCWD, dir_z.ptr, 0o755);
 
     seq +%= 1;
+    var now_ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &now_ts);
+    const epoch_ms = @as(u64, @intCast(now_ts.sec)) * 1000 +
+        @as(u64, @intCast(now_ts.nsec)) / 1_000_000;
     var path_buf: [640]u8 = undefined;
     var tmp_buf: [640]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{d}-{s}-{d}.json", .{
-        state_dir, in.ts_epoch, in.name, seq,
+        state_dir, epoch_ms, in.name, seq,
     }) catch return;
     const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/incidents/.tmp-{d}", .{ state_dir, seq }) catch return;
 
@@ -285,7 +294,82 @@ pub fn write(state_dir: []const u8, in: BundleInput) void {
         off += n;
     }
     _ = linux.close(fd);
-    if (off == json.len) _ = linux.rename(tmp.ptr, path.ptr);
+    if (off == json.len) {
+        _ = linux.rename(tmp.ptr, path.ptr);
+        prune(state_dir);
+    }
+}
+
+pub const DirEntry = struct { key: u64, name: [64]u8, name_len: u8 };
+
+/// List incident files sorted oldest-first by their epoch-ms prefix.
+pub fn listIncidents(state_dir: []const u8, out: []DirEntry) usize {
+    var dir_buf: [512]u8 = undefined;
+    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}/incidents", .{state_dir}) catch return 0;
+    const rc = linux.openat(linux.AT.FDCWD, dir_z.ptr, .{ .DIRECTORY = true }, 0);
+    if (posix.errno(rc) != .SUCCESS) return 0;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    var n: usize = 0;
+    var buf: [8192]u8 align(8) = undefined;
+    while (true) {
+        const got = linux.getdents64(fd, &buf, buf.len);
+        if (posix.errno(got) != .SUCCESS or got == 0) break;
+        var off: usize = 0;
+        while (off < got) {
+            const ent: *const linux.dirent64 = @ptrCast(@alignCast(&buf[off]));
+            off += ent.reclen;
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.name)));
+            if (name.len == 0 or name[0] < '0' or name[0] > '9' or name.len > 63) continue;
+            var key: u64 = 0;
+            var i: usize = 0;
+            while (i < name.len and name[i] >= '0' and name[i] <= '9') : (i += 1) {
+                key = key *| 10 +| (name[i] - '0');
+            }
+            if (n < out.len) {
+                out[n].key = key;
+                @memcpy(out[n].name[0..name.len], name);
+                out[n].name_len = @intCast(name.len);
+                n += 1;
+            } else {
+                // keep the newest: replace the oldest entry if this is newer
+                var oldest: usize = 0;
+                for (out[0..n], 0..) |e, j| {
+                    if (e.key < out[oldest].key) oldest = j;
+                }
+                if (key > out[oldest].key) {
+                    out[oldest].key = key;
+                    @memcpy(out[oldest].name[0..name.len], name);
+                    out[oldest].name_len = @intCast(name.len);
+                }
+            }
+        }
+    }
+    // insertion sort — n is small and bounded
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        const tmp_e = out[i];
+        var j = i;
+        while (j > 0 and out[j - 1].key > tmp_e.key) : (j -= 1) out[j] = out[j - 1];
+        out[j] = tmp_e;
+    }
+    return n;
+}
+
+var prune_entries: [max_incidents + 16]DirEntry = undefined;
+
+/// Delete oldest incidents beyond max_incidents (persistent-volume hygiene).
+fn prune(state_dir: []const u8) void {
+    const n = listIncidents(state_dir, &prune_entries);
+    if (n <= max_incidents) return;
+    for (prune_entries[0 .. n - max_incidents]) |*e| {
+        var path_buf: [640]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
+            state_dir, e.name[0..e.name_len],
+        }) catch continue;
+        _ = linux.unlinkat(linux.AT.FDCWD, p.ptr, 0);
+    }
 }
 
 // ---------------------------------------------------------------- tests

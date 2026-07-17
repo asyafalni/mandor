@@ -19,6 +19,7 @@ pub const Config = struct {
     help: bool = false,
     version: bool = false,
     json: bool = false,
+    incidents: bool = false,
     /// null = not given on the CLI; caller resolves env/config/default.
     state_dir: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
@@ -132,6 +133,9 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
             } else if (std.mem.eql(u8, arg, "--json")) {
                 if (cfg.mode != .report) return error.UnknownFlag;
                 cfg.json = true;
+            } else if (std.mem.eql(u8, arg, "--incidents")) {
+                if (cfg.mode != .report) return error.UnknownFlag;
+                cfg.incidents = true;
             } else {
                 return error.UnknownFlag;
             }

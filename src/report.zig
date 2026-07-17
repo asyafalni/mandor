@@ -63,7 +63,7 @@ pub fn serialize(buf: []u8, workers: []const spawner.Worker, now_ms: u64) ?[]con
 // known-shape scanner: ~100 lines instead of std.json's tables (which blew
 // the 500 KB binary budget).
 
-fn scanU64(chunk: []const u8, comptime key: []const u8) ?u64 {
+pub fn scanU64(chunk: []const u8, comptime key: []const u8) ?u64 {
     const pat = "\"" ++ key ++ "\":";
     const i = std.mem.indexOf(u8, chunk, pat) orelse return null;
     var j = i + pat.len;
@@ -76,7 +76,7 @@ fn scanU64(chunk: []const u8, comptime key: []const u8) ?u64 {
     return if (any) v else null;
 }
 
-fn scanStr(chunk: []const u8, comptime key: []const u8) ?[]const u8 {
+pub fn scanStr(chunk: []const u8, comptime key: []const u8) ?[]const u8 {
     const pat = "\"" ++ key ++ "\":\"";
     const i = std.mem.indexOf(u8, chunk, pat) orelse return null;
     const start = i + pat.len;

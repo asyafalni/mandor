@@ -8,19 +8,21 @@ const usage_text =
     \\mandor — the foreman for your containers
     \\
     \\usage:
-    \\  mandor [flags] [--] "CMD" ["CMD" ...]
+    \\  mandor [flags] [--] "CMD" ["CMD" ...]     supervise workers
+    \\  mandor report [--json | --incidents]      live status / crash history
     \\  mandor --help | --version
     \\
     \\flags:
-    \\  --restart=never|on-failure|always   restart policy (default: never)
-    \\  --backoff-max=DUR                   restart backoff cap, e.g. 500ms|30s|2m (default: 30s)
+    \\  --restart=never|on-failure|always   restart crashed workers (default: never)
     \\  --config=PATH                       mandor.toml (default: ./mandor.toml if present)
-    \\  --state-dir=PATH                    state + incident spool dir (default: /var/lib/mandor)
-    \\  --metrics=PORT                      serve Prometheus text metrics on 127.0.0.1:PORT
+    \\  --health="NAME=CMD"                 liveness probe for a worker (exit 0 = healthy)
+    \\  --metrics=PORT                      Prometheus metrics on 127.0.0.1:PORT
     \\
-    \\Each CMD is one worker: quoted command line, tokenized by mandor
-    \\(no shell needed). Signals TERM/INT/HUP are forwarded to workers.
-    \\mandor exits with the worst worker exit code (128+N for signal deaths).
+    \\Workers are quoted command lines — no shell needed. Signals are forwarded
+    \\(grandchildren included); mandor exits with the worst worker exit code.
+    \\Everything else has sane defaults; advanced flags (--backoff-max,
+    \\--stop-grace, --expected-exit, --state-dir, --ready-fd, --health-interval,
+    \\--restart-on-unhealthy) are in the README.
     \\
 ;
 
@@ -124,13 +126,55 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         (spawner.findEnv(environ, "MANDOR_STATE_DIR") orelse
             (file_cfg.state_dir orelse cli.default_state_dir));
 
-    if (cfg.mode == .report) return runReport(state_dir, cfg.json);
+    if (cfg.mode == .report) {
+        if (cfg.incidents) return runIncidentList(state_dir);
+        return runReport(state_dir, cfg.json);
+    }
 
     const supervisor = @import("supervisor.zig");
     return supervisor.run(cfg, state_dir, environ);
 }
 
 var config_buf: [64 * 1024]u8 = undefined;
+var incident_entries: [256]@import("spool.zig").DirEntry = undefined;
+
+/// `mandor report --incidents` — recall the spooled history (survives
+/// restarts when the state dir is a mounted volume).
+fn runIncidentList(state_dir: []const u8) u8 {
+    const spool = @import("spool.zig");
+    const report = @import("report.zig");
+    const linux = std.os.linux;
+    const n = spool.listIncidents(state_dir, &incident_entries);
+    if (n == 0) {
+        std.debug.print("[mandor] no incidents in {s}/incidents\n", .{state_dir});
+        return 0;
+    }
+    var out_pos: usize = 0;
+    const jb = @import("jsonbuf.zig");
+    _ = jb.appendf(&report_out_buf, &out_pos, "{d} incident(s) in {s}/incidents (oldest first)\n\n", .{ n, state_dir });
+    _ = jb.appendf(&report_out_buf, &out_pos, "{s:<21} {s:<14} {s:<14} {s}\n", .{ "TIME", "WORKER", "CAUSE", "VERDICT" });
+    for (incident_entries[0..n]) |*e| {
+        var path_buf: [640]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
+            state_dir, e.name[0..e.name_len],
+        }) catch continue;
+        const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
+        if (std.posix.errno(rc) != .SUCCESS) continue;
+        const fd: i32 = @intCast(rc);
+        const got = linux.read(fd, &report_read_buf, report_read_buf.len);
+        _ = linux.close(fd);
+        if (std.posix.errno(got) != .SUCCESS) continue;
+        const text = report_read_buf[0..got];
+        _ = jb.appendf(&report_out_buf, &out_pos, "{s:<21} {s:<14} {s:<14} {s}\n", .{
+            report.scanStr(text, "ts") orelse "?",
+            report.scanStr(text, "name") orelse "?",
+            report.scanStr(text, "cause_str") orelse "?",
+            report.scanStr(text, "verdict") orelse "?",
+        });
+    }
+    writeOut(report_out_buf[0..out_pos]);
+    return 0;
+}
 
 fn readSmallFile(path: []const u8, buf: []u8) ?[]const u8 {
     const linux = std.os.linux;

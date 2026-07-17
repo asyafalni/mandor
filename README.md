@@ -1,8 +1,8 @@
-<p align="center">
-  <img src="docs/mandor-logo.webp" alt="mandor logo" width="220">
-</p>
-
 # mandor
+
+<p align="center">
+  <img src="docs/mandor-logo.webp" alt="mandor logo" width="140">
+</p>
 
 > **the foreman for your containers** — a tiny PID-1 process supervisor that
 > watches your workers, captures their logs, and tells you *why* they died.
@@ -77,19 +77,55 @@ mandor report --json     # machine-readable
 
 ### Flags
 
+Everyday — this is the whole surface most deployments need:
+
 | Flag | Values | Default |
 |---|---|---|
 | `--restart` | `never` \| `on-failure` \| `always` | `never` |
-| `--backoff-max` | duration (`500ms`, `30s`, `2m`) | `30s` |
 | `--config` | path to `mandor.toml` | `./mandor.toml` if present |
-| `--state-dir` | state + incident spool dir | `/var/lib/mandor` |
+| `--health` | `NAME=CMD` probe (repeatable; exit 0 = healthy) | none |
 | `--metrics` | port for Prometheus text metrics on 127.0.0.1 | off |
+
+<details>
+<summary>Advanced flags (sane defaults — most users never touch these)</summary>
+
+| Flag | Values | Default |
+|---|---|---|
+| `--backoff-max` | restart backoff cap (`500ms`, `30s`, `2m`) | `30s` |
+| `--state-dir` | state + incident spool dir (or `MANDOR_STATE_DIR`) | `/var/lib/mandor` |
 | `--stop-grace` | TERM→KILL escalation grace period | `10s` |
 | `--expected-exit` | extra exit codes treated as success, e.g. `143,129` | none |
-| `--health` | `NAME=CMD` probe (repeatable; exit 0 = healthy) | none |
 | `--health-interval` | probe cadence | `30s` |
 | `--restart-on-unhealthy` | SIGTERM a worker after 3 failed probes | off |
 | `--ready-fd` | fd workers write a newline to when ready (s6-style) | off |
+
+</details>
+
+### Surviving container restarts
+
+Everything durable — live state and the incident archive — lives under one
+directory (`/var/lib/mandor`), written atomically. A `docker restart` keeps
+it automatically. To survive **new** containers (redeploys, pod
+rescheduling), mount a volume there:
+
+```console
+docker run -v mandor-state:/var/lib/mandor ... my-image
+```
+
+Kubernetes: an `emptyDir` volume survives container restarts within a pod; a
+PersistentVolumeClaim survives rescheduling. Then recall history any time:
+
+```console
+$ mandor report --incidents
+2 incident(s) in /var/lib/mandor/incidents (oldest first)
+
+TIME                  WORKER   CAUSE           VERDICT
+2026-07-17T13:31:37Z  api      exit:3          exit:3 after 0s uptime
+2026-07-17T13:31:38Z  worker   signal:SIGSEGV  go panic in main.crash (main.go:10)
+```
+
+The spool keeps the newest 200 incidents and prunes older ones, so a
+persistent volume never fills up.
 
 ### Configuration file (optional)
 
