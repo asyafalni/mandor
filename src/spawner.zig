@@ -31,6 +31,7 @@ pub const Worker = struct {
     argc: u8 = 0,
     pid: i32 = 0, // 0 = not running
     status: Status = .not_started,
+    core_dumped: bool = false,
     restarts: u32 = 0,
     cur_delay_ms: u64 = 0,
     last_start_ms: u64 = 0,
@@ -62,6 +63,7 @@ fn resetWorker(w: *Worker) void {
     w.argc = 0;
     w.pid = 0;
     w.status = .not_started;
+    w.core_dumped = false;
     w.restarts = 0;
     w.cur_delay_ms = 0;
     w.last_start_ms = 0;

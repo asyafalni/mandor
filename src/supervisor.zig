@@ -51,6 +51,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
 
     var shutting_down = false;
     var kill_escalated = false;
+    var shutdown_deadline_ms: u64 = 0;
     var next_sample_ms: u64 = nowMs() + sampler.interval_ms;
     var oom_kills: u64 = cgroup.readOomKills() orelse 0;
     const metrics_server: ?metrics.Server = if (cfg.metrics_port) |port| blk: {
@@ -82,6 +83,9 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         var wake_at: u64 = next_sample_ms;
         if (!shutting_down and next_deadline != 0 and next_deadline < wake_at)
             wake_at = next_deadline;
+        if (shutting_down and !kill_escalated and shutdown_deadline_ms != 0 and
+            shutdown_deadline_ms < wake_at)
+            wake_at = shutdown_deadline_ms;
         const now_for_timeout = nowMs();
         const timeout: i32 = if (wake_at <= now_for_timeout)
             0
@@ -129,6 +133,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         if (ev.term_or_int) |sig| {
             if (!shutting_down) {
                 shutting_down = true;
+                shutdown_deadline_ms = nowMs() + cfg.stop_grace_ms;
                 std.debug.print("[mandor] SIG{t} received, forwarding to workers\n", .{sig});
                 forwardAll(workers, sig);
                 for (workers) |*w| {
@@ -140,6 +145,13 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 std.debug.print("[mandor] second signal, sending SIGKILL\n", .{});
                 forwardAll(workers, .KILL);
             }
+        }
+        if (shutting_down and !kill_escalated and shutdown_deadline_ms != 0 and
+            nowMs() >= shutdown_deadline_ms)
+        {
+            kill_escalated = true;
+            std.debug.print("[mandor] stop-grace expired, sending SIGKILL\n", .{});
+            forwardAll(workers, .KILL);
         }
         for (ev.pass[0..ev.pass_n]) |sig| forwardAll(workers, sig);
 
@@ -156,10 +168,11 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             for (workers) |*w| {
                 if (w.pid != 0 or w.done or w.next_restart_ms != 0) continue;
                 const clean = switch (w.status) {
-                    .exited => |code| code == 0,
+                    .exited => |code| cfg.expected_exit[code],
                     .signaled => false,
                     else => continue, // not_started/running: nothing new here
                 };
+                if (clean) w.final_code = 0; // expected codes count as success
                 closePipes(w);
                 logDeath(w);
                 if (!shutting_down and !clean) {

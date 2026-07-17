@@ -12,6 +12,8 @@ pub const FileConfig = struct {
     backoff_max_ms: ?u64 = null,
     state_dir: ?[]const u8 = null, // slice into the file buffer
     metrics_port: ?u16 = null,
+    stop_grace_ms: ?u64 = null,
+    expected_exit: ?[256]bool = null,
     commands: []const []const u8 = &.{},
 };
 
@@ -66,6 +68,14 @@ pub fn parse(
             cfg.backoff_max_ms = cli.parseDuration(s) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "state_dir")) {
             cfg.state_dir = parseString(value) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "stop_grace")) {
+            const s = parseString(value) orelse return error.BadValue;
+            cfg.stop_grace_ms = cli.parseDuration(s) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "expected_exit")) {
+            const s = parseString(value) orelse return error.BadValue;
+            var set = [1]bool{true} ++ [1]bool{false} ** 255;
+            if (!cli.parseExpectedExit(s, &set)) return error.BadValue;
+            cfg.expected_exit = set;
         } else if (std.mem.eql(u8, key, "metrics_port")) {
             cfg.metrics_port = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
         } else if (std.mem.eql(u8, key, "workers")) {
@@ -127,6 +137,14 @@ test "full config parses" {
     try t.expectEqual(@as(u16, 9464), cfg.metrics_port.?);
     try t.expectEqual(@as(usize, 2), cfg.commands.len);
     try t.expectEqualStrings("./api --port 8080", cfg.commands[0]);
+}
+
+test "stop_grace and expected_exit keys" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const cfg = try parse("stop_grace = \"5s\"\nexpected_exit = \"143\"", &storage);
+    try t.expectEqual(@as(u64, 5_000), cfg.stop_grace_ms.?);
+    try t.expect(cfg.expected_exit.?[143]);
+    try t.expect(cfg.expected_exit.?[0]);
 }
 
 test "multiline workers array" {

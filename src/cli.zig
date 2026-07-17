@@ -20,10 +20,31 @@ pub const Config = struct {
     state_dir: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
     metrics_port: ?u16 = null,
+    /// Exit codes treated exactly like exit 0 (restart policy, incidents,
+    /// worst-code propagation). Index = code; 0 is always clean.
+    expected_exit: [256]bool = [1]bool{true} ++ [1]bool{false} ** 255,
+    /// Grace period between forwarding TERM/INT and escalating to SIGKILL.
+    stop_grace_ms: u64 = 10_000,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,
+    stop_grace_set: bool = false,
+    expected_exit_set: bool = false,
 };
+
+/// "143,129" -> set the listed codes (on top of the always-clean 0).
+pub fn parseExpectedExit(s: []const u8, out: *[256]bool) bool {
+    var it = std.mem.splitScalar(u8, s, ',');
+    var any = false;
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len == 0) continue;
+        const code = std.fmt.parseInt(u8, trimmed, 10) catch return false;
+        out[code] = true;
+        any = true;
+    }
+    return any;
+}
 
 pub const ParseError = error{ UnknownFlag, BadValue, TooManyWorkers };
 
@@ -60,6 +81,14 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
                 cfg.backoff_max_ms = parseDuration(arg["--backoff-max=".len..]) orelse
                     return error.BadValue;
                 cfg.backoff_set = true;
+            } else if (std.mem.startsWith(u8, arg, "--stop-grace=")) {
+                cfg.stop_grace_ms = parseDuration(arg["--stop-grace=".len..]) orelse
+                    return error.BadValue;
+                cfg.stop_grace_set = true;
+            } else if (std.mem.startsWith(u8, arg, "--expected-exit=")) {
+                if (!parseExpectedExit(arg["--expected-exit=".len..], &cfg.expected_exit))
+                    return error.BadValue;
+                cfg.expected_exit_set = true;
             } else if (std.mem.startsWith(u8, arg, "--config=")) {
                 const v = arg["--config=".len..];
                 if (v.len == 0) return error.BadValue;
@@ -294,6 +323,18 @@ test "parse report subcommand" {
     try expectError(error.BadValue, parse(&.{ "report", "./cmd" }, &storage));
     // --json is report-only
     try expectError(error.UnknownFlag, parse(&.{ "--json", "./cmd" }, &storage));
+}
+
+test "stop-grace and expected-exit flags" {
+    var storage: [max_workers][]const u8 = undefined;
+    const cfg = try parse(&.{ "--stop-grace=3s", "--expected-exit=143,129", "./a" }, &storage);
+    try expectEqual(@as(u64, 3_000), cfg.stop_grace_ms);
+    try expect(cfg.expected_exit[0]);
+    try expect(cfg.expected_exit[143]);
+    try expect(cfg.expected_exit[129]);
+    try expect(!cfg.expected_exit[1]);
+    try expectError(error.BadValue, parse(&.{ "--expected-exit=abc", "./a" }, &storage));
+    try expectError(error.BadValue, parse(&.{ "--stop-grace=oops", "./a" }, &storage));
 }
 
 test "parse help and version short-circuit NoCommands" {

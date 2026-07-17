@@ -94,6 +94,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 if (file_cfg.backoff_max_ms) |b| cfg.backoff_max_ms = b;
             }
             if (cfg.metrics_port == null) cfg.metrics_port = file_cfg.metrics_port;
+            if (!cfg.stop_grace_set) {
+                if (file_cfg.stop_grace_ms) |g| cfg.stop_grace_ms = g;
+            }
+            if (!cfg.expected_exit_set) {
+                if (file_cfg.expected_exit) |set| cfg.expected_exit = set;
+            }
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {

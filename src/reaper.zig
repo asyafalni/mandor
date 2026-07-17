@@ -33,6 +33,7 @@ pub fn drain(workers: []spawner.Worker) ReapSummary {
                 const sig: u8 = @truncate(@intFromEnum(linux.W.TERMSIG(st)));
                 w.status = .{ .signaled = sig };
                 w.final_code = 128 +| sig;
+                w.core_dumped = (st & 0x80) != 0; // WCOREDUMP bit
             } else {
                 w.status = .{ .exited = 255 };
                 w.final_code = 255;
