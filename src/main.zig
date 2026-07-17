@@ -122,6 +122,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             }
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
+            cfg.env_pairs = file_cfg.env_pairs;
+            cfg.env_pairs_n = file_cfg.env_pairs_n;
+            cfg.cwd_pairs = file_cfg.cwd_pairs;
+            cfg.cwd_pairs_n = file_cfg.cwd_pairs_n;
+            cfg.oneshot = file_cfg.oneshot;
+            cfg.oneshot_n = file_cfg.oneshot_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {

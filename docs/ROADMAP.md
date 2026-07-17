@@ -54,8 +54,8 @@ cuts, s6 oneshots, pm2). Strict lowest-hanging-fruit order: build top-down.
 | 18 ✅ | `max_restarts` give-up → mandor exits nonzero | XS | ● ● ● ● | SHIPPED 2026-07-17 |
 | 19 ✅ | On-incident hook (exec argv + bundle path, no shell) | XS | ● ● ● ● | SHIPPED 2026-07-17 — premium sidecar bridge AND the [photon integration](INTEGRATION-PHOTON.md) primitive |
 | 20 ✅ | Health-check `start_period` grace | XS | ● ● ● ○ | SHIPPED 2026-07-17 (default 10s) |
-| 21 | Per-worker `env` / `cwd` | XS | ● ● ● ○ | No shell in scratch to set these; snapshot reporting already free |
-| 22 | Oneshot init tasks (gates dependents via `start_after`) | S | ● ● ● ● | Migrations-before-workers; failed oneshot = LLM-fixable bundle + hard exit |
+| 21 ✅ | Per-worker `env` / `cwd` | XS | ● ● ● ○ | No shell in scratch to set these; snapshot reporting already free |
+| 22 ✅ | Oneshot init tasks (gates dependents via `start_after`) | S | ● ● ● ● | Migrations-before-workers; failed oneshot = LLM-fixable bundle + hard exit |
 | 23 | Per-worker `user = "uid:gid"` drop (numeric) | S | ● ● ● ○ | Root PID 1 + non-root workers without gosu |
 | 24 | `oom_score_adj` / `nice` knobs | XS | ● ● ○ ○ | Steer the OOM killer; hold until asked |
 | 25 | `replicas = N` scaling (no fd sharing) | S | ● ● ○ ○ | compose/VPS queue workers; hold until asked |

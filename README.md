@@ -158,9 +158,13 @@ workers = [
   "./api --port 8080",
   "./worker",
 ]
-# optional: liveness probes and start ordering
+# optional: liveness probes, ordering, init tasks, per-worker settings
 health = ["api=/bin/check-api"]
 start_after = ["worker=api"]   # worker starts once api is up (ready or alive 1s)
+oneshot = ["migrate"]          # init tasks run first; failure aborts startup
+env = ["api=PORT=8080"]        # per-worker environment additions
+cwd = ["api=/srv/app"]         # per-worker working directory
+on_incident = "/notify"        # exec'd with each incident bundle path
 ```
 
 Signals (dumb-init parity): every worker runs in its own process group, so
@@ -231,6 +235,10 @@ unchanged — CI runs the full integration harness on all three distro bases.
 - [x] **v0.6** — liveness: schema v4 with structured trace frames
       (`function`/`file`/`line`/`in_app`), command health checks catching
       hung workers, s6-style readiness fd, ELF build-id extraction
+- [x] **v0.7** — start_after ordering, persistent incident history (schema
+      v5), release pipeline (binaries + .deb/.apk/.rpm + ghcr.io image)
+- [x] **v0.8** — max-restarts give-up, on-incident hook, health start-period,
+      oneshot init tasks, per-worker env/cwd
 
 Full prioritized list with complexity/value ranking: [docs/ROADMAP.md](docs/ROADMAP.md).
 

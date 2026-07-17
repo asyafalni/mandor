@@ -50,6 +50,14 @@ pub const Config = struct {
     health_start_period_set: bool = false,
     /// Command exec'd after each incident bundle write, bundle path appended.
     on_incident: ?[]const u8 = null,
+    /// Per-worker extras (TOML-only): "name=KEY=VAL" env pairs, "name=/path"
+    /// working dirs, and names of workers that are one-shot init tasks.
+    env_pairs: [64]HealthSpec = undefined,
+    env_pairs_n: u8 = 0,
+    cwd_pairs: [16]HealthSpec = undefined,
+    cwd_pairs_n: u8 = 0,
+    oneshot: [16][]const u8 = undefined,
+    oneshot_n: u8 = 0,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,

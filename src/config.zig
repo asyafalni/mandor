@@ -25,10 +25,16 @@ pub const FileConfig = struct {
     /// "dependent=dependency" worker-name pairs.
     start_after: [cli.max_workers]cli.HealthSpec = undefined,
     start_after_n: u8 = 0,
+    env_pairs: [64]cli.HealthSpec = undefined,
+    env_pairs_n: u8 = 0,
+    cwd_pairs: [16]cli.HealthSpec = undefined,
+    cwd_pairs_n: u8 = 0,
+    oneshot: [16][]const u8 = undefined,
+    oneshot_n: u8 = 0,
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot };
 
 pub const ParseError = error{ Syntax, BadValue, TooManyWorkers };
 
@@ -111,11 +117,18 @@ pub fn parse(
             else
                 return error.BadValue;
         } else if (std.mem.eql(u8, key, "workers") or std.mem.eql(u8, key, "health") or
-            std.mem.eql(u8, key, "start_after"))
+            std.mem.eql(u8, key, "start_after") or std.mem.eql(u8, key, "env") or
+            std.mem.eql(u8, key, "cwd") or std.mem.eql(u8, key, "oneshot"))
         {
-            const this_target: ArrayTarget = if (key[0] == 'w')
+            const this_target: ArrayTarget = if (std.mem.eql(u8, key, "workers"))
                 .workers
-            else if (key[0] == 'h') .health else .start_after;
+            else if (std.mem.eql(u8, key, "health"))
+                .health
+            else if (std.mem.eql(u8, key, "start_after"))
+                .start_after
+            else if (std.mem.eql(u8, key, "env"))
+                .env
+            else if (std.mem.eql(u8, key, "cwd")) .cwd else .oneshot;
             if (value.len == 0 or value[0] != '[') return error.BadValue;
             var rest = std.mem.trim(u8, value[1..], " \t");
             const closed = std.mem.endsWith(u8, rest, "]");
@@ -163,6 +176,25 @@ fn appendItem(
             if (cfg.start_after_n == cli.max_workers) return error.BadValue;
             cfg.start_after[cfg.start_after_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
             cfg.start_after_n += 1;
+        },
+        .env => {
+            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
+            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
+            if (cfg.env_pairs_n == cfg.env_pairs.len) return error.BadValue;
+            cfg.env_pairs[cfg.env_pairs_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
+            cfg.env_pairs_n += 1;
+        },
+        .cwd => {
+            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
+            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
+            if (cfg.cwd_pairs_n == cfg.cwd_pairs.len) return error.BadValue;
+            cfg.cwd_pairs[cfg.cwd_pairs_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
+            cfg.cwd_pairs_n += 1;
+        },
+        .oneshot => {
+            if (cfg.oneshot_n == cfg.oneshot.len) return error.BadValue;
+            cfg.oneshot[cfg.oneshot_n] = s;
+            cfg.oneshot_n += 1;
         },
         .none => unreachable, // callers always pass a real target
     }
@@ -220,6 +252,18 @@ test "health, ready_fd and restart_on_unhealthy keys" {
     try t.expectEqual(@as(u8, 1), cfg.health_n);
     try t.expectEqualStrings("api", cfg.health[0].worker);
     try t.expectEqualStrings("/bin/check --fast", cfg.health[0].cmd);
+}
+
+test "env, cwd, oneshot keys" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const cfg = try parse(
+        "env = [\"api=PORT=8080\", \"api=DEBUG=1\"]\ncwd = [\"api=/srv\"]\noneshot = [\"migrate\"]",
+        &storage,
+    );
+    try t.expectEqual(@as(u8, 2), cfg.env_pairs_n);
+    try t.expectEqualStrings("PORT=8080", cfg.env_pairs[0].cmd);
+    try t.expectEqualStrings("/srv", cfg.cwd_pairs[0].cmd);
+    try t.expectEqualStrings("migrate", cfg.oneshot[0]);
 }
 
 test "start_after key" {

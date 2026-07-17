@@ -286,6 +286,46 @@ kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
 if ! grep -q "health check failed" "$TMP/24"; then ok "start-period grace suppresses early probe failures"
 else bad "start-period grace" "$(grep "health check" "$TMP/24" | head -2)"; fi
 
+# 25. per-worker env + cwd from TOML
+cat > "$TMP/ec.toml" <<'TOML'
+workers = ["sh -c 'echo got=$FOO at=$PWD'"]
+env = ["sh=FOO=bar"]
+cwd = ["sh=/tmp"]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/ec.toml" >"$TMP/25" 2>&1
+if grep -q "got=bar at=/tmp" "$TMP/25"; then ok "per-worker env and cwd applied"
+else bad "per-worker env/cwd" "$(grep got= "$TMP/25")"; fi
+
+# 26. oneshot completes before workers start
+cat > "$TMP/os.toml" <<'TOML'
+workers = [
+  "sh -c 'echo migrate-done'",
+  "sh -c 'echo app-run'",
+]
+oneshot = ["sh"]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/os.toml" >"$TMP/26" 2>&1
+c=$?
+mig=$(grep -n "migrate-done" "$TMP/26" | head -1 | cut -d: -f1)
+app=$(grep -n "spawned sh-2" "$TMP/26" | head -1 | cut -d: -f1)
+if [ $c -eq 0 ] && [ -n "$mig" ] && [ -n "$app" ] && [ "$app" -gt "$mig" ]; then
+  ok "oneshot gates worker start"
+else bad "oneshot ordering" "exit $c mig=$mig app=$app: $(head -6 "$TMP/26")"; fi
+
+# 27. failed oneshot aborts startup with its code
+cat > "$TMP/osf.toml" <<'TOML'
+workers = [
+  "sh -c 'exit 7'",
+  "sleep 30",
+]
+oneshot = ["sh"]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/osf.toml" >"$TMP/27" 2>&1
+c=$?
+if [ $c -eq 7 ] && ! grep -q "spawned sleep" "$TMP/27" && grep -q "init task sh failed" "$TMP/27"; then
+  ok "failed oneshot aborts with its exit code"
+else bad "failed oneshot abort" "exit $c: $(head -5 "$TMP/27")"; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

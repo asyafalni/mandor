@@ -41,6 +41,25 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         std.debug.print("[mandor] invalid command line\n", .{});
         return 2;
     };
+    for (cfg.env_pairs[0..cfg.env_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            if (!spawner.addEnv(w, pair.cmd))
+                std.debug.print("[mandor] env overflow for {s}\n", .{pair.worker});
+        } else std.debug.print("[mandor] env: no worker named {s}\n", .{pair.worker});
+    }
+    for (cfg.cwd_pairs[0..cfg.cwd_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            if (!spawner.setCwd(w, pair.cmd))
+                std.debug.print("[mandor] cwd too long for {s}\n", .{pair.worker});
+        } else std.debug.print("[mandor] cwd: no worker named {s}\n", .{pair.worker});
+    }
+    var oneshot_count: usize = 0;
+    for (cfg.oneshot[0..cfg.oneshot_n]) |name| {
+        if (findWorker(workers, name)) |w| {
+            w.is_oneshot = true;
+            oneshot_count += 1;
+        } else std.debug.print("[mandor] oneshot: no worker named {s}\n", .{name});
+    }
     for (cfg.health[0..cfg.health_n]) |spec| {
         var matched = false;
         for (workers) |*w| {
@@ -117,10 +136,11 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     } else null;
 
     for (workers, 0..) |*w, i| {
-        if (dep_of[i] != null) {
+        if (dep_of[i] != null or (oneshot_count > 0 and !w.is_oneshot)) {
             waiting[i] = true;
             std.debug.print("[mandor] {s} waits for {s}\n", .{
-                w.nameSlice(), workers[dep_of[i].?].nameSlice(),
+                w.nameSlice(),
+                if (dep_of[i]) |di| workers[di].nameSlice() else "init tasks",
             });
         } else {
             spawnWorker(w, envp, path_env, cfg.ready_fd);
@@ -152,12 +172,18 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             const now_dep = nowMs();
             for (workers, 0..) |*w, i| {
                 if (!waiting[i]) continue;
-                const dep = &workers[dep_of[i].?];
-                const up = dep.ready or (dep.pid > 0 and now_dep -| dep.last_start_ms >= 1000);
-                if (up or dep.done) {
-                    if (dep.done) std.debug.print("[mandor] {s} is gone; starting {s} anyway\n", .{
+                var ok = true;
+                if (dep_of[i]) |di| {
+                    const dep = &workers[di];
+                    const up = dep.ready or
+                        (dep.pid > 0 and now_dep -| dep.last_start_ms >= 1000);
+                    if (dep.done and !up) std.debug.print("[mandor] {s} is gone; starting {s} anyway\n", .{
                         dep.nameSlice(), w.nameSlice(),
                     });
+                    ok = up or dep.done;
+                }
+                if (ok and !w.is_oneshot) ok = allOneshotsDone(workers);
+                if (ok) {
                     waiting[i] = false;
                     spawnWorker(w, envp, path_env, cfg.ready_fd);
                 }
@@ -188,7 +214,8 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         if (!shutting_down) {
             for (0..workers.len) |i| {
                 if (!waiting[i]) continue;
-                const dep = &workers[dep_of[i].?];
+                const di = dep_of[i] orelse continue; // oneshot-gated: chld-driven
+                const dep = &workers[di];
                 if (dep.pid > 0) {
                     const t = dep.last_start_ms + 1000;
                     if (t < wake_at) wake_at = t;
@@ -304,6 +331,26 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     if (w.det.restartLoopTriggered(now)) |count|
                         incident.onRestartLoop(state_dir, workers, w, count, now);
                 }
+                if (w.is_oneshot) {
+                    // Init task: never restarted. Success unblocks the fleet;
+                    // failure takes the whole container down, visibly.
+                    w.done = true;
+                    if (clean) {
+                        std.debug.print("[mandor] init task {s} completed\n", .{w.nameSlice()});
+                    } else if (!shutting_down) {
+                        std.debug.print("[mandor] init task {s} failed, shutting down\n", .{w.nameSlice()});
+                        give_up_code = w.final_code;
+                        shutting_down = true;
+                        shutdown_deadline_ms = now + cfg.stop_grace_ms;
+                        forwardAll(workers, .TERM);
+                        for (workers, 0..) |*other, oi| {
+                            other.next_restart_ms = 0;
+                            waiting[oi] = false;
+                            if (other.pid == 0) other.done = true;
+                        }
+                    }
+                    continue;
+                }
                 if (!shutting_down and backoff.shouldRestart(cfg.restart, clean)) {
                     if (cfg.max_restarts > 0 and w.fail_streak > cfg.max_restarts) {
                         // give up: make the failure visible to the orchestrator
@@ -367,6 +414,20 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     // On give-up, report the flapping worker's code — not the TERM fallout
     // from shutting its siblings down.
     return give_up_code orelse worst;
+}
+
+fn findWorker(workers: []spawner.Worker, name: []const u8) ?*spawner.Worker {
+    for (workers) |*w| {
+        if (std.mem.eql(u8, w.nameSlice(), name)) return w;
+    }
+    return null;
+}
+
+fn allOneshotsDone(workers: []spawner.Worker) bool {
+    for (workers) |*w| {
+        if (w.is_oneshot and !w.done) return false;
+    }
+    return true;
 }
 
 const health_timeout_ms: u64 = 10_000;

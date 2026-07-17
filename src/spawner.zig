@@ -52,6 +52,15 @@ pub const Worker = struct {
     health_done: bool = false, // set by reaper when a probe was collected
     health_ok: bool = false,
     health_ever_ok: bool = false, // start-period grace ends at first success
+
+    // Per-worker extras (v0.8): env additions, working dir, oneshot marker.
+    extra_env_buf: [1024]u8 = undefined,
+    extra_env: [17]?[*:0]const u8 = undefined,
+    extra_env_n: u8 = 0,
+    extra_env_used: u16 = 0,
+    cwd_buf: [256]u8 = undefined,
+    cwd_len: u16 = 0, // NUL-terminated in cwd_buf when set
+    is_oneshot: bool = false,
     restarts: u32 = 0,
     /// Consecutive unclean deaths (reset by clean exit or stable uptime).
     fail_streak: u32 = 0,
@@ -120,6 +129,31 @@ fn resetWorker(w: *Worker) void {
     w.health_done = false;
     w.health_ok = false;
     w.health_ever_ok = false;
+    w.extra_env_n = 0;
+    w.extra_env_used = 0;
+    w.cwd_len = 0;
+    w.is_oneshot = false;
+}
+
+/// Add one KEY=VAL to a worker's environment.
+pub fn addEnv(w: *Worker, entry: []const u8) bool {
+    if (w.extra_env_n == w.extra_env.len - 1) return false;
+    if (w.extra_env_used + entry.len + 1 > w.extra_env_buf.len) return false;
+    const start = w.extra_env_used;
+    @memcpy(w.extra_env_buf[start..][0..entry.len], entry);
+    w.extra_env_buf[start + entry.len] = 0;
+    w.extra_env[w.extra_env_n] = @ptrCast(&w.extra_env_buf[start]);
+    w.extra_env_n += 1;
+    w.extra_env_used += @intCast(entry.len + 1);
+    return true;
+}
+
+pub fn setCwd(w: *Worker, path: []const u8) bool {
+    if (path.len + 1 > w.cwd_buf.len) return false;
+    @memcpy(w.cwd_buf[0..path.len], path);
+    w.cwd_buf[path.len] = 0;
+    w.cwd_len = @intCast(path.len);
+    return true;
 }
 
 /// Attach a health probe command to a worker (tokenized into fixed storage).
@@ -229,6 +263,12 @@ pub fn spawn(
     const out_p = capture.makePipe();
     const err_p = capture.makePipe();
     const ready_p = if (ready_fd != null) capture.makePipe() else null;
+    // Merge parent env + per-worker extras BEFORE fork (no alloc, static
+    // scratch — spawns are serialized in the single-threaded supervisor).
+    const child_envp: [*:null]const ?[*:0]const u8 = if (w.extra_env_n > 0)
+        mergeEnv(envp, w)
+    else
+        envp;
     const rc = linux.fork();
     if (posix.errno(rc) != .SUCCESS) {
         closePair(out_p);
@@ -246,7 +286,8 @@ pub fn spawn(
         if (err_p) |p| _ = linux.dup2(p.w, 2);
         // s6-style readiness: the worker writes a newline to this fd.
         if (ready_p) |p| _ = linux.dup2(p.w, ready_fd.?);
-        execChild(w, envp, path_env);
+        if (w.cwd_len > 0) _ = linux.chdir(@ptrCast(&w.cwd_buf));
+        execChild(w, child_envp, path_env);
     }
     // Parent sets it too — whichever side wins the race, the group exists
     // before we ever signal it.
@@ -306,6 +347,19 @@ fn resolveExe(w: *Worker, path_env: []const u8) void {
             return;
         }
     }
+}
+
+var merged_env: [513 + 17]?[*:0]const u8 = undefined;
+
+fn mergeEnv(envp: [*:null]const ?[*:0]const u8, w: *const Worker) [*:null]const ?[*:0]const u8 {
+    var n: usize = 0;
+    while (envp[n] != null and n < 512) : (n += 1) merged_env[n] = envp[n];
+    for (w.extra_env[0..w.extra_env_n]) |e| {
+        merged_env[n] = e;
+        n += 1;
+    }
+    merged_env[n] = null;
+    return @ptrCast(&merged_env);
 }
 
 fn closePair(pair: ?capture.PipePair) void {
