@@ -70,6 +70,7 @@ test {
     _ = @import("cli.zig");
     _ = @import("backoff.zig");
     _ = @import("ring.zig");
+    _ = @import("capture.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");
