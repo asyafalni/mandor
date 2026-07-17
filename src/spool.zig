@@ -262,16 +262,19 @@ var seq: u32 = 0;
 /// Keep the spool bounded on persistent volumes: newest N incidents win.
 pub const max_incidents = 200;
 
+var last_path_buf: [640]u8 = undefined;
+
 /// Serialize + write `<state_dir>/incidents/<epoch_ms>-<name>-<seq>.json`
 /// atomically (epoch-ms so supervisor restarts can't collide), then prune
-/// the oldest files beyond max_incidents.
-pub fn write(state_dir: []const u8, in: BundleInput) void {
-    const json = serialize(&bundle_buf, in) orelse return;
+/// the oldest files beyond max_incidents. Returns the bundle path (into a
+/// static buffer valid until the next write) for the on-incident hook.
+pub fn write(state_dir: []const u8, in: BundleInput) ?[]const u8 {
+    const json = serialize(&bundle_buf, in) orelse return null;
 
     var dir_buf: [512]u8 = undefined;
-    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}/incidents", .{state_dir}) catch return;
+    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}/incidents", .{state_dir}) catch return null;
     var root_buf: [512]u8 = undefined;
-    const root_z = std.fmt.bufPrintZ(&root_buf, "{s}", .{state_dir}) catch return;
+    const root_z = std.fmt.bufPrintZ(&root_buf, "{s}", .{state_dir}) catch return null;
     _ = linux.mkdirat(linux.AT.FDCWD, root_z.ptr, 0o755);
     _ = linux.mkdirat(linux.AT.FDCWD, dir_z.ptr, 0o755);
 
@@ -280,19 +283,18 @@ pub fn write(state_dir: []const u8, in: BundleInput) void {
     _ = linux.clock_gettime(.REALTIME, &now_ts);
     const epoch_ms = @as(u64, @intCast(now_ts.sec)) * 1000 +
         @as(u64, @intCast(now_ts.nsec)) / 1_000_000;
-    var path_buf: [640]u8 = undefined;
     var tmp_buf: [640]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{d}-{s}-{d}.json", .{
+    const path = std.fmt.bufPrintZ(&last_path_buf, "{s}/incidents/{d}-{s}-{d}.json", .{
         state_dir, epoch_ms, in.name, seq,
-    }) catch return;
-    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/incidents/.tmp-{d}", .{ state_dir, seq }) catch return;
+    }) catch return null;
+    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/incidents/.tmp-{d}", .{ state_dir, seq }) catch return null;
 
     const rc = linux.openat(linux.AT.FDCWD, tmp.ptr, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
         .TRUNC = true,
     }, 0o644);
-    if (posix.errno(rc) != .SUCCESS) return;
+    if (posix.errno(rc) != .SUCCESS) return null;
     const fd: i32 = @intCast(rc);
     var off: usize = 0;
     while (off < json.len) {
@@ -301,10 +303,10 @@ pub fn write(state_dir: []const u8, in: BundleInput) void {
         off += n;
     }
     _ = linux.close(fd);
-    if (off == json.len) {
-        _ = linux.rename(tmp.ptr, path.ptr);
-        prune(state_dir);
-    }
+    if (off != json.len) return null;
+    _ = linux.rename(tmp.ptr, path.ptr);
+    prune(state_dir);
+    return path;
 }
 
 pub const DirEntry = struct { key: u64, name: [64]u8, name_len: u8 };

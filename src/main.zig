@@ -115,6 +115,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             cfg.start_after = file_cfg.start_after;
             cfg.start_after_n = file_cfg.start_after_n;
+            if (!cfg.max_restarts_set) {
+                if (file_cfg.max_restarts) |m| cfg.max_restarts = m;
+            }
+            if (!cfg.health_start_period_set) {
+                if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
+            }
+            if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {

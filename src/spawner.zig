@@ -51,7 +51,10 @@ pub const Worker = struct {
     health_fails: u8 = 0,
     health_done: bool = false, // set by reaper when a probe was collected
     health_ok: bool = false,
+    health_ever_ok: bool = false, // start-period grace ends at first success
     restarts: u32 = 0,
+    /// Consecutive unclean deaths (reset by clean exit or stable uptime).
+    fail_streak: u32 = 0,
     cur_delay_ms: u64 = 0,
     last_start_ms: u64 = 0,
     next_restart_ms: u64 = 0, // 0 = no restart scheduled
@@ -84,6 +87,7 @@ fn resetWorker(w: *Worker) void {
     w.status = .not_started;
     w.core_dumped = false;
     w.restarts = 0;
+    w.fail_streak = 0;
     w.cur_delay_ms = 0;
     w.last_start_ms = 0;
     w.next_restart_ms = 0;
@@ -115,6 +119,7 @@ fn resetWorker(w: *Worker) void {
     w.health_fails = 0;
     w.health_done = false;
     w.health_ok = false;
+    w.health_ever_ok = false;
 }
 
 /// Attach a health probe command to a worker (tokenized into fixed storage).
@@ -265,6 +270,7 @@ pub fn spawn(
     w.next_restart_ms = 0;
     w.next_health_ms = 0; // runHealth reschedules the first probe
     w.health_fails = 0;
+    w.health_ever_ok = false;
     // New pid: CPU tick baseline restarts from zero (history stays).
     w.stats.prev_ticks = 0;
     w.stats.prev_t_ms = 0;
@@ -319,6 +325,22 @@ fn execChild(
     const empty = posix.sigemptyset();
     posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
     execArgv(@ptrCast(&w.argv), envp, path_env);
+}
+
+/// Fire-and-forget child (incident hooks): inherits stdio, own signal mask
+/// restored; reaped later as an ordinary orphan.
+pub fn spawnDetached(
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) void {
+    const rc = linux.fork();
+    if (posix.errno(rc) != .SUCCESS) return;
+    if (rc == 0) {
+        const empty = posix.sigemptyset();
+        posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+        execArgv(argv, envp, path_env);
+    }
 }
 
 /// exec with PATH candidates; never returns (127 on total failure).

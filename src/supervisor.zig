@@ -65,6 +65,13 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     };
 
     incident.initSnapshot(state_dir, environ);
+    if (cfg.on_incident) |cmd| {
+        if (!incident.setHook(cmd)) {
+            std.debug.print("[mandor] invalid on-incident command\n", .{});
+            return 2;
+        }
+    }
+    var give_up_code: ?u8 = null;
 
     // start-after ordering: dep_of[i] = worker index i must wait for.
     var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
@@ -285,6 +292,10 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     else => continue, // not_started/running: nothing new here
                 };
                 if (clean) w.final_code = 0; // expected codes count as success
+                const uptime_ms = now -| w.last_start_ms;
+                w.fail_streak = if (clean)
+                    0
+                else if (uptime_ms >= backoff.stable_uptime_ms) 1 else w.fail_streak + 1;
                 closePipes(w);
                 logDeath(w);
                 if (!shutting_down and !clean) {
@@ -294,12 +305,28 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                         incident.onRestartLoop(state_dir, workers, w, count, now);
                 }
                 if (!shutting_down and backoff.shouldRestart(cfg.restart, clean)) {
-                    const uptime = now -| w.last_start_ms;
-                    w.cur_delay_ms = backoff.next(w.cur_delay_ms, uptime, cfg.backoff_max_ms);
-                    w.next_restart_ms = now + w.cur_delay_ms;
-                    std.debug.print("[mandor] restarting {s} in {d}ms\n", .{
-                        w.nameSlice(), w.cur_delay_ms,
-                    });
+                    if (cfg.max_restarts > 0 and w.fail_streak > cfg.max_restarts) {
+                        // give up: make the failure visible to the orchestrator
+                        std.debug.print("[mandor] {s} failed {d} consecutive restarts, giving up\n", .{
+                            w.nameSlice(), cfg.max_restarts,
+                        });
+                        w.done = true;
+                        give_up_code = w.final_code;
+                        shutting_down = true;
+                        shutdown_deadline_ms = now + cfg.stop_grace_ms;
+                        forwardAll(workers, .TERM);
+                        for (workers, 0..) |*other, oi| {
+                            other.next_restart_ms = 0;
+                            waiting[oi] = false;
+                            if (other.pid == 0) other.done = true;
+                        }
+                    } else {
+                        w.cur_delay_ms = backoff.next(w.cur_delay_ms, now -| w.last_start_ms, cfg.backoff_max_ms);
+                        w.next_restart_ms = now + w.cur_delay_ms;
+                        std.debug.print("[mandor] restarting {s} in {d}ms\n", .{
+                            w.nameSlice(), w.cur_delay_ms,
+                        });
+                    }
                 } else {
                     w.done = true;
                 }
@@ -337,7 +364,9 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
 
     var worst: u8 = 0;
     for (workers) |*w| worst = @max(worst, w.final_code);
-    return worst;
+    // On give-up, report the flapping worker's code — not the TERM fallout
+    // from shutting its siblings down.
+    return give_up_code orelse worst;
 }
 
 const health_timeout_ms: u64 = 10_000;
@@ -359,6 +388,11 @@ fn runHealth(
             w.health_done = false;
             if (w.health_ok) {
                 w.health_fails = 0;
+                w.health_ever_ok = true;
+            } else if (!w.health_ever_ok and
+                now -| w.last_start_ms < cfg.health_start_period_ms)
+            {
+                // start-period grace: slow booters aren't failures yet
             } else {
                 w.health_fails += 1;
                 std.debug.print("[mandor] health check failed for {s} ({d}/{d})\n", .{

@@ -40,6 +40,16 @@ pub const Config = struct {
     /// "dependent=dependency" ordering pairs (TOML-only; no CLI flag).
     start_after: [max_workers]HealthSpec = undefined,
     start_after_n: u8 = 0,
+    /// Consecutive failed restarts before mandor gives up and exits with the
+    /// worker's code (0 = retry forever, the default).
+    max_restarts: u32 = 0,
+    max_restarts_set: bool = false,
+    /// Probe failures within this window after spawn (and before the first
+    /// success) don't count — the k8s startupProbe lesson.
+    health_start_period_ms: u64 = 10_000,
+    health_start_period_set: bool = false,
+    /// Command exec'd after each incident bundle write, bundle path appended.
+    on_incident: ?[]const u8 = null,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,
@@ -96,6 +106,18 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
                 cfg.backoff_max_ms = parseDuration(arg["--backoff-max=".len..]) orelse
                     return error.BadValue;
                 cfg.backoff_set = true;
+            } else if (std.mem.startsWith(u8, arg, "--max-restarts=")) {
+                cfg.max_restarts = std.fmt.parseInt(u32, arg["--max-restarts=".len..], 10) catch
+                    return error.BadValue;
+                cfg.max_restarts_set = true;
+            } else if (std.mem.startsWith(u8, arg, "--health-start-period=")) {
+                cfg.health_start_period_ms = parseDuration(arg["--health-start-period=".len..]) orelse
+                    return error.BadValue;
+                cfg.health_start_period_set = true;
+            } else if (std.mem.startsWith(u8, arg, "--on-incident=")) {
+                const v = arg["--on-incident=".len..];
+                if (v.len == 0) return error.BadValue;
+                cfg.on_incident = v;
             } else if (std.mem.startsWith(u8, arg, "--health=")) {
                 const v = arg["--health=".len..];
                 const eq2 = std.mem.indexOfScalar(u8, v, '=') orelse return error.BadValue;
@@ -359,6 +381,20 @@ test "parse report subcommand" {
     try expectError(error.BadValue, parse(&.{ "report", "./cmd" }, &storage));
     // --json is report-only
     try expectError(error.UnknownFlag, parse(&.{ "--json", "./cmd" }, &storage));
+}
+
+test "v0.8 flags: max-restarts, start-period, on-incident" {
+    var storage: [max_workers][]const u8 = undefined;
+    const cfg = try parse(&.{
+        "--max-restarts=10",
+        "--health-start-period=30s",
+        "--on-incident=/notify --room ops",
+        "./a",
+    }, &storage);
+    try expectEqual(@as(u32, 10), cfg.max_restarts);
+    try expectEqual(@as(u64, 30_000), cfg.health_start_period_ms);
+    try expectEqualStrings("/notify --room ops", cfg.on_incident.?);
+    try expectError(error.BadValue, parse(&.{ "--max-restarts=lots", "./a" }, &storage));
 }
 
 test "health flags" {

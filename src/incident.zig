@@ -46,6 +46,36 @@ var snap_memory_max: ?u64 = null;
 var snap_release: []const u8 = "";
 
 const history = @import("history.zig");
+const cli = @import("cli.zig");
+
+// On-incident hook: exec'd after each bundle write, bundle path appended.
+var hook_buf: [1024]u8 = undefined;
+var hook_argv: [18]?[*:0]const u8 = undefined;
+var hook_argc: usize = 0;
+var hook_path_buf: [641]u8 = undefined;
+var snap_path_env: []const u8 = "";
+
+/// Tokenize the hook command into fixed storage. Returns false on bad cmd.
+pub fn setHook(cmd: []const u8) bool {
+    var toks: [16][]const u8 = undefined;
+    const argv = cli.tokenize(cmd, &hook_buf, &toks) catch return false;
+    for (argv, 0..) |t, i| hook_argv[i] = @ptrCast(t.ptr);
+    hook_argc = argv.len;
+    return true;
+}
+
+fn fireHook(bundle_path: []const u8) void {
+    if (hook_argc == 0 or bundle_path.len >= hook_path_buf.len) return;
+    @memcpy(hook_path_buf[0..bundle_path.len], bundle_path);
+    hook_path_buf[bundle_path.len] = 0;
+    hook_argv[hook_argc] = @ptrCast(&hook_path_buf);
+    hook_argv[hook_argc + 1] = null;
+    spawner.spawnDetached(@ptrCast(&hook_argv), snap_environ.ptr, snap_path_env);
+}
+
+fn writeBundle(state_dir: []const u8, in: spool.BundleInput) void {
+    if (spool.write(state_dir, in)) |path| fireHook(path);
+}
 
 pub fn initSnapshot(state_dir: []const u8, environ: [:null]const ?[*:0]const u8) void {
     history.load(state_dir);
@@ -58,6 +88,7 @@ pub fn initSnapshot(state_dir: []const u8, environ: [:null]const ?[*:0]const u8)
     snap_memory_max = cgroup.readMemoryMax();
     snap_release = spawner.findEnv(environ, "MANDOR_RELEASE") orelse
         (spawner.findEnv(environ, "GIT_SHA") orelse "");
+    snap_path_env = spawner.findPath(environ);
 }
 
 fn epochNow() i64 {
@@ -180,7 +211,7 @@ pub fn onDeath(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Wor
     history.save(state_dir);
     const uptime_s = (now_ms -| w.last_start_ms) / 1000;
     const stats = collectStats(w);
-    spool.write(state_dir, .{
+    writeBundle(state_dir, .{
         .ts_epoch = epochNow(),
         .name = w.nameSlice(),
         .cmd = w.cmd,
@@ -273,7 +304,7 @@ pub fn onRestartLoop(state_dir: []const u8, workers: []spawner.Worker, w: *spawn
     in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);
     in.verdict = summarize.verdictRestartLoop(&verdict_buf, count, detector.restart_loop_window_ms / 1000, last_cause);
-    spool.write(state_dir, in);
+    writeBundle(state_dir, in);
 }
 
 /// Health probe failed `fails` consecutive times: the worker is alive but
@@ -291,7 +322,7 @@ pub fn onUnhealthy(state_dir: []const u8, workers: []spawner.Worker, w: *spawner
     in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);
     in.verdict = summarize.verdictUnhealthy(&verdict_buf, fails, (now_ms -| w.last_start_ms) / 1000);
-    spool.write(state_dir, in);
+    writeBundle(state_dir, in);
 }
 
 /// RSS climb detected on a live worker.
@@ -306,5 +337,5 @@ pub fn onLeak(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Work
     in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);
     in.verdict = summarize.verdictLeak(&verdict_buf, info.growth_mb, info.minutes);
-    spool.write(state_dir, in);
+    writeBundle(state_dir, in);
 }

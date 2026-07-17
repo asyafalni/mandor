@@ -19,6 +19,9 @@ pub const FileConfig = struct {
     health_n: u8 = 0,
     health_interval_ms: ?u64 = null,
     restart_on_unhealthy: ?bool = null,
+    max_restarts: ?u32 = null,
+    health_start_period_ms: ?u64 = null,
+    on_incident: ?[]const u8 = null,
     /// "dependent=dependency" worker-name pairs.
     start_after: [cli.max_workers]cli.HealthSpec = undefined,
     start_after_n: u8 = 0,
@@ -90,6 +93,13 @@ pub fn parse(
             const fd = std.fmt.parseInt(u8, value, 10) catch return error.BadValue;
             if (fd < 3) return error.BadValue;
             cfg.ready_fd = fd;
+        } else if (std.mem.eql(u8, key, "max_restarts")) {
+            cfg.max_restarts = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
+        } else if (std.mem.eql(u8, key, "health_start_period")) {
+            const s = parseString(value) orelse return error.BadValue;
+            cfg.health_start_period_ms = cli.parseDuration(s) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "on_incident")) {
+            cfg.on_incident = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "health_interval")) {
             const s = parseString(value) orelse return error.BadValue;
             cfg.health_interval_ms = cli.parseDuration(s) orelse return error.BadValue;

@@ -214,7 +214,7 @@ else bad "readiness fd" "$(head -4 "$TMP/18")"; fi
 
 # 19. health checks: failing probe -> unhealthy incident with worker alive
 export MANDOR_STATE_DIR="$TMP/state19"
-"$MANDOR" --health='sleep=/bin/false' --health-interval=1s "sleep 30" >"$TMP/19" 2>&1 &
+"$MANDOR" --health='sleep=/bin/false' --health-interval=1s --health-start-period=0s "sleep 30" >"$TMP/19" 2>&1 &
 mpid=$!
 sleep 6
 f=$(ls "$TMP/state19/incidents/"*.json 2>/dev/null | head -1)
@@ -255,6 +255,36 @@ spawn_b=$(grep -n "spawned sh" "$TMP/21" | head -1 | cut -d: -f1)
 if [ $c -eq 0 ] && [ -n "$waits" ] && [ -n "$spawn_b" ] && [ "$spawn_b" -gt "$waits" ]; then
   ok "start_after defers dependent start"
 else bad "start_after ordering" "exit $c: $(head -6 "$TMP/21")"; fi
+
+# 22. --max-restarts gives up with the worker's exit code
+timeout 15 "$MANDOR" --restart=always --max-restarts=2 "sh -c 'exit 5'" >"$TMP/22" 2>&1
+c=$?
+n=$(grep -c "spawned" "$TMP/22")
+if [ $c -eq 5 ] && [ "$n" -eq 3 ] && grep -q "giving up" "$TMP/22"; then
+  ok "max-restarts gives up visibly (exit 5 after 3 spawns)"
+else bad "max-restarts give-up" "exit $c, spawns $n"; fi
+
+# 23. on-incident hook fires with the bundle path
+cat > "$TMP/hook.sh" <<'HOOK'
+echo "$1" >> "${HOOK_OUT:-/tmp/hook-out}"
+HOOK
+chmod +x "$TMP/hook.sh"
+export MANDOR_STATE_DIR="$TMP/state23" HOOK_OUT="$TMP/hook-fired"
+timeout 10 "$MANDOR" --on-incident="sh $TMP/hook.sh" "sh -c 'exit 4'" >"$TMP/23" 2>&1
+sleep 0.5
+if [ -f "$TMP/hook-fired" ] && grep -q "state23/incidents/.*\.json" "$TMP/hook-fired" \
+   && [ -f "$(cat "$TMP/hook-fired" | head -1)" ]; then
+  ok "on-incident hook receives bundle path"
+else bad "on-incident hook" "$(cat "$TMP/hook-fired" 2>/dev/null)"; fi
+unset MANDOR_STATE_DIR HOOK_OUT
+
+# 24. health start-period: early failures don't count
+"$MANDOR" --health='sleep=/bin/false' --health-interval=1s --health-start-period=1m "sleep 30" >"$TMP/24" 2>&1 &
+mpid=$!
+sleep 5
+kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
+if ! grep -q "health check failed" "$TMP/24"; then ok "start-period grace suppresses early probe failures"
+else bad "start-period grace" "$(grep "health check" "$TMP/24" | head -2)"; fi
 
 echo
 echo "passed $pass, failed $fail"
