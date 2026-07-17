@@ -30,12 +30,27 @@ jobs:
           cp zig-out/x64/bin/mandor mandor-x86_64-linux
           cp zig-out/a64/bin/mandor mandor-aarch64-linux
 
-      - name: GitHub Release with binaries
+      - name: Build .deb/.apk/.rpm packages (nFPM)
+        run: |
+          curl -sL https://github.com/goreleaser/nfpm/releases/download/v2.38.0/nfpm_2.38.0_Linux_x86_64.tar.gz | tar xz nfpm
+          VERSION="${GITHUB_REF_NAME#v}"
+          for arch in amd64 arm64; do
+            for fmt in deb apk rpm; do
+              ARCH=$arch VERSION=$VERSION ./nfpm package -f nfpm.yaml -p $fmt \
+                -t "mandor_${VERSION}_${arch}.${fmt}"
+            done
+          done
+          ls -la mandor_*
+
+      - name: GitHub Release with binaries + packages
         uses: softprops/action-gh-release@v2
         with:
           files: |
             mandor-x86_64-linux
             mandor-aarch64-linux
+            mandor_*.deb
+            mandor_*.apk
+            mandor_*.rpm
           generate_release_notes: true
 
       - uses: docker/setup-qemu-action@v3

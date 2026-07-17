@@ -51,6 +51,22 @@ fixes the code, and opens a PR — supervision that closes the loop.
 
 ## Quick start
 
+### Install
+
+Grab a package from the [latest release](https://github.com/asyafalni/mandor/releases):
+
+```console
+# Debian / Ubuntu
+dpkg -i mandor_*_amd64.deb
+
+# Alpine
+apk add --allow-untrusted mandor_*_amd64.apk
+
+# or just the raw static binary — it runs on any Linux
+curl -LO https://github.com/asyafalni/mandor/releases/latest/download/mandor-x86_64-linux
+install -m755 mandor-x86_64-linux /usr/bin/mandor
+```
+
 ### In a Dockerfile
 
 ```dockerfile

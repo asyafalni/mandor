@@ -1,0 +1,18 @@
+# nFPM package spec — one static binary, three package formats.
+# Built in release.yml with ARCH/VERSION from the environment.
+name: mandor
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: admin
+maintainer: Alfin Syafalni <alfin@nodeflux.io>
+description: |
+  Tiny PID-1 process supervisor for containers with crash forensics:
+  restart policies, signal forwarding, log capture, resource stats,
+  health checks, and JSON incident bundles explaining why workers died.
+vendor: mandor
+homepage: https://github.com/asyafalni/mandor
+license: MIT
+contents:
+  - src: dist/${ARCH}/mandor
+    dst: /usr/bin/mandor
