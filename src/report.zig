@@ -13,25 +13,9 @@ const state_buf_cap = 256 * 1024;
 
 // ------------------------------------------------------- serialization
 
-fn appendf(buf: []u8, pos: *usize, comptime fmt: []const u8, args: anytype) bool {
-    const out = std.fmt.bufPrint(buf[pos.*..], fmt, args) catch return false;
-    pos.* += out.len;
-    return true;
-}
-
-fn appendJsonString(buf: []u8, pos: *usize, s: []const u8) bool {
-    if (!appendf(buf, pos, "\"", .{})) return false;
-    for (s) |c| {
-        const ok = switch (c) {
-            '"' => appendf(buf, pos, "\\\"", .{}),
-            '\\' => appendf(buf, pos, "\\\\", .{}),
-            0x00...0x1f => appendf(buf, pos, "\\u{x:0>4}", .{c}),
-            else => appendf(buf, pos, "{c}", .{c}),
-        };
-        if (!ok) return false;
-    }
-    return appendf(buf, pos, "\"", .{});
-}
+const jb = @import("jsonbuf.zig");
+const appendf = jb.appendf;
+const appendJsonString = jb.appendJsonString;
 
 /// Serialize supervisor state as JSON into `buf`. Returns the written slice,
 /// or null if the buffer is too small (never panics).
