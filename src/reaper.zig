@@ -57,8 +57,8 @@ test "spawn, reap, classify exit and signal deaths" {
     const empty_env = [_:null]?[*:0]const u8{};
     const envp: [*:null]const ?[*:0]const u8 = &empty_env;
 
-    try spawner.spawn(&workers[0], envp, "", 0);
-    try spawner.spawn(&workers[1], envp, "", 0);
+    try spawner.spawn(&workers[0], envp, "", 0, null);
+    try spawner.spawn(&workers[1], envp, "", 0, null);
     try std.testing.expect(workers[0].pid > 0);
     try std.testing.expect(workers[1].pid > 0);
 

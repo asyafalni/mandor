@@ -177,5 +177,6 @@ test {
         _ = @import("report.zig");
         _ = @import("spool.zig");
         _ = @import("metrics.zig");
+        _ = @import("elf.zig");
     }
 }

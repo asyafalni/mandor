@@ -25,6 +25,8 @@ pub const Config = struct {
     expected_exit: [256]bool = [1]bool{true} ++ [1]bool{false} ** 255,
     /// Grace period between forwarding TERM/INT and escalating to SIGKILL.
     stop_grace_ms: u64 = 10_000,
+    /// s6-style readiness: workers write a newline to this fd when ready.
+    ready_fd: ?u8 = null,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,
@@ -81,6 +83,11 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
                 cfg.backoff_max_ms = parseDuration(arg["--backoff-max=".len..]) orelse
                     return error.BadValue;
                 cfg.backoff_set = true;
+            } else if (std.mem.startsWith(u8, arg, "--ready-fd=")) {
+                const fd = std.fmt.parseInt(u8, arg["--ready-fd=".len..], 10) catch
+                    return error.BadValue;
+                if (fd < 3) return error.BadValue; // stdio is taken
+                cfg.ready_fd = fd;
             } else if (std.mem.startsWith(u8, arg, "--stop-grace=")) {
                 cfg.stop_grace_ms = parseDuration(arg["--stop-grace=".len..]) orelse
                     return error.BadValue;
@@ -323,6 +330,14 @@ test "parse report subcommand" {
     try expectError(error.BadValue, parse(&.{ "report", "./cmd" }, &storage));
     // --json is report-only
     try expectError(error.UnknownFlag, parse(&.{ "--json", "./cmd" }, &storage));
+}
+
+test "ready-fd flag" {
+    var storage: [max_workers][]const u8 = undefined;
+    const cfg = try parse(&.{ "--ready-fd=5", "./a" }, &storage);
+    try expectEqual(@as(?u8, 5), cfg.ready_fd);
+    try expectError(error.BadValue, parse(&.{ "--ready-fd=1", "./a" }, &storage));
+    try expectError(error.BadValue, parse(&.{ "--ready-fd=x", "./a" }, &storage));
 }
 
 test "stop-grace and expected-exit flags" {

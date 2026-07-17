@@ -9,6 +9,7 @@ const capture = @import("capture.zig");
 const ring = @import("ring.zig");
 const sampler = @import("sampler.zig");
 const detector = @import("detector.zig");
+const elf = @import("elf.zig");
 
 pub const max_args = 64;
 pub const name_cap = 32;
@@ -35,6 +36,10 @@ pub const Worker = struct {
     exe_buf: [256]u8 = undefined,
     exe_len: u16 = 0,
     spawned_at_epoch: i64 = 0,
+    build_id_buf: [64]u8 = undefined,
+    build_id_len: u8 = 0,
+    ready: bool = false,
+    ready_r: i32 = -1, // read end of the readiness pipe (-1 = none/closed)
     restarts: u32 = 0,
     cur_delay_ms: u64 = 0,
     last_start_ms: u64 = 0,
@@ -89,6 +94,9 @@ fn resetWorker(w: *Worker) void {
     w.det = .{};
     w.exe_len = 0;
     w.spawned_at_epoch = 0;
+    w.build_id_len = 0;
+    w.ready = false;
+    w.ready_r = -1;
 }
 
 pub const InitError = error{BadCommand};
@@ -158,13 +166,16 @@ pub fn spawn(
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
     now_ms: u64,
+    ready_fd: ?u8,
 ) SpawnError!void {
     const out_p = capture.makePipe();
     const err_p = capture.makePipe();
+    const ready_p = if (ready_fd != null) capture.makePipe() else null;
     const rc = linux.fork();
     if (posix.errno(rc) != .SUCCESS) {
         closePair(out_p);
         closePair(err_p);
+        closePair(ready_p);
         return error.ForkFailed;
     }
     if (rc == 0) {
@@ -175,6 +186,8 @@ pub fn spawn(
         _ = linux.setpgid(0, 0);
         if (out_p) |p| _ = linux.dup2(p.w, 1);
         if (err_p) |p| _ = linux.dup2(p.w, 2);
+        // s6-style readiness: the worker writes a newline to this fd.
+        if (ready_p) |p| _ = linux.dup2(p.w, ready_fd.?);
         execChild(w, envp, path_env);
     }
     // Parent sets it too — whichever side wins the race, the group exists
@@ -188,6 +201,11 @@ pub fn spawn(
         _ = linux.close(p.w);
         w.err_r = p.r;
     }
+    if (ready_p) |p| {
+        _ = linux.close(p.w);
+        w.ready_r = p.r;
+    }
+    w.ready = false;
     w.pid = @intCast(rc);
     w.status = .running;
     w.last_start_ms = now_ms;
@@ -199,6 +217,10 @@ pub fn spawn(
     _ = linux.clock_gettime(.REALTIME, &ts);
     w.spawned_at_epoch = ts.sec;
     resolveExe(w, path_env);
+    if (w.exe_len > 0 and w.build_id_len == 0) {
+        if (elf.readBuildId(w.exe_buf[0..w.exe_len], &w.build_id_buf)) |id|
+            w.build_id_len = @intCast(id.len);
+    }
 }
 
 /// Parent-side mirror of the child's exec resolution, so incident bundles

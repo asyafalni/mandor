@@ -66,7 +66,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         break :blk srv;
     } else null;
 
-    for (workers) |*w| spawnWorker(w, envp, path_env);
+    for (workers) |*w| spawnWorker(w, envp, path_env, cfg.ready_fd);
     report.writeState(state_dir, workers, nowMs());
 
     while (true) {
@@ -96,9 +96,10 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         else
             @intCast(@min(wake_at - now_for_timeout, 3_600_000));
 
-        var pfds: [2 + 2 * cli.max_workers]posix.pollfd = undefined;
-        var owners: [2 + 2 * cli.max_workers]*spawner.Worker = undefined;
-        var errs: [2 + 2 * cli.max_workers]bool = undefined;
+        const PollKind = enum { out, err, ready };
+        var pfds: [2 + 3 * cli.max_workers]posix.pollfd = undefined;
+        var owners: [2 + 3 * cli.max_workers]*spawner.Worker = undefined;
+        var kinds: [2 + 3 * cli.max_workers]PollKind = undefined;
         pfds[0] = .{ .fd = sigs.fd, .events = posix.POLL.IN, .revents = 0 };
         var nf: usize = 1;
         var metrics_idx: usize = 0; // 0 = not in the set
@@ -111,13 +112,19 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             if (w.out_r >= 0) {
                 pfds[nf] = .{ .fd = w.out_r, .events = posix.POLL.IN, .revents = 0 };
                 owners[nf] = w;
-                errs[nf] = false;
+                kinds[nf] = .out;
                 nf += 1;
             }
             if (w.err_r >= 0) {
                 pfds[nf] = .{ .fd = w.err_r, .events = posix.POLL.IN, .revents = 0 };
                 owners[nf] = w;
-                errs[nf] = true;
+                kinds[nf] = .err;
+                nf += 1;
+            }
+            if (w.ready_r >= 0) {
+                pfds[nf] = .{ .fd = w.ready_r, .events = posix.POLL.IN, .revents = 0 };
+                owners[nf] = w;
+                kinds[nf] = .ready;
                 nf += 1;
             }
         }
@@ -127,8 +134,10 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             if (pfd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) continue;
             if (i == metrics_idx) {
                 metrics_server.?.onReadable(workers, incident.total);
-            } else {
-                readPipe(owners[i], errs[i]);
+            } else switch (kinds[i]) {
+                .out => readPipe(owners[i], false),
+                .err => readPipe(owners[i], true),
+                .ready => readReady(owners[i]),
             }
         }
 
@@ -204,7 +213,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 if (w.done or w.pid != 0 or w.next_restart_ms == 0 or w.next_restart_ms > now)
                     continue;
                 w.restarts += 1;
-                spawnWorker(w, envp, path_env);
+                spawnWorker(w, envp, path_env, cfg.ready_fd);
             }
         }
 
@@ -236,8 +245,9 @@ fn spawnWorker(
     w: *spawner.Worker,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
+    ready_fd: ?u8,
 ) void {
-    spawner.spawn(w, envp, path_env, nowMs()) catch {
+    spawner.spawn(w, envp, path_env, nowMs(), ready_fd) catch {
         std.debug.print("[mandor] fork failed for {s}\n", .{w.nameSlice()});
         w.done = true;
         w.final_code = 125;
@@ -312,6 +322,18 @@ fn readPipe(w: *spawner.Worker, is_err: bool) void {
     }
 }
 
+/// First byte on the readiness fd marks the worker ready; EOF without a
+/// byte means it never signaled (or doesn't speak the protocol) — fine.
+fn readReady(w: *spawner.Worker) void {
+    var byte: [16]u8 = undefined;
+    const rc = linux.read(w.ready_r, &byte, byte.len);
+    if (posix.errno(rc) == .SUCCESS and rc > 0) {
+        if (!w.ready) std.debug.print("[mandor] {s} is ready\n", .{w.nameSlice()});
+        w.ready = true;
+    }
+    capture.closeFd(&w.ready_r); // one-shot either way
+}
+
 /// Final drain + close at worker death. Data still in flight is read;
 /// grandchildren keeping the pipe open lose their audience by design.
 fn closePipes(w: *spawner.Worker) void {
@@ -323,4 +345,5 @@ fn closePipes(w: *spawner.Worker) void {
     w.asm_err.flushEof(ring.flag_stderr, &ctx_err, echoLine);
     capture.closeFd(&w.out_r);
     capture.closeFd(&w.err_r);
+    capture.closeFd(&w.ready_r);
 }
