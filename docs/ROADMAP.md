@@ -34,7 +34,7 @@ fixture tests.
 | 12 | Readiness fd (s6-style newline notification) | M | ● ● ○ | Enables "died before ever becoming ready" — very high-signal field |
 | 13 | ELF build-id extraction from worker exe | M | ● ● ○ | Release correlation without app cooperation; small ELF note parser |
 
-## Tier 3 — v0.7+ (nice-to-have or policy-heavy)
+## Tier 3 — v0.7 — ✅ SHIPPED 2026-07-17 (#16 dropped: built-in redaction + simplicity)
 
 | # | Feature | Cx | Value | Notes |
 |---|---------|----|-------|-------|

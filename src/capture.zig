@@ -90,13 +90,7 @@ pub const Assembler = struct {
 const linux = std.os.linux;
 const posix = std.posix;
 
-pub const Pipes = struct {
-    out_r: i32 = -1,
-    err_r: i32 = -1,
-};
-
-/// Create stdout+stderr pipes for a worker about to be spawned.
-/// Returns parent read ends (nonblocking, cloexec) and child write ends.
+/// One pipe: parent read end (nonblocking, cloexec) + child write end.
 pub const PipePair = struct { r: i32, w: i32 };
 
 pub fn makePipe() ?PipePair {

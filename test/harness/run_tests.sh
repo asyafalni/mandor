@@ -98,7 +98,7 @@ export MANDOR_STATE_DIR="$TMP/state2"
 timeout 10 "$MANDOR" "sh $TMP/crash_go.sh" >"$TMP/11" 2>&1
 c=$?
 f=$(ls "$TMP/state2/incidents/"*.json 2>/dev/null | head -1)
-if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":4' "$f" \
+if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":5' "$f" \
    && grep -q '"kind":"exit"' "$f" && grep -q '"exit_code":2' "$f" \
    && grep -q '"cause_str":"exit:2"' "$f" \
    && grep -q '"lang":"go"' "$f" \
@@ -233,6 +233,11 @@ timeout 10 "$MANDOR" "sh -c 'kill -SEGV \$\$'" >/dev/null 2>&1
 if grep -q "2 incident(s)" "$TMP/20" && grep -q "exit:3" "$TMP/20" && grep -q "signal:SIGSEGV" "$TMP/20"; then
   ok "incident history recall across restarts"
 else bad "incident history recall" "$(cat "$TMP/20" | head -5)"; fi
+# same crash again in a THIRD supervisor run: persistent count reaches 2
+timeout 10 "$MANDOR" "sh -c 'exit 3'" >/dev/null 2>&1
+newest=$(ls "$TMP/state20/incidents/"*.json | sort | tail -1)
+if grep -q '"count":2' "$newest"; then ok "recurrence count survives supervisor restarts"
+else bad "recurrence count persistence" "$(grep -o "\"history\":[^}]*}" "$newest")"; fi
 unset MANDOR_STATE_DIR
 
 # 21. start_after defers the dependent until the dependency is up

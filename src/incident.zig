@@ -45,7 +45,10 @@ var snap_nofile: u64 = 0;
 var snap_memory_max: ?u64 = null;
 var snap_release: []const u8 = "";
 
-pub fn initSnapshot(environ: [:null]const ?[*:0]const u8) void {
+const history = @import("history.zig");
+
+pub fn initSnapshot(state_dir: []const u8, environ: [:null]const ?[*:0]const u8) void {
+    history.load(state_dir);
     snap_environ = environ;
     const rc = linux.getcwd(&snap_cwd_buf, snap_cwd_buf.len);
     if (std.posix.errno(rc) == .SUCCESS and rc > 0) snap_cwd_len = rc - 1; // drop NUL
@@ -173,6 +176,8 @@ pub fn onDeath(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Wor
     if (!w.det.shouldEmit(sig_hash, now_ms)) return;
 
     total += 1;
+    const hist = history.record(sig_hash, epochNow());
+    history.save(state_dir);
     const uptime_s = (now_ms -| w.last_start_ms) / 1000;
     const stats = collectStats(w);
     spool.write(state_dir, .{
@@ -199,8 +204,19 @@ pub fn onDeath(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Wor
         .stats = stats,
         .now_ms = now_ms,
         .siblings = collectSiblings(workers, w, now_ms),
+        .history_sig = hist.sig,
+        .history_first_epoch = hist.first_seen,
+        .history_count = hist.count,
         .verdict = summarize.diagnose(&verdict_buf, cause_str, trace, tail, stats, uptime_s, killed_by_sigkill),
     });
+}
+
+/// Non-death incidents dedupe/recur on (kind, worker) alone.
+fn recordKindHistory(state_dir: []const u8, kind: []const u8, w: *const spawner.Worker) history.Entry {
+    const sig = summarize.signature(kind, w.nameSlice(), "");
+    const e = history.record(sig, epochNow());
+    history.save(state_dir);
+    return e;
 }
 
 /// Common v2 plumbing for the non-death incident kinds.
@@ -248,6 +264,10 @@ pub fn onRestartLoop(state_dir: []const u8, workers: []spawner.Worker, w: *spawn
         else => "unknown",
     };
     var in = commonInput(workers, w, now_ms, "restart-loop", 0);
+    const hist = recordKindHistory(state_dir, "restart-loop", w);
+    in.history_sig = hist.sig;
+    in.history_first_epoch = hist.first_seen;
+    in.history_count = hist.count;
     in.trace = summarize.extractTrace(tail, &trace_storage);
     in.logs_tail = collectCompact(w);
     in.logs_dropped = compactor.dropped;
@@ -262,6 +282,10 @@ pub fn onUnhealthy(state_dir: []const u8, workers: []spawner.Worker, w: *spawner
     total += 1;
     const tail = collectTail(w);
     var in = commonInput(workers, w, now_ms, "unhealthy", w.pid);
+    const hist = recordKindHistory(state_dir, "unhealthy", w);
+    in.history_sig = hist.sig;
+    in.history_first_epoch = hist.first_seen;
+    in.history_count = hist.count;
     in.trace = summarize.extractTrace(tail, &trace_storage);
     in.logs_tail = collectCompact(w);
     in.logs_dropped = compactor.dropped;
@@ -274,6 +298,10 @@ pub fn onUnhealthy(state_dir: []const u8, workers: []spawner.Worker, w: *spawner
 pub fn onLeak(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Worker, info: detector.LeakInfo, now_ms: u64) void {
     total += 1;
     var in = commonInput(workers, w, now_ms, "leak-suspect", w.pid);
+    const hist = recordKindHistory(state_dir, "leak-suspect", w);
+    in.history_sig = hist.sig;
+    in.history_first_epoch = hist.first_seen;
+    in.history_count = hist.count;
     in.logs_tail = collectCompact(w);
     in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);

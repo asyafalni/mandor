@@ -64,7 +64,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         return 2;
     };
 
-    incident.initSnapshot(environ);
+    incident.initSnapshot(state_dir, environ);
 
     // start-after ordering: dep_of[i] = worker index i must wait for.
     var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;

@@ -134,13 +134,14 @@ file values; `MANDOR_STATE_DIR` overrides the file's `state_dir`.
 
 ```toml
 restart = "on-failure"
-backoff_max = "30s"
-state_dir = "/var/lib/mandor"
 metrics_port = 9464
 workers = [
   "./api --port 8080",
   "./worker",
 ]
+# optional: liveness probes and start ordering
+health = ["api=/bin/check-api"]
+start_after = ["worker=api"]   # worker starts once api is up (ready or alive 1s)
 ```
 
 Signals (dumb-init parity): every worker runs in its own process group, so

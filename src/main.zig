@@ -235,5 +235,6 @@ test {
         _ = @import("spool.zig");
         _ = @import("metrics.zig");
         _ = @import("elf.zig");
+        _ = @import("history.zig");
     }
 }

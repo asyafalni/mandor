@@ -38,10 +38,6 @@ pub const Window = struct {
         const start = (self.next + window_len - self.len) % window_len;
         return self.samples[(start + i) % window_len];
     }
-
-    pub fn reset(self: *Window) void {
-        self.* = .{};
-    }
 };
 
 pub const StatFields = struct {

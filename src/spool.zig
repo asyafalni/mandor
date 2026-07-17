@@ -8,7 +8,7 @@ const sampler = @import("sampler.zig");
 const ring = @import("ring.zig");
 const summarize = @import("summarize.zig");
 
-pub const bundle_version = 4;
+pub const bundle_version = 5;
 
 // ------------------------------------------------------- wall clock
 
@@ -66,7 +66,6 @@ pub fn envRedacted(name: []const u8) bool {
 
 // ------------------------------------------------------- bundle input
 
-pub const LogLine = summarize.LogLine;
 pub const TraceInfo = summarize.TraceInfo;
 
 pub const CauseInfo = struct {
@@ -113,6 +112,10 @@ pub const BundleInput = struct {
     stats: []const sampler.Sample, // oldest-first
     now_ms: u64, // monotonic reference for stats "t" offsets
     siblings: []const Sibling = &.{},
+    /// Persistent recurrence info for this incident's dedup signature.
+    history_sig: u64 = 0,
+    history_first_epoch: i64 = 0,
+    history_count: u32 = 1,
     verdict: []const u8,
 };
 
@@ -238,7 +241,11 @@ pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
             sib.state, sib.uptime_s, sib.restarts,
         })) return null;
     }
-    if (!jb.appendf(buf, p, "],\"verdict\":", .{})) return null;
+    var hf_buf: [20]u8 = undefined;
+    if (!jb.appendf(buf, p, "],\"history\":{{\"signature\":\"{x:0>16}\",\"first_seen\":\"{s}\",\"count\":{d}}}", .{
+        in.history_sig, iso8601(&hf_buf, in.history_first_epoch), in.history_count,
+    })) return null;
+    if (!jb.appendf(buf, p, ",\"verdict\":", .{})) return null;
     if (!jb.appendJsonString(buf, p, in.verdict)) return null;
     if (!jb.appendf(buf, p, "}}", .{})) return null;
     return buf[0..pos];
@@ -444,10 +451,13 @@ test "bundle golden output locks schema v4" {
         .stats = &stats,
         .now_ms = 100_000,
         .siblings = &siblings,
+        .history_sig = 0xdeadbeef12345678,
+        .history_first_epoch = 1_784_242_023,
+        .history_count = 5,
         .verdict = "go panic in main.crash",
     }).?;
     const expected =
-        "{\"v\":4,\"ts\":\"2026-07-17T22:47:03Z\"," ++
+        "{\"v\":5,\"ts\":\"2026-07-17T22:47:03Z\"," ++
         "\"process\":{\"name\":\"api\",\"cmd\":\"./api --port 8080\",\"pid\":42,\"restarts\":3," ++
         "\"cwd\":\"/app\",\"exe\":\"/app/api\",\"spawned_at\":\"2026-07-17T22:46:16Z\",\"uptime_s\":47," ++
         "\"ready\":true,\"build\":{\"release\":\"api@1.4.2\",\"elf_build_id\":\"a1b2c3d4\"}," ++
@@ -468,6 +478,7 @@ test "bundle golden output locks schema v4" {
         "\"logs_dropped\":3," ++
         "\"stats_timeline\":[{\"t\":\"-60s\",\"rss_mb\":812,\"cpu_pct\":97}]," ++
         "\"siblings\":[{\"name\":\"worker\",\"state\":\"running\",\"uptime_s\":3600,\"restarts\":0}]," ++
+        "\"history\":{\"signature\":\"deadbeef12345678\",\"first_seen\":\"2026-07-16T22:47:03Z\",\"count\":5}," ++
         "\"verdict\":\"go panic in main.crash\"}";
     try std.testing.expectEqualStrings(expected, json);
 }
