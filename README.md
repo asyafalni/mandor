@@ -29,6 +29,7 @@ $ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
 |---|---|---|---|
 | Single static binary | ✅ | ✅ | ❌ |
 | Works in `scratch` / distroless | ✅ | ✅ | ❌ |
+| Full signal forwarding + process groups (dumb-init parity) | ✅ | partial | ✅ |
 | Restart policies + backoff | ✅ | ❌ | ✅ |
 | Log capture with per-worker prefix | ✅ | ✅ | ✅ |
 | CPU / RSS / fd tracking | ✅ | ❌ | ❌ |
@@ -75,9 +76,12 @@ mandor report --json     # machine-readable
 | `--restart` | `never` \| `on-failure` \| `always` | `never` |
 | `--backoff-max` | duration (`500ms`, `30s`, `2m`) | `30s` |
 
-Signals: `SIGTERM`/`SIGINT` are forwarded to every worker (second signal
-escalates to `SIGKILL`); `SIGHUP` is forwarded as-is. Exit code is the worst
-worker exit code (`128+signal` for signal deaths).
+Signals (dumb-init parity): every worker runs in its own process group, so
+signals reach shell-spawned grandchildren too. `SIGTERM`/`SIGINT` are
+forwarded and start graceful shutdown (a second one escalates to `SIGKILL`);
+`SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, and `SIGWINCH` are passed through
+untouched — log rotation and graceful reloads just work. Exit code is the
+worst worker exit code (`128+signal` for signal deaths).
 
 ## Architecture
 
@@ -125,8 +129,8 @@ PID-1 semantics. On other systems the binary compiles for cross-target use.
       policies with exponential backoff, worst-exit-code propagation
 - [x] **v0.2** — log capture (ring buffers, `[name]` prefixes), `/proc`
       sampler, `mandor report`
-- [ ] **v0.3** — incident detection, heuristic summaries, Go/Rust/Python
-      trace parsing, spool dir
+- [x] **v0.3** — incident detection with diagnosis verdicts, Go/Rust/Python
+      trace parsing, restart-loop + leak detection, spool dir
 - [ ] **v0.4** — cgroup v2 OOM detection, optional Prometheus text endpoint,
       `mandor.toml` (CLI-only always works)
 

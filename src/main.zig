@@ -103,6 +103,7 @@ test {
     _ = @import("sampler.zig");
     _ = @import("jsonbuf.zig");
     _ = @import("summarize.zig");
+    _ = @import("detector.zig");
     _ = @import("parsers/go.zig");
     _ = @import("parsers/rust.zig");
     _ = @import("parsers/python.zig");

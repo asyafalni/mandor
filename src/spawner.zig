@@ -8,6 +8,7 @@ const cli = @import("cli.zig");
 const capture = @import("capture.zig");
 const ring = @import("ring.zig");
 const sampler = @import("sampler.zig");
+const detector = @import("detector.zig");
 
 pub const max_args = 64;
 pub const name_cap = 32;
@@ -46,6 +47,7 @@ pub const Worker = struct {
     asm_err: capture.Assembler = .{},
     log: ring.Ring(log_ring_capacity) = .{},
     stats: sampler.Window = .{},
+    det: detector.State = .{},
 
     pub fn nameSlice(w: *const Worker) []const u8 {
         return w.name[0..w.name_len];
@@ -79,6 +81,7 @@ fn resetWorker(w: *Worker) void {
     w.stats.len = 0;
     w.stats.prev_ticks = 0;
     w.stats.prev_t_ms = 0;
+    w.det = .{};
 }
 
 pub const InitError = error{BadCommand};
@@ -158,12 +161,18 @@ pub fn spawn(
         return error.ForkFailed;
     }
     if (rc == 0) {
-        // Child: route stdout/stderr into the pipes. dup2 clears CLOEXEC on
-        // fds 1/2; the original pipe fds close automatically at execve.
+        // Child: own process group so signals reach shell-spawned
+        // grandchildren too (dumb-init behavior), then route stdout/stderr
+        // into the pipes. dup2 clears CLOEXEC on fds 1/2; the original pipe
+        // fds close automatically at execve.
+        _ = linux.setpgid(0, 0);
         if (out_p) |p| _ = linux.dup2(p.w, 1);
         if (err_p) |p| _ = linux.dup2(p.w, 2);
         execChild(w, envp, path_env);
     }
+    // Parent sets it too — whichever side wins the race, the group exists
+    // before we ever signal it.
+    _ = linux.setpgid(@intCast(rc), @intCast(rc));
     if (out_p) |p| {
         _ = linux.close(p.w);
         w.out_r = p.r;

@@ -88,6 +88,53 @@ if [ $rc_h -eq 0 ] && [ $rc_j -eq 0 ] && grep -q "^sh " "$TMP/10rep" && grep -q 
 else bad "report human + json" "rc_h=$rc_h rc_j=$rc_j $(head -3 "$TMP/10rep")"; fi
 unset MANDOR_STATE_DIR
 
+# 11. crash with a go-style panic spools an incident bundle
+cat > "$TMP/crash_go.sh" <<'CRASH'
+echo "booting fine"
+printf 'panic: runtime error: nil deref\n\ngoroutine 1 [running]:\nmain.crash(0x0)\n\t/app/main.go:10 +0x18\nmain.main()\n\t/app/main.go:4 +0x1c\n' >&2
+exit 2
+CRASH
+export MANDOR_STATE_DIR="$TMP/state2"
+timeout 10 "$MANDOR" "sh $TMP/crash_go.sh" >"$TMP/11" 2>&1
+c=$?
+f=$(ls "$TMP/state2/incidents/"*.json 2>/dev/null | head -1)
+if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"cause":"exit:2"' "$f" \
+   && grep -q '"lang":"go"' "$f" && grep -q 'main.crash /app/main.go:10' "$f" \
+   && grep -q 'go panic in main.crash' "$f"; then
+  ok "incident bundle with go trace + verdict"
+else
+  bad "incident bundle with go trace" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
+fi
+unset MANDOR_STATE_DIR
+
+# 12. USR1 is forwarded (dumb-init parity)
+marker_usr1="$TMP/got_usr1"
+"$MANDOR" "bash -c 'trap \"touch $marker_usr1\" USR1; trap \"exit 0\" TERM; while true; do sleep 1; done'" >"$TMP/12" 2>&1 &
+mpid=$!
+sleep 1
+kill -USR1 "$mpid"
+sleep 1
+kill -TERM "$mpid"
+wait "$mpid"; c=$?
+if [ $c -eq 0 ] && [ -f "$marker_usr1" ]; then ok "USR1 forwarded to workers"
+else bad "USR1 forwarded" "exit $c, marker $([ -f "$marker_usr1" ] && echo yes || echo no)"; fi
+
+# 13. signals reach grandchildren via process groups
+m1="$TMP/gc_parent"; m2="$TMP/gc_child"
+cat > "$TMP/gc.sh" <<GCEOF
+(trap 'touch $m2; exit 0' TERM; sleep 30 & wait \$!) &
+trap 'touch $m1; exit 0' TERM
+sleep 30 & wait \$!
+GCEOF
+"$MANDOR" "bash $TMP/gc.sh" >"$TMP/13" 2>&1 &
+mpid=$!
+sleep 1
+kill -TERM "$mpid"
+wait "$mpid" 2>/dev/null
+sleep 0.5
+if [ -f "$m1" ] && [ -f "$m2" ]; then ok "TERM reaches grandchildren (process group)"
+else bad "TERM reaches grandchildren" "parent=$([ -f $m1 ] && echo y || echo n) child=$([ -f $m2 ] && echo y || echo n)"; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

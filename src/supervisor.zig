@@ -14,6 +14,7 @@ const capture = @import("capture.zig");
 const ring = @import("ring.zig");
 const sampler = @import("sampler.zig");
 const report = @import("report.zig");
+const incident = @import("incident.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -112,7 +113,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 forwardAll(workers, .KILL);
             }
         }
-        if (ev.hup) forwardAll(workers, .HUP);
+        for (ev.pass[0..ev.pass_n]) |sig| forwardAll(workers, sig);
 
         if (ev.chld) {
             const reaped = reaper.drain(workers).reaped_workers;
@@ -127,6 +128,12 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 };
                 closePipes(w);
                 logDeath(w);
+                if (!shutting_down and !clean) {
+                    w.det.recordDeath(now);
+                    incident.onDeath(state_dir, w, now);
+                    if (w.det.restartLoopTriggered(now)) |count|
+                        incident.onRestartLoop(state_dir, w, count, now);
+                }
                 if (!shutting_down and backoff.shouldRestart(cfg.restart, clean)) {
                     const uptime = now -| w.last_start_ms;
                     w.cur_delay_ms = backoff.next(w.cur_delay_ms, uptime, cfg.backoff_max_ms);
@@ -154,7 +161,11 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         if (now_sample >= next_sample_ms) {
             next_sample_ms = now_sample + sampler.interval_ms;
             for (workers) |*w| {
-                if (w.pid > 0) sampler.sample(&w.stats, w.pid, now_sample);
+                if (w.pid > 0) {
+                    sampler.sample(&w.stats, w.pid, now_sample);
+                    if (w.det.leakCheck(&w.stats, now_sample)) |info|
+                        incident.onLeak(state_dir, w, info, now_sample);
+                }
             }
             report.writeState(state_dir, workers, now_sample);
         }
@@ -195,7 +206,11 @@ fn logDeath(w: *const spawner.Worker) void {
 
 fn forwardAll(workers: []spawner.Worker, sig: posix.SIG) void {
     for (workers) |*w| {
-        if (w.pid > 0) posix.kill(w.pid, sig) catch {};
+        // Negative pid = the worker's whole process group (set at spawn), so
+        // grandchildren under a shell wrapper receive the signal too.
+        if (w.pid > 0) posix.kill(-w.pid, sig) catch {
+            posix.kill(w.pid, sig) catch {};
+        };
     }
 }
 
