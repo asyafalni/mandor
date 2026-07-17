@@ -23,6 +23,11 @@ pub fn drain(workers: []spawner.Worker) ReapSummary {
         const pid: i32 = @intCast(rc);
         if (pid == 0) return summary; // children exist, none exited
         for (workers) |*w| {
+            if (w.pid == pid) {
+                // Leader is dead: sweep any grandchildren left in its
+                // process group so restarts never accumulate strays.
+                posix.kill(-pid, .KILL) catch {};
+            }
             if (w.health_pid == pid) {
                 w.health_pid = 0;
                 w.health_done = true;

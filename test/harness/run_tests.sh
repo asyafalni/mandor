@@ -349,6 +349,23 @@ timeout 10 "$MANDOR" --config="$TMP/oom.toml" >"$TMP/29" 2>&1
 if grep -q "^\[sh\] 500$" "$TMP/29"; then ok "oom_score_adj applied to worker"
 else bad "oom_score_adj" "$(grep '\[sh\]' "$TMP/29")"; fi
 
+# 30. dead worker's grandchildren are swept (no strays across restarts)
+timeout 10 "$MANDOR" "bash -c 'sleep 30 & echo BGPID=\$!; exit 0'" >"$TMP/30" 2>&1
+bg=$(grep -o "BGPID=[0-9]*" "$TMP/30" | cut -d= -f2)
+sleep 0.5
+if [ -n "$bg" ] && ! kill -0 "$bg" 2>/dev/null; then ok "grandchildren swept on worker death"
+else bad "grandchild sweep" "bg=$bg still=$(kill -0 "$bg" 2>/dev/null && echo alive)"; fi
+
+# 31. workers die if the supervisor is SIGKILLed (PDEATHSIG, non-PID-1 safety)
+"$MANDOR" "sleep 30" >"$TMP/31" 2>&1 &
+mpid=$!
+sleep 1
+wpid=$(grep -o "spawned sleep (pid [0-9]*)" "$TMP/31" | grep -o "[0-9]*")
+kill -9 "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+sleep 0.5
+if [ -n "$wpid" ] && ! kill -0 "$wpid" 2>/dev/null; then ok "PDEATHSIG kills workers when supervisor dies"
+else bad "PDEATHSIG" "wpid=$wpid $(kill -0 "$wpid" 2>/dev/null && echo alive)"; kill "$wpid" 2>/dev/null; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

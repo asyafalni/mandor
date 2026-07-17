@@ -189,9 +189,13 @@ pub fn spawnCheck(
     path_env: []const u8,
     now_ms: u64,
 ) bool {
+    const supervisor_pid = linux.getpid();
     const rc = linux.fork();
     if (posix.errno(rc) != .SUCCESS) return false;
     if (rc == 0) {
+        // Probes die with the supervisor — hard, they hold no state.
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        if (linux.getppid() != supervisor_pid) linux.exit(1);
         const empty = posix.sigemptyset();
         posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
         const null_rc = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
@@ -285,6 +289,7 @@ pub fn spawn(
         mergeEnv(envp, w)
     else
         envp;
+    const supervisor_pid = linux.getpid(); // must be pre-fork for the guard
     const rc = linux.fork();
     if (posix.errno(rc) != .SUCCESS) {
         closePair(out_p);
@@ -293,10 +298,14 @@ pub fn spawn(
         return error.ForkFailed;
     }
     if (rc == 0) {
-        // Child: own process group so signals reach shell-spawned
-        // grandchildren too (dumb-init behavior), then route stdout/stderr
-        // into the pipes. dup2 clears CLOEXEC on fds 1/2; the original pipe
-        // fds close automatically at execve.
+        // Child: if the supervisor dies unexpectedly (non-PID-1 use), take
+        // the worker down with it — no orphans. Guard the classic race:
+        // parent may already be gone before prctl lands.
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.TERM), 0, 0, 0);
+        if (linux.getppid() != supervisor_pid) linux.exit(1);
+        // Own process group so signals reach shell-spawned grandchildren
+        // too (dumb-init behavior), then route stdout/stderr into the
+        // pipes. dup2 clears CLOEXEC on fds 1/2; originals close at execve.
         _ = linux.setpgid(0, 0);
         if (out_p) |p| _ = linux.dup2(p.w, 1);
         if (err_p) |p| _ = linux.dup2(p.w, 2);
