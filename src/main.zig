@@ -6,4 +6,5 @@ pub fn main() !void {
 
 test {
     _ = @import("cli.zig");
+    _ = @import("backoff.zig");
 }
