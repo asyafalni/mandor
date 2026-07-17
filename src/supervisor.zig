@@ -109,6 +109,13 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             };
         } else logmod.print("[mandor] restart: no worker named {s}\n", .{pair.worker});
     }
+    for (cfg.essential[0..cfg.essential_n]) |name| {
+        if (findWorker(workers, name)) |w| {
+            w.essential = true;
+        } else logmod.print("[mandor] essential: no worker named {s}\n", .{name});
+    }
+    tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
+    tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
     var oneshot_count: usize = 0;
     for (cfg.oneshot[0..cfg.oneshot_n]) |name| {
         if (findWorker(workers, name)) |w| {
@@ -451,6 +458,20 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 } else {
                     w.done = true;
                 }
+                // Leader semantics: a permanently-finished essential worker
+                // takes the whole container down with its exit code.
+                if (w.done and w.essential and !shutting_down) {
+                    logmod.print("[mandor] essential worker {s} finished, stopping all\n", .{w.nameSlice()});
+                    give_up_code = w.final_code;
+                    shutting_down = true;
+                    shutdown_deadline_ms = now + cfg.stop_grace_ms;
+                    forwardAll(workers, .TERM);
+                    for (workers, 0..) |*other, oi| {
+                        other.next_restart_ms = 0;
+                        waiting[oi] = false;
+                        if (other.pid == 0) other.done = true;
+                    }
+                }
             }
         }
 
@@ -623,18 +644,34 @@ const EchoCtx = struct { w: *spawner.Worker, err: bool };
 
 /// Ring-record the line and echo it, `[name] `-prefixed, to our own
 /// stdout/stderr in a single write (atomic below PIPE_BUF).
+var tty_out = false;
+var tty_err = false;
+
 fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     _ = ctx.w.log.push(text, flags, wallMs());
-    var buf: [capture.max_line + spawner.name_cap + 8]u8 = undefined;
+    var buf: [capture.max_line + spawner.name_cap + 24]u8 = undefined;
     const name = ctx.w.nameSlice();
-    buf[0] = '[';
-    @memcpy(buf[1..][0..name.len], name);
-    buf[1 + name.len] = ']';
-    buf[2 + name.len] = ' ';
-    @memcpy(buf[3 + name.len ..][0..text.len], text);
-    buf[3 + name.len + text.len] = '\n';
     const fd: i32 = if (flags & ring.flag_stderr != 0) 2 else 1;
-    _ = linux.write(fd, &buf, 4 + name.len + text.len);
+    const colored = if (fd == 1) tty_out else tty_err;
+    var p: usize = 0;
+    if (colored) {
+        // \x1b[3Xm[name]\x1b[0m — 8-color cycle per worker, TTY only
+        const esc = [_]u8{ 0x1b, '[', '3', '0' + (ctx.w.color - 30), 'm' };
+        @memcpy(buf[p..][0..esc.len], &esc);
+        p += esc.len;
+    }
+    buf[p] = '[';
+    @memcpy(buf[p + 1 ..][0..name.len], name);
+    buf[p + 1 + name.len] = ']';
+    p += 2 + name.len;
+    if (colored) {
+        @memcpy(buf[p..][0..4], "\x1b[0m");
+        p += 4;
+    }
+    buf[p] = ' ';
+    @memcpy(buf[p + 1 ..][0..text.len], text);
+    buf[p + 1 + text.len] = '\n';
+    _ = linux.write(fd, &buf, p + 2 + text.len);
 }
 
 /// Drain a readable pipe until EAGAIN; on EOF flush partials and close.

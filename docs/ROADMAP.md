@@ -73,9 +73,10 @@ Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
 | 28 ✅ | Recycle thresholds `max_rss_mb` / `max_lifetime` (per worker) | XS | ● ● ● ○ | pm2's most-cited flag; sampler already has RSS — detector becomes actor; planned recycling never counts toward give-up |
 | 29 ✅ | Per-worker `restart` / `max_restarts` / `backoff_max` overrides | XS | ● ● ● ○ | Consistency: everything else already scopes per worker |
 | 30 | Restart propagation along start_after (OTP `rest_for_one`) | S | ● ● ● ○ | compose retrofitted this after years of demand; hold until asked |
-| 31 | `essential` worker (leader exits ⇒ all stop, code propagates) | XS | ● ● ○ ○ | Nomad leader-task semantics; hold until asked |
+| 31 ✅ | `essential` worker (leader exits ⇒ all stop, code propagates) | XS | ● ● ○ ○ | SHIPPED 2026-07-17 |
 | 32 | `pre_stop` drain hook | S | ● ● ○ ○ | Narrower than it looks (pod-level preStop covers routing drain); hold |
-| 33 | TTY color prefixes / `.env` loading | XS | ● ○ ○ ○ | Dev-UX only; hold |
+| 33 ✅ | TTY color prefixes + `env_file` loading | XS | ● ○ ○ ○ | SHIPPED 2026-07-17 |
+| 34 | Ultra-low-latency capture path, nanozlog-inspired (https://github.com/wyzdwdz/nanozlog) | M | ● ● ○ ○ | User-parked 2026-07-17 — make logging MORE EFFICIENT: study nanozlog's lock-free ring/deferred-formatting techniques for the read→assemble→ring→echo hot path (batched writev echo, fewer wallMs calls, single-copy framing) when log-heavy workers show overhead |
 
 ## Explicitly rejected (research-backed)
 

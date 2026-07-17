@@ -69,6 +69,8 @@ pub const Worker = struct {
     max_lifetime_ms: ?u64 = null,
     recycling: bool = false, // current death is planned, not a failure
     restart_override: ?cli.RestartPolicy = null,
+    essential: bool = false, // leader semantics: its exit stops everything
+    color: u8 = 0, // ANSI 31..36 cycle for TTY prefixes
     restarts: u32 = 0,
     /// Consecutive unclean deaths (reset by clean exit or stable uptime).
     fail_streak: u32 = 0,
@@ -149,6 +151,8 @@ fn resetWorker(w: *Worker) void {
     w.max_lifetime_ms = null;
     w.recycling = false;
     w.restart_override = null;
+    w.essential = false;
+    w.color = 0;
 }
 
 /// "1000:1000" -> numeric uid/gid privilege drop for this worker.
@@ -233,7 +237,24 @@ pub fn initWorkers(workers: []Worker, commands: []const []const u8) InitError!vo
         w.argv[argv.len] = null;
         w.argc = @intCast(argv.len);
         setName(w, argv[0], workers[0..idx]);
+        w.color = @intCast(31 + (idx % 6)); // red..cyan cycle
     }
+}
+
+// Global env additions (env_file), applied to every worker.
+var g_env_buf: [2048]u8 = undefined;
+var g_env: [32]?[*:0]const u8 = undefined;
+var g_env_n: u8 = 0;
+var g_env_used: u16 = 0;
+
+pub fn addGlobalEnv(entry: []const u8) bool {
+    if (g_env_n == g_env.len or g_env_used + entry.len + 1 > g_env_buf.len) return false;
+    @memcpy(g_env_buf[g_env_used..][0..entry.len], entry);
+    g_env_buf[g_env_used + entry.len] = 0;
+    g_env[g_env_n] = @ptrCast(&g_env_buf[g_env_used]);
+    g_env_n += 1;
+    g_env_used += @intCast(entry.len + 1);
+    return true;
 }
 
 fn setName(w: *Worker, argv0: []const u8, prior: []const Worker) void {
@@ -293,7 +314,7 @@ pub fn spawn(
     const ready_p = if (ready_fd != null) capture.makePipe() else null;
     // Merge parent env + per-worker extras BEFORE fork (no alloc, static
     // scratch — spawns are serialized in the single-threaded supervisor).
-    const child_envp: [*:null]const ?[*:0]const u8 = if (w.extra_env_n > 0)
+    const child_envp: [*:null]const ?[*:0]const u8 = if (w.extra_env_n > 0 or g_env_n > 0)
         mergeEnv(envp, w)
     else
         envp;
@@ -420,7 +441,11 @@ var merged_env: [513 + 17]?[*:0]const u8 = undefined;
 
 fn mergeEnv(envp: [*:null]const ?[*:0]const u8, w: *const Worker) [*:null]const ?[*:0]const u8 {
     var n: usize = 0;
-    while (envp[n] != null and n < 512) : (n += 1) merged_env[n] = envp[n];
+    while (envp[n] != null and n < 480) : (n += 1) merged_env[n] = envp[n];
+    for (g_env[0..g_env_n]) |e| {
+        merged_env[n] = e;
+        n += 1;
+    }
     for (w.extra_env[0..w.extra_env_n]) |e| {
         merged_env[n] = e;
         n += 1;

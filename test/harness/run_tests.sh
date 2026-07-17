@@ -406,6 +406,40 @@ else
   echo "skip termination-log (not root)"
 fi
 
+# 35. env_file loads globals into every worker
+printf "# comment\nFOO=from-envfile\n" > "$TMP/app.env"
+cat > "$TMP/ef.toml" <<TOML
+workers = ["sh -c 'echo got=\$FOO'"]
+env_file = "$TMP/app.env"
+TOML
+timeout 10 "$MANDOR" --config="$TMP/ef.toml" >"$TMP/35" 2>&1
+if grep -q "got=from-envfile" "$TMP/35"; then ok "env_file applied"
+else bad "env_file" "$(grep got= "$TMP/35")"; fi
+
+# 36. essential worker exit stops the fleet with its code
+cat > "$TMP/es.toml" <<'TOML'
+workers = [
+  "sh -c 'sleep 0.5; exit 0'",
+  "sleep 30",
+]
+essential = ["sh"]
+TOML
+start=$(date +%s)
+timeout 15 "$MANDOR" --config="$TMP/es.toml" >"$TMP/36" 2>&1
+c=$?; took=$(( $(date +%s) - start ))
+if [ $c -eq 0 ] && [ "$took" -le 5 ] && grep -q "essential worker sh finished" "$TMP/36"; then
+  ok "essential worker stops fleet (exit 0 in ${took}s)"
+else bad "essential" "exit $c after ${took}s: $(tail -2 "$TMP/36")"; fi
+
+# 37. TTY color prefixes (needs util-linux script to fake a tty)
+if command -v script >/dev/null 2>&1; then
+  script -qec "\"$MANDOR\" \"sh -c 'echo colored'\"" /dev/null >"$TMP/37" 2>&1
+  if grep -q $'\x1b\[3[1-6]m\[sh\]' "$TMP/37"; then ok "TTY color prefixes"
+  else bad "TTY colors" "$(head -c 120 "$TMP/37" | od -c | head -2)"; fi
+else
+  echo "skip TTY colors (no script cmd)"
+fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

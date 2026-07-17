@@ -44,10 +44,13 @@ pub const FileConfig = struct {
     lifetime_pairs_n: u8 = 0,
     restart_pairs: [16]cli.HealthSpec = undefined,
     restart_pairs_n: u8 = 0,
+    essential: [16][]const u8 = undefined,
+    essential_n: u8 = 0,
+    env_file: ?[]const u8 = null,
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, oom, nice, max_rss, lifetime, restart_override };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, oom, nice, max_rss, lifetime, restart_override, essential };
 
 /// name=value array keys share one parse shape; map key -> target + slot.
 fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSpec, n: *u8 } {
@@ -151,6 +154,8 @@ pub fn parse(
             cfg.on_incident = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "photon")) {
             cfg.photon = parseString(value) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "env_file")) {
+            cfg.env_file = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "health_interval")) {
             const s = parseString(value) orelse return error.BadValue;
             cfg.health_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
@@ -190,7 +195,7 @@ fn arrayKey(key: []const u8) ?ArrayTarget {
         .{ "cwd", ArrayTarget.cwd },                 .{ "oneshot", ArrayTarget.oneshot },
         .{ "user", ArrayTarget.user },               .{ "oom_score_adj", ArrayTarget.oom },
         .{ "nice", ArrayTarget.nice },               .{ "max_rss_mb", ArrayTarget.max_rss },
-        .{ "max_lifetime", ArrayTarget.lifetime },
+        .{ "max_lifetime", ArrayTarget.lifetime },   .{ "essential", ArrayTarget.essential },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, key, entry[0])) return entry[1];
@@ -215,6 +220,11 @@ fn appendItem(
             if (cfg.oneshot_n == cfg.oneshot.len) return error.BadValue;
             cfg.oneshot[cfg.oneshot_n] = s;
             cfg.oneshot_n += 1;
+        },
+        .essential => {
+            if (cfg.essential_n == cfg.essential.len) return error.BadValue;
+            cfg.essential[cfg.essential_n] = s;
+            cfg.essential_n += 1;
         },
         else => {
             const slot = pairSlot(cfg, target) orelse unreachable; // real target

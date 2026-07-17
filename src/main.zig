@@ -151,6 +151,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
             if (cfg.photon == null) cfg.photon = file_cfg.photon;
+            cfg.essential = file_cfg.essential;
+            cfg.essential_n = file_cfg.essential_n;
+            if (cfg.env_file == null) cfg.env_file = file_cfg.env_file;
             cfg.env_pairs = file_cfg.env_pairs;
             cfg.env_pairs_n = file_cfg.env_pairs_n;
             cfg.cwd_pairs = file_cfg.cwd_pairs;
@@ -170,6 +173,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.restart_pairs = file_cfg.restart_pairs;
             cfg.restart_pairs_n = file_cfg.restart_pairs_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
+        }
+        if (cfg.env_file) |path| {
+            const ef_text = readSmallFile(path, &envfile_buf) orelse {
+                logmod.print("[mandor] cannot read env_file {s}\n", .{path});
+                return 2;
+            };
+            var lines = std.mem.splitScalar(u8, ef_text, '\n');
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (line.len == 0 or line[0] == '#') continue;
+                if (std.mem.indexOfScalar(u8, line, '=') == null) continue;
+                const spawner2 = @import("spawner.zig");
+                if (!spawner2.addGlobalEnv(line))
+                    logmod.print("[mandor] env_file overflow, ignoring: {s}\n", .{line});
+            }
         }
         if (cfg.commands.len == 0) {
             logmod.print("[mandor] no worker commands given\n\n", .{});
@@ -192,6 +210,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 }
 
 var config_buf: [64 * 1024]u8 = undefined;
+var envfile_buf: [8 * 1024]u8 = undefined;
 var incident_entries: [256]@import("spool.zig").DirEntry = undefined;
 
 /// `mandor report --incidents` — recall the spooled history (survives

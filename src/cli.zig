@@ -73,6 +73,11 @@ pub const Config = struct {
     lifetime_pairs_n: u8 = 0,
     restart_pairs: [16]HealthSpec = undefined,
     restart_pairs_n: u8 = 0,
+    /// Worker names whose exit stops everything (Nomad leader-task).
+    essential: [16][]const u8 = undefined,
+    essential_n: u8 = 0,
+    /// Optional KEY=VAL file loaded into every worker's environment.
+    env_file: ?[]const u8 = null,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,
