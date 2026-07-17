@@ -82,6 +82,8 @@ mandor report --json     # machine-readable
 | `--config` | path to `mandor.toml` | `./mandor.toml` if present |
 | `--state-dir` | state + incident spool dir | `/var/lib/mandor` |
 | `--metrics` | port for Prometheus text metrics on 127.0.0.1 | off |
+| `--stop-grace` | TERM→KILL escalation grace period | `10s` |
+| `--expected-exit` | extra exit codes treated as success, e.g. `143,129` | none |
 
 ### Configuration file (optional)
 
@@ -156,8 +158,9 @@ PID-1 semantics. On other systems the binary compiles for cross-target use.
       trace parsing, restart-loop + leak detection, spool dir
 - [x] **v0.4** — cgroup v2 OOM detection, optional Prometheus text endpoint,
       `mandor.toml` (CLI-only always works)
-- [ ] **v0.5** — forensics upgrade: bundle schema v2 (log timestamps,
-      spawn-time /proc snapshot, structured cause + exception, release ids)
+- [x] **v0.5** — forensics upgrade: bundle schema v2 (log timestamps,
+      spawn-time snapshot, structured cause + exception, release ids via
+      `MANDOR_RELEASE`, redacted env, siblings, stop-grace, expected-exit)
 - [ ] **v0.6** — liveness: health checks, readiness notification, structured
       trace frames
 

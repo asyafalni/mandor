@@ -55,6 +55,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     var kill_escalated = false;
     var shutdown_deadline_ms: u64 = 0;
     var next_sample_ms: u64 = nowMs() + sampler.interval_ms;
+    var sample_tick: u32 = 0;
     var oom_kills: u64 = cgroup.readOomKills() orelse 0;
     const metrics_server: ?metrics.Server = if (cfg.metrics_port) |port| blk: {
         const srv = metrics.Server.init(port);
@@ -66,6 +67,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     } else null;
 
     for (workers) |*w| spawnWorker(w, envp, path_env);
+    report.writeState(state_dir, workers, nowMs());
 
     while (true) {
         var live: usize = 0;
@@ -209,6 +211,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         const now_sample = nowMs();
         if (now_sample >= next_sample_ms) {
             next_sample_ms = now_sample + sampler.interval_ms;
+            sample_tick +%= 1;
             for (workers) |*w| {
                 if (w.pid > 0) {
                     sampler.sample(&w.stats, w.pid, now_sample);
@@ -216,7 +219,9 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                         incident.onLeak(state_dir, workers, w, info, now_sample);
                 }
             }
-            report.writeState(state_dir, workers, now_sample);
+            // Near-zero idle footprint: deaths flush state immediately, so
+            // the periodic freshness write only needs to run every 30 s.
+            if (sample_tick % 6 == 0) report.writeState(state_dir, workers, now_sample);
         }
     }
 

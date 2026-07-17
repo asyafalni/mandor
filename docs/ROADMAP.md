@@ -7,7 +7,7 @@ milestone of work", and within a tier items are sorted by value-per-effort.
 Complexity scale: **XS** (< 1h) · **S** (half day) · **M** (1–3 days) ·
 **L** (a week+).
 
-## Tier 1 — v0.5 "forensics upgrade" (all XS/S, ships bundle schema v2)
+## Tier 1 — v0.5 "forensics upgrade" — ✅ SHIPPED 2026-07-17 (bundle schema v2)
 
 These convert the incident bundle from human-readable postmortem into
 LLM-localizable repair input. One coordinated schema bump to `"v": 2` with

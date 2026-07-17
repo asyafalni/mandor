@@ -26,14 +26,31 @@ pub fn Ring(comptime capacity: usize) type {
             const needed = header_len + line.len;
             if (needed > capacity or line.len > 4095) return false;
             while (capacity - self.used < needed) self.evictOldest();
-            self.setAt(self.used, @truncate(line.len));
-            self.setAt(self.used + 1, @truncate(line.len >> 8));
-            self.setAt(self.used + 2, flags);
-            inline for (0..8) |b| self.setAt(self.used + 3 + b, @truncate(t_ms >> (8 * b)));
-            for (line, 0..) |c, i| self.setAt(self.used + header_len + i, c);
+            var header: [header_len]u8 = undefined;
+            header[0] = @truncate(line.len);
+            header[1] = @truncate(line.len >> 8);
+            header[2] = flags;
+            std.mem.writeInt(u64, header[3..11], t_ms, .little);
+            self.writeSpan(self.used, &header);
+            self.writeSpan(self.used + header_len, line);
             self.used += needed;
             self.records += 1;
             return true;
+        }
+
+        /// Hot path: at most two memcpy spans, no per-byte modulo.
+        fn writeSpan(self: *Self, logical: usize, bytes: []const u8) void {
+            const start = (self.head + logical) % capacity;
+            const first = @min(bytes.len, capacity - start);
+            @memcpy(self.buf[start..][0..first], bytes[0..first]);
+            if (first < bytes.len) @memcpy(self.buf[0 .. bytes.len - first], bytes[first..]);
+        }
+
+        fn readSpan(self: *const Self, logical: usize, out: []u8) void {
+            const start = (self.head + logical) % capacity;
+            const first = @min(out.len, capacity - start);
+            @memcpy(out[0..first], self.buf[start..][0..first]);
+            if (first < out.len) @memcpy(out[first..], self.buf[0 .. out.len - first]);
         }
 
         fn evictOldest(self: *Self) void {
@@ -46,10 +63,6 @@ pub fn Ring(comptime capacity: usize) type {
 
         fn at(self: *const Self, logical: usize) u8 {
             return self.buf[(self.head + logical) % capacity];
-        }
-
-        fn setAt(self: *Self, logical: usize, value: u8) void {
-            self.buf[(self.head + logical) % capacity] = value;
         }
 
         pub const Record = struct { line: []const u8, flags: u8, t_ms: u64 };
@@ -65,12 +78,12 @@ pub fn Ring(comptime capacity: usize) type {
             pub fn next(self: *Iterator) ?Record {
                 const r = self.ring;
                 if (self.offset >= r.used) return null;
-                const len = @as(usize, r.at(self.offset)) |
-                    (@as(usize, r.at(self.offset + 1)) << 8);
-                const flags = r.at(self.offset + 2);
-                var t_ms: u64 = 0;
-                inline for (0..8) |b| t_ms |= @as(u64, r.at(self.offset + 3 + b)) << (8 * b);
-                for (0..len) |i| self.copy_buf[i] = r.at(self.offset + header_len + i);
+                var header: [header_len]u8 = undefined;
+                r.readSpan(self.offset, &header);
+                const len = @as(usize, header[0]) | (@as(usize, header[1]) << 8);
+                const flags = header[2];
+                const t_ms = std.mem.readInt(u64, header[3..11], .little);
+                r.readSpan(self.offset + header_len, self.copy_buf[0..len]);
                 self.offset += header_len + len;
                 return .{ .line = self.copy_buf[0..len], .flags = flags, .t_ms = t_ms };
             }

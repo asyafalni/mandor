@@ -98,12 +98,16 @@ export MANDOR_STATE_DIR="$TMP/state2"
 timeout 10 "$MANDOR" "sh $TMP/crash_go.sh" >"$TMP/11" 2>&1
 c=$?
 f=$(ls "$TMP/state2/incidents/"*.json 2>/dev/null | head -1)
-if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"cause":"exit:2"' "$f" \
+if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":2' "$f" \
+   && grep -q '"kind":"exit"' "$f" && grep -q '"exit_code":2' "$f" \
+   && grep -q '"cause_str":"exit:2"' "$f" \
    && grep -q '"lang":"go"' "$f" && grep -q 'main.crash /app/main.go:10' "$f" \
+   && grep -q '"type":"runtime error"' "$f" \
+   && grep -q '"exe":"[^"]*/sh"' "$f" \
    && grep -q 'go panic in main.crash' "$f"; then
-  ok "incident bundle with go trace + verdict"
+  ok "incident bundle v2 with go trace + exception + verdict"
 else
-  bad "incident bundle with go trace" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
+  bad "incident bundle v2" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
 fi
 unset MANDOR_STATE_DIR
 
@@ -156,6 +160,27 @@ kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
 if echo "$body" | grep -q 'mandor_worker_up{worker="sh"} 1' && echo "$body" | grep -q 'mandor_incidents_total 0'; then
   ok "metrics endpoint serves prometheus text"
 else bad "metrics endpoint" "$(echo "$body" | head -3)"; fi
+
+# 16. --expected-exit: listed code behaves like success (exit 0, no incident)
+export MANDOR_STATE_DIR="$TMP/state16"
+timeout 10 "$MANDOR" --expected-exit=7 "sh -c 'exit 7'" >"$TMP/16" 2>&1
+c=$?
+n=$(ls "$TMP/state16/incidents/" 2>/dev/null | wc -l)
+if [ $c -eq 0 ] && [ "$n" -eq 0 ]; then ok "expected-exit treated as clean"
+else bad "expected-exit treated as clean" "exit $c, incidents $n"; fi
+unset MANDOR_STATE_DIR
+
+# 17. --stop-grace force-kills TERM-ignoring workers
+start=$(date +%s)
+"$MANDOR" --stop-grace=1s "bash -c 'trap \"\" TERM; sleep 30'" >"$TMP/17" 2>&1 &
+mpid=$!
+sleep 1
+kill -TERM "$mpid"
+wait "$mpid"; c=$?
+took=$(( $(date +%s) - start ))
+if [ $c -eq 137 ] && [ "$took" -le 6 ] && grep -q "stop-grace expired" "$TMP/17"; then
+  ok "stop-grace escalates to SIGKILL"
+else bad "stop-grace escalates" "exit $c after ${took}s: $(tail -2 "$TMP/17")"; fi
 
 echo
 echo "passed $pass, failed $fail"
