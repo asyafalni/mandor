@@ -191,6 +191,10 @@ zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe  # arm64
 Linux-only by design — supervision is built on `signalfd`, `/proc`, and
 PID-1 semantics. On other systems the binary compiles for cross-target use.
 
+The binary is libc-free static (raw syscalls, no glibc/musl runtime), so the
+same file runs on **Alpine, Debian, Ubuntu, scratch, and distroless** images
+unchanged — CI runs the full integration harness on all three distro bases.
+
 ## Status
 
 - [x] **v0.1** — multirun parity: spawn, forward signals, reap, restart
