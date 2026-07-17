@@ -8,7 +8,7 @@ const sampler = @import("sampler.zig");
 const ring = @import("ring.zig");
 const summarize = @import("summarize.zig");
 
-pub const bundle_version = 3;
+pub const bundle_version = 4;
 
 // ------------------------------------------------------- wall clock
 
@@ -97,7 +97,9 @@ pub const BundleInput = struct {
     exe: []const u8 = "",
     spawned_at_epoch: i64 = 0,
     uptime_s: u64 = 0,
+    ready: bool = false, // worker signaled readiness before the incident
     release: []const u8 = "", // MANDOR_RELEASE / GIT_SHA passthrough
+    build_id: []const u8 = "", // hex GNU build-id of the resolved exe
     environ: [:null]const ?[*:0]const u8 = &empty_environ,
     limits_nofile: u64 = 0,
     memory_max_bytes: ?u64 = null,
@@ -136,10 +138,12 @@ pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
     if (!jb.appendJsonString(buf, p, in.cwd)) return null;
     if (!jb.appendf(buf, p, ",\"exe\":", .{})) return null;
     if (!jb.appendJsonString(buf, p, in.exe)) return null;
-    if (!jb.appendf(buf, p, ",\"spawned_at\":\"{s}\",\"uptime_s\":{d},\"build\":{{\"release\":", .{
-        iso8601(&ts2_buf, in.spawned_at_epoch), in.uptime_s,
+    if (!jb.appendf(buf, p, ",\"spawned_at\":\"{s}\",\"uptime_s\":{d},\"ready\":{},\"build\":{{\"release\":", .{
+        iso8601(&ts2_buf, in.spawned_at_epoch), in.uptime_s, in.ready,
     })) return null;
     if (!jb.appendJsonString(buf, p, in.release)) return null;
+    if (!jb.appendf(buf, p, ",\"elf_build_id\":", .{})) return null;
+    if (!jb.appendJsonString(buf, p, in.build_id)) return null;
     if (!jb.appendf(buf, p, "}},\"env\":{{", .{})) return null;
     var env_n: usize = 0;
     for (in.environ) |maybe| {
@@ -186,7 +190,12 @@ pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
         return null;
     for (in.trace.frames, 0..) |f, i| {
         if (i > 0 and !jb.appendf(buf, p, ",", .{})) return null;
-        if (!jb.appendJsonString(buf, p, f)) return null;
+        if (!jb.appendf(buf, p, "{{\"function\":", .{})) return null;
+        if (!jb.appendJsonString(buf, p, f.function)) return null;
+        if (!jb.appendf(buf, p, ",\"file\":", .{})) return null;
+        if (!jb.appendJsonString(buf, p, f.file)) return null;
+        if (!jb.appendf(buf, p, ",\"line\":{d},\"in_app\":{}}}", .{ f.line, f.in_app }))
+            return null;
     }
     if (!jb.appendf(buf, p, "],\"raw\":", .{})) return null;
     if (!jb.appendJsonString(buf, p, in.trace.raw)) return null;
@@ -298,8 +307,11 @@ test "envRedacted heuristics" {
     try std.testing.expect(!envRedacted("GOMAXPROCS"));
 }
 
-test "bundle golden output locks schema v3" {
-    const frames = [_][]const u8{ "main.crash main.go:10", "main.main main.go:4" };
+test "bundle golden output locks schema v4" {
+    const frames = [_]summarize.Frame{
+        .{ .function = "main.crash", .file = "main.go", .line = 10, .in_app = true },
+        .{ .function = "runtime.gopanic", .file = "/usr/local/go/src/runtime/panic.go", .line = 770, .in_app = false },
+    };
     const logs = [_]summarize.CompactLine{
         .{ .text = "retry 7 failed", .flags = ring.flag_stderr, .first_t_ms = 1_784_328_419_000, .last_t_ms = 1_784_328_420_250, .count = 47 },
         .{ .text = "listening on :8080", .flags = 0, .first_t_ms = 1_784_328_420_500, .last_t_ms = 1_784_328_420_500, .count = 1 },
@@ -323,7 +335,9 @@ test "bundle golden output locks schema v3" {
         .exe = "/app/api",
         .spawned_at_epoch = 1_784_328_376,
         .uptime_s = 47,
+        .ready = true,
         .release = "api@1.4.2",
+        .build_id = "a1b2c3d4",
         .environ = &environ,
         .limits_nofile = 1024,
         .memory_max_bytes = 536_870_912,
@@ -349,16 +363,18 @@ test "bundle golden output locks schema v3" {
         .verdict = "go panic in main.crash",
     }).?;
     const expected =
-        "{\"v\":3,\"ts\":\"2026-07-17T22:47:03Z\"," ++
+        "{\"v\":4,\"ts\":\"2026-07-17T22:47:03Z\"," ++
         "\"process\":{\"name\":\"api\",\"cmd\":\"./api --port 8080\",\"pid\":42,\"restarts\":3," ++
         "\"cwd\":\"/app\",\"exe\":\"/app/api\",\"spawned_at\":\"2026-07-17T22:46:16Z\",\"uptime_s\":47," ++
-        "\"build\":{\"release\":\"api@1.4.2\"}," ++
+        "\"ready\":true,\"build\":{\"release\":\"api@1.4.2\",\"elf_build_id\":\"a1b2c3d4\"}," ++
         "\"env\":{\"PORT\":\"8080\",\"DB_PASSWORD\":\"<redacted>\"}," ++
         "\"limits\":{\"nofile\":1024,\"memory_max_bytes\":536870912}}," ++
         "\"cause\":{\"kind\":\"signal\",\"exit_code\":null,\"signal\":{\"num\":11,\"name\":\"SIGSEGV\"}," ++
         "\"core_dumped\":true,\"oom_kill_delta\":0},\"cause_str\":\"signal:SIGSEGV\"," ++
         "\"exception\":{\"type\":\"runtime error\",\"message\":\"nil deref\"}," ++
-        "\"trace\":{\"lang\":\"go\",\"frames\":[\"main.crash main.go:10\",\"main.main main.go:4\"]," ++
+        "\"trace\":{\"lang\":\"go\",\"frames\":[" ++
+        "{\"function\":\"main.crash\",\"file\":\"main.go\",\"line\":10,\"in_app\":true}," ++
+        "{\"function\":\"runtime.gopanic\",\"file\":\"/usr/local/go/src/runtime/panic.go\",\"line\":770,\"in_app\":false}]," ++
         "\"raw\":\"panic: nil deref\"}," ++
         "\"logs_tail\":[" ++
         "{\"t\":\"2026-07-17T22:46:59.000Z\",\"s\":\"E\",\"err\":false,\"line\":\"retry 7 failed\"," ++

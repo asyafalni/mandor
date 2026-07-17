@@ -30,9 +30,13 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
         loc = loc[0 .. loc.len - 1];
     }
     if (loc.len > 0) {
-        const frame = std.fmt.bufPrint(&st.frame_texts[nframes], "panicked_at {s}", .{loc}) catch
-            return null;
-        st.frames[nframes] = frame;
+        const fl = summarize.splitFileLine(loc);
+        st.frames[nframes] = .{
+            .function = "panic site",
+            .file = fl.file,
+            .line = fl.line,
+            .in_app = true,
+        };
         nframes += 1;
     }
 
@@ -47,11 +51,16 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
                 const nxt = std.mem.trimStart(u8, lines[i + 1].text, " ");
                 if (std.mem.startsWith(u8, nxt, "at ")) location = nxt[3..];
             }
-            const frame = if (location.len > 0)
-                std.fmt.bufPrint(&st.frame_texts[nframes], "{s} {s}", .{ func, location }) catch break
-            else
-                std.fmt.bufPrint(&st.frame_texts[nframes], "{s}", .{func}) catch break;
-            st.frames[nframes] = frame;
+            const fl = summarize.splitFileLine(location);
+            st.frames[nframes] = .{
+                .function = func,
+                .file = fl.file,
+                .line = fl.line,
+                .in_app = !std.mem.startsWith(u8, func, "core::") and
+                    !std.mem.startsWith(u8, func, "std::") and
+                    !std.mem.startsWith(u8, func, "rust_begin_unwind") and
+                    std.mem.indexOf(u8, fl.file, "/rustc/") == null,
+            };
             nframes += 1;
             end = i + 1;
         } else if (std.mem.startsWith(u8, trimmed, "at ")) {
@@ -120,9 +129,15 @@ test "new-format panic with backtrace" {
     try t.expectEqualStrings("panic", tr.exc_type);
     try t.expectEqualStrings("attempt to divide by zero", tr.exc_msg);
     try t.expectEqual(@as(usize, 3), tr.frames.len);
-    try t.expectEqualStrings("panicked_at src/main.rs:10:5", tr.frames[0]);
-    try t.expectEqualStrings("rust_begin_unwind /rustc/abc/library/std/src/panicking.rs:645:5", tr.frames[1]);
-    try t.expectEqualStrings("core::panicking::panic_fmt", tr.frames[2]);
+    try t.expectEqualStrings("panic site", tr.frames[0].function);
+    try t.expectEqualStrings("src/main.rs", tr.frames[0].file);
+    try t.expectEqual(@as(u32, 10), tr.frames[0].line);
+    try t.expect(tr.frames[0].in_app);
+    try t.expectEqualStrings("rust_begin_unwind", tr.frames[1].function);
+    try t.expectEqual(@as(u32, 645), tr.frames[1].line);
+    try t.expect(!tr.frames[1].in_app);
+    try t.expectEqualStrings("core::panicking::panic_fmt", tr.frames[2].function);
+    try t.expect(!tr.frames[2].in_app);
 }
 
 test "old-format single line panic" {
@@ -132,7 +147,8 @@ test "old-format single line panic" {
     };
     var st: summarize.TraceStorage = .{};
     const tr = detect(&lines, &st).?;
-    try t.expectEqualStrings("panicked_at src/lib.rs:42:13", tr.frames[0]);
+    try t.expectEqualStrings("src/lib.rs", tr.frames[0].file);
+    try t.expectEqual(@as(u32, 42), tr.frames[0].line);
     try t.expectEqualStrings("index out of bounds: the len is 3 but the index is 7", tr.exc_msg);
 }
 

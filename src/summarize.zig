@@ -6,9 +6,32 @@ const ring = @import("ring.zig");
 
 pub const LogLine = struct { text: []const u8, flags: u8, t_ms: u64 = 0 };
 
+/// Sentry-style structured frame — file-level localization is the single
+/// biggest lever for automated repair accuracy.
+pub const Frame = struct {
+    function: []const u8,
+    file: []const u8 = "",
+    line: u32 = 0,
+    in_app: bool = true,
+};
+
+/// "path/file.go:123:5" -> file + line (extra :col ignored).
+pub fn splitFileLine(loc: []const u8) struct { file: []const u8, line: u32 } {
+    var file = loc;
+    var line: u32 = 0;
+    if (std.mem.indexOfScalar(u8, loc, ':')) |colon| {
+        file = loc[0..colon];
+        var j = colon + 1;
+        while (j < loc.len and loc[j] >= '0' and loc[j] <= '9') : (j += 1) {
+            line = line *| 10 +| (loc[j] - '0');
+        }
+    }
+    return .{ .file = file, .line = line };
+}
+
 pub const TraceInfo = struct {
     lang: []const u8 = "unknown",
-    frames: []const []const u8 = &.{},
+    frames: []const Frame = &.{},
     raw: []const u8 = "",
     /// First-class exception identity — ablation studies show the type field
     /// matters more than the raw trace for automated localization.
@@ -17,9 +40,9 @@ pub const TraceInfo = struct {
 };
 
 /// Fixed storage a parser fills; owned by the caller (static in supervisor).
+/// Frame slices point into the caller's (stable) log-line storage.
 pub const TraceStorage = struct {
-    frame_texts: [16][192]u8 = undefined,
-    frames: [16][]const u8 = undefined,
+    frames: [16]Frame = undefined,
     raw: [4096]u8 = undefined,
 };
 
@@ -270,8 +293,9 @@ pub fn diagnose(
     var insights: [2][]const u8 = undefined;
     var n: usize = 0;
     if (trace.frames.len > 0) {
-        if (std.fmt.bufPrint(&trace_buf, "{s} panic in {s}", .{
-            trace.lang, trace.frames[0],
+        const f0 = trace.frames[0];
+        if (std.fmt.bufPrint(&trace_buf, "{s} panic in {s} ({s}:{d})", .{
+            trace.lang, f0.function, f0.file, f0.line,
         }) catch null) |s| {
             insights[n] = s;
             n += 1;
@@ -383,9 +407,9 @@ test "verdict builders" {
 
 test "diagnose: trace beats everything" {
     var buf: [256]u8 = undefined;
-    const frames = [_][]const u8{"main.crash main.go:10"};
+    const frames = [_]Frame{.{ .function = "main.crash", .file = "main.go", .line = 10 }};
     const v = diagnose(&buf, "signal:SIGSEGV", .{ .lang = "go", .frames = &frames }, &.{}, &.{}, 5, false);
-    try std.testing.expectEqualStrings("signal:SIGSEGV after 5s — go panic in main.crash main.go:10", v);
+    try std.testing.expectEqualStrings("signal:SIGSEGV after 5s — go panic in main.crash (main.go:10)", v);
 }
 
 test "diagnose: known pattern explains the failure" {

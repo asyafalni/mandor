@@ -42,13 +42,16 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
         if (text[0] != '\t' and i + 1 < lines.len and lines[i + 1].text.len > 1 and
             lines[i + 1].text[0] == '\t')
         {
-            const func = text;
+            const func = stripArgs(text);
             var loc = std.mem.trim(u8, lines[i + 1].text, "\t ");
             if (std.mem.indexOfScalar(u8, loc, ' ')) |sp| loc = loc[0..sp]; // drop "+0x18"
-            const frame = std.fmt.bufPrint(&st.frame_texts[nframes], "{s} {s}", .{
-                stripArgs(func), loc,
-            }) catch continue;
-            st.frames[nframes] = frame;
+            const fl = summarize.splitFileLine(loc);
+            st.frames[nframes] = .{
+                .function = func,
+                .file = fl.file,
+                .line = fl.line,
+                .in_app = !std.mem.startsWith(u8, func, "runtime."),
+            };
             nframes += 1;
             end = i + 2;
         }
@@ -103,8 +106,12 @@ test "parses a real go panic" {
     try t.expectEqualStrings("runtime error", tr.exc_type);
     try t.expectEqualStrings("invalid memory address or nil pointer dereference", tr.exc_msg);
     try t.expectEqual(@as(usize, 2), tr.frames.len);
-    try t.expectEqualStrings("main.crash /app/main.go:10", tr.frames[0]);
-    try t.expectEqualStrings("main.main /app/main.go:4", tr.frames[1]);
+    try t.expectEqualStrings("main.crash", tr.frames[0].function);
+    try t.expectEqualStrings("/app/main.go", tr.frames[0].file);
+    try t.expectEqual(@as(u32, 10), tr.frames[0].line);
+    try t.expect(tr.frames[0].in_app);
+    try t.expectEqualStrings("main.main", tr.frames[1].function);
+    try t.expectEqual(@as(u32, 4), tr.frames[1].line);
     try t.expect(std.mem.startsWith(u8, tr.raw, "panic: runtime error"));
 }
 

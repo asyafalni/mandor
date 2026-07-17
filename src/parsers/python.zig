@@ -25,7 +25,7 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
         const trimmed = std.mem.trimStart(u8, lines[i].text, " ");
         if (std.mem.startsWith(u8, trimmed, "File \"")) {
             if (nframes < st.frames.len) {
-                if (parseFileLine(trimmed, &st.frame_texts[nframes])) |frame| {
+                if (parseFileLine(trimmed)) |frame| {
                     st.frames[nframes] = frame;
                     nframes += 1;
                 }
@@ -49,7 +49,7 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
     if (nframes == 0) return null;
 
     // Python prints outermost first; reverse so frames[0] is the crash site.
-    std.mem.reverse([]const u8, st.frames[0..nframes]);
+    std.mem.reverse(summarize.Frame, st.frames[0..nframes]);
 
     return .{
         .lang = "python",
@@ -60,22 +60,30 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
     };
 }
 
-/// `File "/app/x.py", line 7, in main` -> "main /app/x.py:7"
-fn parseFileLine(trimmed: []const u8, out: *[192]u8) ?[]const u8 {
+/// `File "/app/x.py", line 7, in main` -> structured frame
+fn parseFileLine(trimmed: []const u8) ?summarize.Frame {
     const q1 = "File \"".len;
     const q2 = std.mem.indexOfScalarPos(u8, trimmed, q1, '"') orelse return null;
     const file = trimmed[q1..q2];
     const line_pat = ", line ";
     const lp = std.mem.indexOfPos(u8, trimmed, q2, line_pat) orelse return null;
     var j = lp + line_pat.len;
+    var lineno: u32 = 0;
     const num_start = j;
-    while (j < trimmed.len and trimmed[j] >= '0' and trimmed[j] <= '9') j += 1;
+    while (j < trimmed.len and trimmed[j] >= '0' and trimmed[j] <= '9') : (j += 1) {
+        lineno = lineno *| 10 +| (trimmed[j] - '0');
+    }
     if (j == num_start) return null;
-    const lineno = trimmed[num_start..j];
     var func: []const u8 = "?";
     const in_pat = ", in ";
     if (std.mem.indexOfPos(u8, trimmed, j, in_pat)) |ip| func = trimmed[ip + in_pat.len ..];
-    return std.fmt.bufPrint(out, "{s} {s}:{s}", .{ func, file, lineno }) catch null;
+    return .{
+        .function = func,
+        .file = file,
+        .line = lineno,
+        .in_app = std.mem.indexOf(u8, file, "site-packages") == null and
+            !std.mem.startsWith(u8, file, "/usr/lib/python"),
+    };
 }
 
 // ---------------------------------------------------------------- tests
@@ -99,8 +107,12 @@ test "parses a python traceback, crash site first" {
     try t.expectEqualStrings("ZeroDivisionError", tr.exc_type);
     try t.expectEqualStrings("division by zero", tr.exc_msg);
     try t.expectEqual(@as(usize, 2), tr.frames.len);
-    try t.expectEqualStrings("main /app/x.py:7", tr.frames[0]);
-    try t.expectEqualStrings("<module> /app/x.py:10", tr.frames[1]);
+    try t.expectEqualStrings("main", tr.frames[0].function);
+    try t.expectEqualStrings("/app/x.py", tr.frames[0].file);
+    try t.expectEqual(@as(u32, 7), tr.frames[0].line);
+    try t.expect(tr.frames[0].in_app);
+    try t.expectEqualStrings("<module>", tr.frames[1].function);
+    try t.expectEqual(@as(u32, 10), tr.frames[1].line);
     try t.expect(std.mem.endsWith(u8, tr.raw, "ZeroDivisionError: division by zero"));
 }
 
