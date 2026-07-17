@@ -55,10 +55,22 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
     }
     if (nframes == 0) return null;
 
+    // "panic: runtime error: nil deref" -> type "runtime error", msg tail;
+    // "panic: custom message" -> type "panic", msg as-is.
+    const payload = lines[start].text["panic: ".len..];
+    var exc_type: []const u8 = "panic";
+    var exc_msg = payload;
+    if (std.mem.startsWith(u8, payload, "runtime error: ")) {
+        exc_type = "runtime error";
+        exc_msg = payload["runtime error: ".len..];
+    }
+
     return .{
         .lang = "go",
         .frames = st.frames[0..nframes],
         .raw = summarize.joinRaw(lines, start, @min(end, lines.len), st),
+        .exc_type = exc_type,
+        .exc_msg = exc_msg,
     };
 }
 
@@ -88,6 +100,8 @@ test "parses a real go panic" {
     var st: summarize.TraceStorage = .{};
     const tr = detect(&lines, &st).?;
     try t.expectEqualStrings("go", tr.lang);
+    try t.expectEqualStrings("runtime error", tr.exc_type);
+    try t.expectEqualStrings("invalid memory address or nil pointer dereference", tr.exc_msg);
     try t.expectEqual(@as(usize, 2), tr.frames.len);
     try t.expectEqualStrings("main.crash /app/main.go:10", tr.frames[0]);
     try t.expectEqualStrings("main.main /app/main.go:4", tr.frames[1]);

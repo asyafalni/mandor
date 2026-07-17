@@ -35,6 +35,20 @@ pub fn readOomKills() ?u64 {
     return parseOomKills(buf[0..n]);
 }
 
+/// The container's memory limit in bytes (null = no cgroup v2 or "max").
+pub fn readMemoryMax() ?u64 {
+    const rc = linux.openat(linux.AT.FDCWD, "/sys/fs/cgroup/memory.max", .{}, 0);
+    if (posix.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [64]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (posix.errno(n) != .SUCCESS) return null;
+    const text = std.mem.trim(u8, buf[0..n], " \n");
+    if (std.mem.eql(u8, text, "max")) return null;
+    return std.fmt.parseInt(u64, text, 10) catch null;
+}
+
 // ---------------------------------------------------------------- tests
 
 test "parses oom_kill from memory.events" {

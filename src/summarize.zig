@@ -10,6 +10,10 @@ pub const TraceInfo = struct {
     lang: []const u8 = "unknown",
     frames: []const []const u8 = &.{},
     raw: []const u8 = "",
+    /// First-class exception identity — ablation studies show the type field
+    /// matters more than the raw trace for automated localization.
+    exc_type: []const u8 = "",
+    exc_msg: []const u8 = "",
 };
 
 /// Fixed storage a parser fills; owned by the caller (static in supervisor).

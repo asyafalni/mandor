@@ -32,6 +32,9 @@ pub const Worker = struct {
     pid: i32 = 0, // 0 = not running
     status: Status = .not_started,
     core_dumped: bool = false,
+    exe_buf: [256]u8 = undefined,
+    exe_len: u16 = 0,
+    spawned_at_epoch: i64 = 0,
     restarts: u32 = 0,
     cur_delay_ms: u64 = 0,
     last_start_ms: u64 = 0,
@@ -84,6 +87,8 @@ fn resetWorker(w: *Worker) void {
     w.stats.prev_ticks = 0;
     w.stats.prev_t_ms = 0;
     w.det = .{};
+    w.exe_len = 0;
+    w.spawned_at_epoch = 0;
 }
 
 pub const InitError = error{BadCommand};
@@ -190,6 +195,34 @@ pub fn spawn(
     // New pid: CPU tick baseline restarts from zero (history stays).
     w.stats.prev_ticks = 0;
     w.stats.prev_t_ms = 0;
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    w.spawned_at_epoch = ts.sec;
+    resolveExe(w, path_env);
+}
+
+/// Parent-side mirror of the child's exec resolution, so incident bundles
+/// can map the command to a real file path. Runs once per spawn — cold path.
+fn resolveExe(w: *Worker, path_env: []const u8) void {
+    const argv0 = std.mem.span(w.argv[0].?);
+    if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
+        const len = @min(argv0.len, w.exe_buf.len);
+        @memcpy(w.exe_buf[0..len], argv0[0..len]);
+        w.exe_len = @intCast(len);
+        return;
+    }
+    var cand: [4200]u8 = undefined;
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0 or dir.len + 1 + argv0.len + 1 > cand.len) continue;
+        const path = std.fmt.bufPrintZ(&cand, "{s}/{s}", .{ dir, argv0 }) catch continue;
+        if (posix.errno(linux.faccessat(linux.AT.FDCWD, path.ptr, 1, 0)) == .SUCCESS) { // X_OK
+            const len = @min(path.len, w.exe_buf.len);
+            @memcpy(w.exe_buf[0..len], path[0..len]);
+            w.exe_len = @intCast(len);
+            return;
+        }
+    }
 }
 
 fn closePair(pair: ?capture.PipePair) void {

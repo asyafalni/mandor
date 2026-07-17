@@ -19,6 +19,8 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
     var nframes: usize = 0;
     var end = start + 1;
     var i = start + 1;
+    var exc_type: []const u8 = "";
+    var exc_msg: []const u8 = "";
     while (i < lines.len) : (i += 1) {
         const trimmed = std.mem.trimStart(u8, lines[i].text, " ");
         if (std.mem.startsWith(u8, trimmed, "File \"")) {
@@ -30,7 +32,15 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
             }
             end = i + 1;
         } else if (lines[i].text.len > 0 and lines[i].text[0] != ' ') {
-            end = i + 1; // "SomeError: msg" terminator
+            // "SomeError: msg" terminator
+            const term = lines[i].text;
+            if (std.mem.indexOf(u8, term, ": ")) |colon| {
+                exc_type = term[0..colon];
+                exc_msg = term[colon + 2 ..];
+            } else {
+                exc_type = term;
+            }
+            end = i + 1;
             break;
         } else {
             end = i + 1; // source echo line
@@ -45,6 +55,8 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
         .lang = "python",
         .frames = st.frames[0..nframes],
         .raw = summarize.joinRaw(lines, start, @min(end, lines.len), st),
+        .exc_type = exc_type,
+        .exc_msg = exc_msg,
     };
 }
 
@@ -84,6 +96,8 @@ test "parses a python traceback, crash site first" {
     var st: summarize.TraceStorage = .{};
     const tr = detect(&lines, &st).?;
     try t.expectEqualStrings("python", tr.lang);
+    try t.expectEqualStrings("ZeroDivisionError", tr.exc_type);
+    try t.expectEqualStrings("division by zero", tr.exc_msg);
     try t.expectEqual(@as(usize, 2), tr.frames.len);
     try t.expectEqualStrings("main /app/x.py:7", tr.frames[0]);
     try t.expectEqualStrings("<module> /app/x.py:10", tr.frames[1]);

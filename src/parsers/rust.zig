@@ -67,10 +67,27 @@ pub fn detect(lines: []const summarize.LogLine, st: *summarize.TraceStorage) ?su
         }
     }
 
+    // Message: old format carries it inline in quotes; new format puts it on
+    // the following line.
+    var exc_msg: []const u8 = "";
+    const after = panic_line[at..];
+    if (after.len > 0 and after[0] == '\'') {
+        if (std.mem.lastIndexOf(u8, after, "', ")) |q| exc_msg = after[1..q];
+    } else if (start + 1 < lines.len) {
+        const nxt = lines[start + 1].text;
+        if (nxt.len > 0 and !std.mem.startsWith(u8, nxt, "note:") and
+            !std.mem.startsWith(u8, nxt, "stack backtrace:"))
+        {
+            exc_msg = nxt;
+        }
+    }
+
     return .{
         .lang = "rust",
         .frames = st.frames[0..nframes],
         .raw = summarize.joinRaw(lines, start, @min(end, lines.len), st),
+        .exc_type = "panic",
+        .exc_msg = exc_msg,
     };
 }
 
@@ -100,6 +117,8 @@ test "new-format panic with backtrace" {
     var st: summarize.TraceStorage = .{};
     const tr = detect(&lines, &st).?;
     try t.expectEqualStrings("rust", tr.lang);
+    try t.expectEqualStrings("panic", tr.exc_type);
+    try t.expectEqualStrings("attempt to divide by zero", tr.exc_msg);
     try t.expectEqual(@as(usize, 3), tr.frames.len);
     try t.expectEqualStrings("panicked_at src/main.rs:10:5", tr.frames[0]);
     try t.expectEqualStrings("rust_begin_unwind /rustc/abc/library/std/src/panicking.rs:645:5", tr.frames[1]);
@@ -114,6 +133,7 @@ test "old-format single line panic" {
     var st: summarize.TraceStorage = .{};
     const tr = detect(&lines, &st).?;
     try t.expectEqualStrings("panicked_at src/lib.rs:42:13", tr.frames[0]);
+    try t.expectEqualStrings("index out of bounds: the len is 3 but the index is 7", tr.exc_msg);
 }
 
 test "no panic -> null" {
