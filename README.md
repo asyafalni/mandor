@@ -240,6 +240,8 @@ unchanged — CI runs the full integration harness on all three distro bases.
       v5), release pipeline (binaries + .deb/.apk/.rpm + ghcr.io image)
 - [x] **v0.8** — max-restarts give-up, on-incident hook, health start-period,
       oneshot init tasks, per-worker env/cwd
+- [x] **v0.9** — per-worker privilege drop (`user`), OOM-killer steering
+      (`oom_score_adj`/`nice`), Alpine APKBUILD, `photon-relay` bridge shim
 
 Full prioritized list with complexity/value ranking: [docs/ROADMAP.md](docs/ROADMAP.md).
 

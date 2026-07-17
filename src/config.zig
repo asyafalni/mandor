@@ -160,10 +160,10 @@ pub fn parse(
 
 fn arrayKey(key: []const u8) ?ArrayTarget {
     const map = .{
-        .{ "workers", ArrayTarget.workers },  .{ "health", ArrayTarget.health },
+        .{ "workers", ArrayTarget.workers },         .{ "health", ArrayTarget.health },
         .{ "start_after", ArrayTarget.start_after }, .{ "env", ArrayTarget.env },
-        .{ "cwd", ArrayTarget.cwd },          .{ "oneshot", ArrayTarget.oneshot },
-        .{ "user", ArrayTarget.user },        .{ "oom_score_adj", ArrayTarget.oom },
+        .{ "cwd", ArrayTarget.cwd },                 .{ "oneshot", ArrayTarget.oneshot },
+        .{ "user", ArrayTarget.user },               .{ "oom_score_adj", ArrayTarget.oom },
         .{ "nice", ArrayTarget.nice },
     };
     inline for (map) |entry| {

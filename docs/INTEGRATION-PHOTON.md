@@ -48,10 +48,11 @@ is ROADMAP #19, the **on-incident hook**:
 on_incident = ["/photon-relay"]   # exec'd with the bundle path appended
 ```
 
-`photon-relay` is a tiny static shim (candidate: ship in photon's repo, or a
-shared `mandor-contrib` repo) that POSTs the bundle to photon's OTLP/HTTP
-logs endpoint on localhost. mandor's core stays offline; the user opts into
-the bridge by installing the shim. The premium sidecar uses the same hook.
+`photon-relay` **ships in this repo** (`contrib/photon-relay/`, built as a
+separate binary by `zig build` and attached to releases): it POSTs the
+bundle to photon's OTLP/HTTP logs endpoint (`PHOTON_OTLP=ip:port`, default
+127.0.0.1:4318). mandor's core stays offline; the user opts into the bridge
+by installing the shim. The premium sidecar uses the same hook.
 
 **Proposed OTLP mapping** (for the shim / photon-side importer):
 

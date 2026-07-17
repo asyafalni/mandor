@@ -1,0 +1,23 @@
+# Contributor: Alfin Syafalni <alfin@nodeflux.io>
+# Maintainer: Alfin Syafalni <alfin@nodeflux.io>
+pkgname=mandor
+pkgver=0.8.0
+pkgrel=0
+pkgdesc="Tiny PID-1 process supervisor for containers with crash forensics"
+url="https://github.com/asyafalni/mandor"
+arch="x86_64 aarch64"
+license="MIT"
+makedepends="zig"
+source="$pkgname-$pkgver.tar.gz::https://github.com/asyafalni/mandor/archive/refs/tags/v$pkgver.tar.gz"
+options="!check" # unit tests need the exact pinned zig; CI covers them upstream
+
+build() {
+	zig build -Doptimize=ReleaseSafe --prefix "$builddir/out"
+}
+
+package() {
+	install -Dm755 "$builddir/out/bin/mandor" "$pkgdir/usr/bin/mandor"
+	install -Dm644 "$builddir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+sha512sums="SKIP" # run `abuild checksum` before submitting
