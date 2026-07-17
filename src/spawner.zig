@@ -63,6 +63,8 @@ pub const Worker = struct {
     is_oneshot: bool = false,
     drop_uid: ?u32 = null,
     drop_gid: ?u32 = null,
+    oom_adj: ?i16 = null, // -1000..1000, written to /proc/self/oom_score_adj
+    nice_val: ?i8 = null,
     restarts: u32 = 0,
     /// Consecutive unclean deaths (reset by clean exit or stable uptime).
     fail_streak: u32 = 0,
@@ -137,6 +139,8 @@ fn resetWorker(w: *Worker) void {
     w.is_oneshot = false;
     w.drop_uid = null;
     w.drop_gid = null;
+    w.oom_adj = null;
+    w.nice_val = null;
 }
 
 /// "1000:1000" -> numeric uid/gid privilege drop for this worker.
@@ -299,6 +303,21 @@ pub fn spawn(
         // s6-style readiness: the worker writes a newline to this fd.
         if (ready_p) |p| _ = linux.dup2(p.w, ready_fd.?);
         if (w.cwd_len > 0) _ = linux.chdir(@ptrCast(&w.cwd_buf));
+        // OOM-killer steering + niceness: best-effort, before the drop
+        // (negative oom_score_adj needs the privileges we may give up).
+        if (w.oom_adj) |adj| {
+            const orc = linux.openat(linux.AT.FDCWD, "/proc/self/oom_score_adj", .{ .ACCMODE = .WRONLY }, 0);
+            if (posix.errno(orc) == .SUCCESS) {
+                var nbuf: [8]u8 = undefined;
+                const txt = std.fmt.bufPrint(&nbuf, "{d}", .{adj}) catch "0";
+                _ = linux.write(@intCast(orc), txt.ptr, txt.len);
+                _ = linux.close(@intCast(orc));
+            }
+        }
+        if (w.nice_val) |n| {
+            // setpriority(PRIO_PROCESS=0, self=0, n)
+            _ = linux.syscall3(.setpriority, 0, 0, @bitCast(@as(isize, n)));
+        }
         // Privilege drop is fail-closed: a worker configured as non-root must
         // never accidentally run as root. Order matters: groups, gid, uid.
         if (w.drop_gid) |gid| {

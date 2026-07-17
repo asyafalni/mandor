@@ -340,6 +340,15 @@ else
   echo "skip privilege drop (not root)"
 fi
 
+# 29. oom_score_adj applied (positive values need no privileges)
+cat > "$TMP/oom.toml" <<'TOML'
+workers = ["sh -c 'cat /proc/self/oom_score_adj'"]
+oom_score_adj = ["sh=500"]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/oom.toml" >"$TMP/29" 2>&1
+if grep -q "^\[sh\] 500$" "$TMP/29"; then ok "oom_score_adj applied to worker"
+else bad "oom_score_adj" "$(grep '\[sh\]' "$TMP/29")"; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

@@ -33,10 +33,28 @@ pub const FileConfig = struct {
     oneshot_n: u8 = 0,
     user_pairs: [16]cli.HealthSpec = undefined,
     user_pairs_n: u8 = 0,
+    oom_pairs: [16]cli.HealthSpec = undefined,
+    oom_pairs_n: u8 = 0,
+    nice_pairs: [16]cli.HealthSpec = undefined,
+    nice_pairs_n: u8 = 0,
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, oom, nice };
+
+/// name=value array keys share one parse shape; map key -> target + slot.
+fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSpec, n: *u8 } {
+    return switch (target) {
+        .health => .{ .arr = &cfg.health, .n = &cfg.health_n },
+        .start_after => .{ .arr = &cfg.start_after, .n = &cfg.start_after_n },
+        .env => .{ .arr = &cfg.env_pairs, .n = &cfg.env_pairs_n },
+        .cwd => .{ .arr = &cfg.cwd_pairs, .n = &cfg.cwd_pairs_n },
+        .user => .{ .arr = &cfg.user_pairs, .n = &cfg.user_pairs_n },
+        .oom => .{ .arr = &cfg.oom_pairs, .n = &cfg.oom_pairs_n },
+        .nice => .{ .arr = &cfg.nice_pairs, .n = &cfg.nice_pairs_n },
+        else => null,
+    };
+}
 
 pub const ParseError = error{ Syntax, BadValue, TooManyWorkers };
 
@@ -118,22 +136,7 @@ pub fn parse(
                 false
             else
                 return error.BadValue;
-        } else if (std.mem.eql(u8, key, "workers") or std.mem.eql(u8, key, "health") or
-            std.mem.eql(u8, key, "start_after") or std.mem.eql(u8, key, "env") or
-            std.mem.eql(u8, key, "cwd") or std.mem.eql(u8, key, "oneshot") or
-            std.mem.eql(u8, key, "user"))
-        {
-            const this_target: ArrayTarget = if (std.mem.eql(u8, key, "workers"))
-                .workers
-            else if (std.mem.eql(u8, key, "health"))
-                .health
-            else if (std.mem.eql(u8, key, "start_after"))
-                .start_after
-            else if (std.mem.eql(u8, key, "env"))
-                .env
-            else if (std.mem.eql(u8, key, "cwd"))
-                .cwd
-            else if (std.mem.eql(u8, key, "oneshot")) .oneshot else .user;
+        } else if (arrayKey(key)) |this_target| {
             if (value.len == 0 or value[0] != '[') return error.BadValue;
             var rest = std.mem.trim(u8, value[1..], " \t");
             const closed = std.mem.endsWith(u8, rest, "]");
@@ -155,6 +158,20 @@ pub fn parse(
     return cfg;
 }
 
+fn arrayKey(key: []const u8) ?ArrayTarget {
+    const map = .{
+        .{ "workers", ArrayTarget.workers },  .{ "health", ArrayTarget.health },
+        .{ "start_after", ArrayTarget.start_after }, .{ "env", ArrayTarget.env },
+        .{ "cwd", ArrayTarget.cwd },          .{ "oneshot", ArrayTarget.oneshot },
+        .{ "user", ArrayTarget.user },        .{ "oom_score_adj", ArrayTarget.oom },
+        .{ "nice", ArrayTarget.nice },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, key, entry[0])) return entry[1];
+    }
+    return null;
+}
+
 fn appendItem(
     cfg: *FileConfig,
     cmd_storage: *[cli.max_workers][]const u8,
@@ -168,47 +185,19 @@ fn appendItem(
             cmd_storage[ncmd.*] = s;
             ncmd.* += 1;
         },
-        .health => {
-            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
-            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
-            if (cfg.health_n == cli.max_health) return error.BadValue;
-            cfg.health[cfg.health_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
-            cfg.health_n += 1;
-        },
-        .start_after => {
-            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
-            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
-            if (cfg.start_after_n == cli.max_workers) return error.BadValue;
-            cfg.start_after[cfg.start_after_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
-            cfg.start_after_n += 1;
-        },
-        .env => {
-            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
-            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
-            if (cfg.env_pairs_n == cfg.env_pairs.len) return error.BadValue;
-            cfg.env_pairs[cfg.env_pairs_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
-            cfg.env_pairs_n += 1;
-        },
-        .cwd => {
-            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
-            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
-            if (cfg.cwd_pairs_n == cfg.cwd_pairs.len) return error.BadValue;
-            cfg.cwd_pairs[cfg.cwd_pairs_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
-            cfg.cwd_pairs_n += 1;
-        },
         .oneshot => {
             if (cfg.oneshot_n == cfg.oneshot.len) return error.BadValue;
             cfg.oneshot[cfg.oneshot_n] = s;
             cfg.oneshot_n += 1;
         },
-        .user => {
+        else => {
+            const slot = pairSlot(cfg, target) orelse unreachable; // real target
             const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
             if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
-            if (cfg.user_pairs_n == cfg.user_pairs.len) return error.BadValue;
-            cfg.user_pairs[cfg.user_pairs_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
-            cfg.user_pairs_n += 1;
+            if (slot.n.* == slot.arr.len) return error.BadValue;
+            slot.arr[slot.n.*] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
+            slot.n.* += 1;
         },
-        .none => unreachable, // callers always pass a real target
     }
 }
 

@@ -2,6 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
 
+/// Size diet: a panic is a bug (the supervision path never panics by
+/// design), so skip std.debug's DWARF/ELF/decompression stack-trace
+/// machinery (~100 KB) — print the message and trap.
+pub const panic = std.debug.simple_panic;
+pub const std_options: std.Options = .{ .enable_segfault_handler = false };
+
 const version = "0.1.0-dev";
 
 const usage_text =
@@ -130,6 +136,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.oneshot_n = file_cfg.oneshot_n;
             cfg.user_pairs = file_cfg.user_pairs;
             cfg.user_pairs_n = file_cfg.user_pairs_n;
+            cfg.oom_pairs = file_cfg.oom_pairs;
+            cfg.oom_pairs_n = file_cfg.oom_pairs_n;
+            cfg.nice_pairs = file_cfg.nice_pairs;
+            cfg.nice_pairs_n = file_cfg.nice_pairs_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {

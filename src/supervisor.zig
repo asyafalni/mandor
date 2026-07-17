@@ -61,6 +61,22 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             }
         } else std.debug.print("[mandor] user: no worker named {s}\n", .{pair.worker});
     }
+    for (cfg.oom_pairs[0..cfg.oom_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            w.oom_adj = std.fmt.parseInt(i16, pair.cmd, 10) catch {
+                std.debug.print("[mandor] oom_score_adj: bad value for {s}\n", .{pair.worker});
+                return 2;
+            };
+        } else std.debug.print("[mandor] oom_score_adj: no worker named {s}\n", .{pair.worker});
+    }
+    for (cfg.nice_pairs[0..cfg.nice_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            w.nice_val = std.fmt.parseInt(i8, pair.cmd, 10) catch {
+                std.debug.print("[mandor] nice: bad value for {s}\n", .{pair.worker});
+                return 2;
+            };
+        } else std.debug.print("[mandor] nice: no worker named {s}\n", .{pair.worker});
+    }
     var oneshot_count: usize = 0;
     for (cfg.oneshot[0..cfg.oneshot_n]) |name| {
         if (findWorker(workers, name)) |w| {
