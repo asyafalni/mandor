@@ -16,11 +16,16 @@ pub const Config = struct {
     help: bool = false,
     version: bool = false,
     json: bool = false,
-    /// null = not given on the CLI; caller resolves env/default.
+    /// null = not given on the CLI; caller resolves env/config/default.
     state_dir: ?[]const u8 = null,
+    config_path: ?[]const u8 = null,
+    metrics_port: ?u16 = null,
+    /// Track explicit CLI flags so a config file never overrides them.
+    restart_set: bool = false,
+    backoff_set: bool = false,
 };
 
-pub const ParseError = error{ UnknownFlag, BadValue, NoCommands, TooManyWorkers };
+pub const ParseError = error{ UnknownFlag, BadValue, TooManyWorkers };
 
 pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) ParseError!Config {
     var cfg: Config = .{};
@@ -50,8 +55,17 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
                     .always
                 else
                     return error.BadValue;
+                cfg.restart_set = true;
             } else if (std.mem.startsWith(u8, arg, "--backoff-max=")) {
                 cfg.backoff_max_ms = parseDuration(arg["--backoff-max=".len..]) orelse
+                    return error.BadValue;
+                cfg.backoff_set = true;
+            } else if (std.mem.startsWith(u8, arg, "--config=")) {
+                const v = arg["--config=".len..];
+                if (v.len == 0) return error.BadValue;
+                cfg.config_path = v;
+            } else if (std.mem.startsWith(u8, arg, "--metrics=")) {
+                cfg.metrics_port = std.fmt.parseInt(u16, arg["--metrics=".len..], 10) catch
                     return error.BadValue;
             } else if (std.mem.startsWith(u8, arg, "--state-dir=")) {
                 const v = arg["--state-dir=".len..];
@@ -70,11 +84,8 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
         n += 1;
     }
     cfg.commands = cmd_storage[0..n];
-    if (cfg.mode == .report) {
-        if (n != 0) return error.BadValue; // report takes no commands
-        return cfg;
-    }
-    if (n == 0 and !cfg.help and !cfg.version) return error.NoCommands;
+    if (cfg.mode == .report and n != 0) return error.BadValue; // report takes no commands
+    // Zero commands is legal here: a config file may provide the workers.
     return cfg;
 }
 
@@ -254,7 +265,24 @@ test "parse errors" {
     try expectError(error.UnknownFlag, parse(&.{ "--nope", "./a" }, &storage));
     try expectError(error.BadValue, parse(&.{ "--restart=sometimes", "./a" }, &storage));
     try expectError(error.BadValue, parse(&.{ "--backoff-max=fast", "./a" }, &storage));
-    try expectError(error.NoCommands, parse(&.{}, &storage));
+    try expectError(error.BadValue, parse(&.{ "--metrics=nope", "./a" }, &storage));
+}
+
+test "zero commands allowed (config file may supply workers)" {
+    var storage: [max_workers][]const u8 = undefined;
+    const cfg = try parse(&.{}, &storage);
+    try expectEqual(@as(usize, 0), cfg.commands.len);
+}
+
+test "config and metrics flags, explicit-set tracking" {
+    var storage: [max_workers][]const u8 = undefined;
+    const cfg = try parse(&.{ "--config=/etc/mandor.toml", "--metrics=9464", "./a" }, &storage);
+    try expectEqualStrings("/etc/mandor.toml", cfg.config_path.?);
+    try expectEqual(@as(u16, 9464), cfg.metrics_port.?);
+    try expect(!cfg.restart_set);
+    const cfg2 = try parse(&.{ "--restart=always", "--backoff-max=1s", "./a" }, &storage);
+    try expect(cfg2.restart_set);
+    try expect(cfg2.backoff_set);
 }
 
 test "parse report subcommand" {

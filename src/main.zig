@@ -14,6 +14,9 @@ const usage_text =
     \\flags:
     \\  --restart=never|on-failure|always   restart policy (default: never)
     \\  --backoff-max=DUR                   restart backoff cap, e.g. 500ms|30s|2m (default: 30s)
+    \\  --config=PATH                       mandor.toml (default: ./mandor.toml if present)
+    \\  --state-dir=PATH                    state + incident spool dir (default: /var/lib/mandor)
+    \\  --metrics=PORT                      serve Prometheus text metrics on 127.0.0.1:PORT
     \\
     \\Each CMD is one worker: quoted command line, tokenized by mandor
     \\(no shell needed). Signals TERM/INT/HUP are forwarded to workers.
@@ -43,11 +46,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const args = args_buf[0 .. vec.len - 1];
 
     var cmd_storage: [cli.max_workers][]const u8 = undefined;
-    const cfg = cli.parse(args, &cmd_storage) catch |err| {
+    var cfg = cli.parse(args, &cmd_storage) catch |err| {
         std.debug.print("[mandor] {s}\n\n", .{switch (err) {
             error.UnknownFlag => "unknown flag",
             error.BadValue => "bad flag value",
-            error.NoCommands => "no worker commands given",
             error.TooManyWorkers => "too many workers (max 64)",
         }});
         writeOut(usage_text);
@@ -64,13 +66,66 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     const environ = init.environ.block.slice;
     const spawner = @import("spawner.zig");
+
+    // Config file (TOML < env < CLI). CLI-only always works; the implicit
+    // ./mandor.toml is best-effort, an explicit --config= must exist.
+    const config = @import("config.zig");
+    var file_cfg: config.FileConfig = .{};
+    var file_cmds: [cli.max_workers][]const u8 = undefined;
+    if (cfg.mode == .supervise) {
+        var text: ?[]const u8 = null;
+        if (cfg.config_path) |path| {
+            text = readSmallFile(path, &config_buf) orelse {
+                std.debug.print("[mandor] cannot read config file {s}\n", .{path});
+                return 2;
+            };
+        } else {
+            text = readSmallFile("mandor.toml", &config_buf);
+        }
+        if (text) |txt| {
+            file_cfg = config.parse(txt, &file_cmds) catch |err| {
+                std.debug.print("[mandor] invalid config file: {s}\n", .{@errorName(err)});
+                return 2;
+            };
+            if (!cfg.restart_set) {
+                if (file_cfg.restart) |r| cfg.restart = r;
+            }
+            if (!cfg.backoff_set) {
+                if (file_cfg.backoff_max_ms) |b| cfg.backoff_max_ms = b;
+            }
+            if (cfg.metrics_port == null) cfg.metrics_port = file_cfg.metrics_port;
+            if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
+        }
+        if (cfg.commands.len == 0) {
+            std.debug.print("[mandor] no worker commands given\n\n", .{});
+            writeOut(usage_text);
+            return 2;
+        }
+    }
+
     const state_dir = cfg.state_dir orelse
-        (spawner.findEnv(environ, "MANDOR_STATE_DIR") orelse cli.default_state_dir);
+        (spawner.findEnv(environ, "MANDOR_STATE_DIR") orelse
+            (file_cfg.state_dir orelse cli.default_state_dir));
 
     if (cfg.mode == .report) return runReport(state_dir, cfg.json);
 
     const supervisor = @import("supervisor.zig");
     return supervisor.run(cfg, state_dir, environ);
+}
+
+var config_buf: [64 * 1024]u8 = undefined;
+
+fn readSmallFile(path: []const u8, buf: []u8) ?[]const u8 {
+    const linux = std.os.linux;
+    var path_buf: [512]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
+    const rc = linux.openat(linux.AT.FDCWD, path_z.ptr, .{}, 0);
+    if (std.posix.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, buf.ptr, buf.len);
+    if (std.posix.errno(n) != .SUCCESS) return null;
+    return buf[0..n];
 }
 
 var report_read_buf: [256 * 1024]u8 = undefined;
@@ -98,6 +153,7 @@ fn runReport(state_dir: []const u8, json: bool) u8 {
 test {
     _ = @import("cli.zig");
     _ = @import("backoff.zig");
+    _ = @import("config.zig");
     _ = @import("ring.zig");
     _ = @import("capture.zig");
     _ = @import("sampler.zig");
