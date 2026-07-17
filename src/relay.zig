@@ -1,28 +1,19 @@
-//! photon-relay — ships a mandor incident bundle to photon's OTLP/HTTP logs
-//! endpoint. The bridge mandor's core must not contain (offline boundary):
-//! wire it as `on_incident = "/usr/bin/photon-relay"`.
-//!
-//! Usage: photon-relay <bundle.json>   (mandor appends the path)
-//! Env:   PHOTON_OTLP=ip:port          (default 127.0.0.1:4318)
-//!
-//! Self-contained on purpose — no imports from mandor's src/ so it builds
-//! and vendors independently. Field mapping: docs/INTEGRATION-PHOTON.md.
+//! `mandor relay <bundle.json>` — ships an incident bundle to photon's
+//! OTLP/HTTP logs endpoint (PHOTON_OTLP=ip:port, default 127.0.0.1:4318).
+//! Runs ONLY when explicitly invoked as this subcommand — the supervisor
+//! itself never opens outbound connections. Wire it up with
+//! `on_incident = "/mandor relay"`. Mapping: docs/INTEGRATION-PHOTON.md.
 
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const spawner = @import("spawner.zig");
 
 var file_buf: [256 * 1024]u8 = undefined;
 var body_buf: [320 * 1024]u8 = undefined;
 var req_buf: [321 * 1024]u8 = undefined;
 
-pub fn main(init: std.process.Init.Minimal) u8 {
-    const argv = init.args.vector;
-    if (argv.len < 2) {
-        err("usage: photon-relay <bundle.json>");
-        return 2;
-    }
-    const path = std.mem.span(argv[1]);
+pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const ?[*:0]const u8) u8 {
     const bundle = readFile(path) orelse {
         err("cannot read bundle");
         return 1;
@@ -30,12 +21,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var host: u32 = 0x7f000001; // 127.0.0.1
     var port: u16 = 4318;
-    if (findEnv(init.environ.block.slice, "PHOTON_OTLP")) |spec| {
-        if (parseHostPort(spec)) |hp| {
+    const spec = endpoint_arg orelse spawner.findEnv(environ, "PHOTON_OTLP");
+    if (spec) |s| {
+        if (parseHostPort(s)) |hp| {
             host = hp.host;
             port = hp.port;
         } else {
-            err("bad PHOTON_OTLP (want ip:port)");
+            err("bad photon endpoint (want ip:port)");
             return 2;
         }
     }
@@ -52,8 +44,8 @@ fn err(msg: []const u8) void {
     _ = linux.write(2, "\n", 1);
 }
 
-fn readFile(path: [:0]const u8) ?[]const u8 {
-    const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
+fn readFile(path: [*:0]const u8) ?[]const u8 {
+    const rc = linux.openat(linux.AT.FDCWD, path, .{}, 0);
     if (posix.errno(rc) != .SUCCESS) return null;
     const fd: i32 = @intCast(rc);
     defer _ = linux.close(fd);
@@ -62,16 +54,7 @@ fn readFile(path: [:0]const u8) ?[]const u8 {
     return file_buf[0..n];
 }
 
-fn findEnv(environ: [:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {
-    for (environ) |maybe| {
-        const entry = std.mem.span(maybe orelse continue);
-        if (entry.len > name.len and entry[name.len] == '=' and
-            std.mem.startsWith(u8, entry, name)) return entry[name.len + 1 ..];
-    }
-    return null;
-}
-
-fn parseHostPort(spec: []const u8) ?struct { host: u32, port: u16 } {
+pub fn parseHostPort(spec: []const u8) ?struct { host: u32, port: u16 } {
     const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return null;
     const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return null;
     var host: u32 = 0;

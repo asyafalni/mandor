@@ -29,8 +29,6 @@ jobs:
           cp zig-out/a64/bin/mandor dist/arm64/mandor
           cp zig-out/x64/bin/mandor mandor-x86_64-linux
           cp zig-out/a64/bin/mandor mandor-aarch64-linux
-          cp zig-out/x64/bin/photon-relay photon-relay-x86_64-linux
-          cp zig-out/a64/bin/photon-relay photon-relay-aarch64-linux
 
       - name: Build .deb/.apk/.rpm packages (nFPM)
         run: |
@@ -51,8 +49,6 @@ jobs:
           files: |
             mandor-x86_64-linux
             mandor-aarch64-linux
-            photon-relay-x86_64-linux
-            photon-relay-aarch64-linux
             mandor_*.deb
             mandor_*.apk
             mandor_*.rpm

@@ -50,6 +50,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         writeOut(usage_text);
         return 2;
     }
+    // Invisible subcommand: `mandor relay <bundle.json>` (photon bridge).
+    // The supervisor path never networks; this runs only when invoked.
+    if (vec.len >= 3 and std.mem.eql(u8, std.mem.span(vec[1]), "relay")) {
+        const endpoint: ?[]const u8 = if (vec.len >= 4) std.mem.span(vec[3]) else null;
+        return @import("relay.zig").run(vec[2], endpoint, init.environ.block.slice);
+    }
+
     for (vec[1..], 0..) |p, i| args_buf[i] = std.mem.span(p);
     const args = args_buf[0 .. vec.len - 1];
 
@@ -128,6 +135,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             }
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
+            if (cfg.photon == null) cfg.photon = file_cfg.photon;
             cfg.env_pairs = file_cfg.env_pairs;
             cfg.env_pairs_n = file_cfg.env_pairs_n;
             cfg.cwd_pairs = file_cfg.cwd_pairs;

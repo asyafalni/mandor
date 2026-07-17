@@ -45,14 +45,15 @@ stats timeline, release/build-id, recurrence history. The delivery mechanism
 is ROADMAP #19, the **on-incident hook**:
 
 ```toml
-on_incident = ["/photon-relay"]   # exec'd with the bundle path appended
+photon = "127.0.0.1:4318"   # that's the whole integration
 ```
 
-`photon-relay` **ships in this repo** (`contrib/photon-relay/`, built as a
-separate binary by `zig build` and attached to releases): it POSTs the
-bundle to photon's OTLP/HTTP logs endpoint (`PHOTON_OTLP=ip:port`, default
-127.0.0.1:4318). mandor's core stays offline; the user opts into the bridge
-by installing the shim. The premium sidecar uses the same hook.
+One config key. When set, mandor forwards every incident bundle to photon's
+OTLP/HTTP logs endpoint by fire-and-forget re-exec of its own invisible
+`mandor relay` subcommand — the supervision path never touches a socket,
+and without the key mandor is fully offline. `--photon=ip:port` works on
+the CLI too. The generic `on_incident` hook remains for custom tooling and
+the premium sidecar.
 
 **Proposed OTLP mapping** (for the shim / photon-side importer):
 

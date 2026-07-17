@@ -15,8 +15,10 @@
   heuristic incident summaries. **Fully offline. No network, no account, no LLM.**
 - **Premium (separate sidecar binary, later):** ships incident bundles to a
   relay → AI root-cause analysis → optional repo access → auto-fix PR.
-  The core binary NEVER contains networking except the optional local
-  metrics endpoint.
+  mandor stays offline until the user enables a network feature in config:
+  the local metrics endpoint (`--metrics`) or photon forwarding (`photon =
+  "ip:port"`, which fire-and-forget re-execs `mandor relay` so the
+  supervision path itself never touches a socket). No config, no network.
 
 ## Architecture
 

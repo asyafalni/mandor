@@ -17,18 +17,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    // Separate opt-in artifact — the network bridge the core must not have.
-    const relay = b.addExecutable(.{
-        .name = "photon-relay",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("contrib/photon-relay/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-        }),
-    });
-    b.installArtifact(relay);
-
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit tests");

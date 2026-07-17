@@ -114,6 +114,13 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             return 2;
         }
     }
+    if (cfg.photon) |endpoint| {
+        if (@import("relay.zig").parseHostPort(endpoint) == null or !incident.setPhoton(endpoint)) {
+            std.debug.print("[mandor] invalid photon endpoint (want ip:port)\n", .{});
+            return 2;
+        }
+        std.debug.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
+    }
     var give_up_code: ?u8 = null;
 
     // start-after ordering: dep_of[i] = worker index i must wait for.

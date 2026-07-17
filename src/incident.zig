@@ -73,8 +73,38 @@ fn fireHook(bundle_path: []const u8) void {
     spawner.spawnDetached(@ptrCast(&hook_argv), snap_environ.ptr, snap_path_env);
 }
 
+// photon auto-forward: enabled ONLY by the `photon` config key — mandor
+// stays offline otherwise. Fire-and-forget self-exec keeps network syscalls
+// off the supervision path entirely.
+var photon_endpoint_buf: [64]u8 = undefined;
+var photon_endpoint_len: usize = 0;
+
+pub fn setPhoton(endpoint: []const u8) bool {
+    if (endpoint.len >= photon_endpoint_buf.len) return false;
+    @memcpy(photon_endpoint_buf[0..endpoint.len], endpoint);
+    photon_endpoint_buf[endpoint.len] = 0;
+    photon_endpoint_len = endpoint.len;
+    return true;
+}
+
+fn firePhoton(bundle_path: []const u8) void {
+    if (photon_endpoint_len == 0 or bundle_path.len >= hook_path_buf.len) return;
+    @memcpy(hook_path_buf[0..bundle_path.len], bundle_path);
+    hook_path_buf[bundle_path.len] = 0;
+    const argv = [_:null]?[*:0]const u8{
+        "/proc/self/exe",
+        "relay",
+        @ptrCast(&hook_path_buf),
+        @ptrCast(&photon_endpoint_buf),
+    };
+    spawner.spawnDetached(&argv, snap_environ.ptr, snap_path_env);
+}
+
 fn writeBundle(state_dir: []const u8, in: spool.BundleInput) void {
-    if (spool.write(state_dir, in)) |path| fireHook(path);
+    if (spool.write(state_dir, in)) |path| {
+        firePhoton(path);
+        fireHook(path);
+    }
 }
 
 pub fn initSnapshot(state_dir: []const u8, environ: [:null]const ?[*:0]const u8) void {

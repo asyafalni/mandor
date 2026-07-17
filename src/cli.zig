@@ -50,6 +50,8 @@ pub const Config = struct {
     health_start_period_set: bool = false,
     /// Command exec'd after each incident bundle write, bundle path appended.
     on_incident: ?[]const u8 = null,
+    /// photon OTLP endpoint ("ip:port"); when set, incidents auto-forward.
+    photon: ?[]const u8 = null,
     /// Per-worker extras (TOML-only): "name=KEY=VAL" env pairs, "name=/path"
     /// working dirs, and names of workers that are one-shot init tasks.
     env_pairs: [64]HealthSpec = undefined,
@@ -133,6 +135,10 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
                 const v = arg["--on-incident=".len..];
                 if (v.len == 0) return error.BadValue;
                 cfg.on_incident = v;
+            } else if (std.mem.startsWith(u8, arg, "--photon=")) {
+                const v = arg["--photon=".len..];
+                if (v.len == 0) return error.BadValue;
+                cfg.photon = v;
             } else if (std.mem.startsWith(u8, arg, "--health=")) {
                 const v = arg["--health=".len..];
                 const eq2 = std.mem.indexOfScalar(u8, v, '=') orelse return error.BadValue;

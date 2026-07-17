@@ -166,6 +166,7 @@ env = ["api=PORT=8080"]        # per-worker environment additions
 cwd = ["api=/srv/app"]         # per-worker working directory
 user = ["api=1000:1000"]       # drop root before exec (numeric uid:gid)
 on_incident = "/notify"        # exec'd with each incident bundle path
+photon = "127.0.0.1:4318"      # auto-forward incidents to photon (OTLP)
 ```
 
 Signals (dumb-init parity): every worker runs in its own process group, so
