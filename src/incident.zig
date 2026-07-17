@@ -256,6 +256,20 @@ pub fn onRestartLoop(state_dir: []const u8, workers: []spawner.Worker, w: *spawn
     spool.write(state_dir, in);
 }
 
+/// Health probe failed `fails` consecutive times: the worker is alive but
+/// not doing its job — the failure mode exit-based supervision cannot see.
+pub fn onUnhealthy(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Worker, fails: u8, now_ms: u64) void {
+    total += 1;
+    const tail = collectTail(w);
+    var in = commonInput(workers, w, now_ms, "unhealthy", w.pid);
+    in.trace = summarize.extractTrace(tail, &trace_storage);
+    in.logs_tail = collectCompact(w);
+    in.logs_dropped = compactor.dropped;
+    in.stats = collectStats(w);
+    in.verdict = summarize.verdictUnhealthy(&verdict_buf, fails, (now_ms -| w.last_start_ms) / 1000);
+    spool.write(state_dir, in);
+}
+
 /// RSS climb detected on a live worker.
 pub fn onLeak(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Worker, info: detector.LeakInfo, now_ms: u64) void {
     total += 1;

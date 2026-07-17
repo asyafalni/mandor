@@ -40,6 +40,17 @@ pub const Worker = struct {
     build_id_len: u8 = 0,
     ready: bool = false,
     ready_r: i32 = -1, // read end of the readiness pipe (-1 = none/closed)
+
+    // Health checks (v0.6): probe command + tracking of the running probe.
+    has_health: bool = false,
+    health_cmd_buf: [1024]u8 = undefined,
+    health_argv: [17]?[*:0]const u8 = undefined,
+    health_pid: i32 = 0,
+    health_started_ms: u64 = 0,
+    next_health_ms: u64 = 0,
+    health_fails: u8 = 0,
+    health_done: bool = false, // set by reaper when a probe was collected
+    health_ok: bool = false,
     restarts: u32 = 0,
     cur_delay_ms: u64 = 0,
     last_start_ms: u64 = 0,
@@ -97,6 +108,48 @@ fn resetWorker(w: *Worker) void {
     w.build_id_len = 0;
     w.ready = false;
     w.ready_r = -1;
+    w.has_health = false;
+    w.health_pid = 0;
+    w.health_started_ms = 0;
+    w.next_health_ms = 0;
+    w.health_fails = 0;
+    w.health_done = false;
+    w.health_ok = false;
+}
+
+/// Attach a health probe command to a worker (tokenized into fixed storage).
+pub fn setHealth(w: *Worker, cmd: []const u8) InitError!void {
+    var toks: [16][]const u8 = undefined;
+    const argv = cli.tokenize(cmd, &w.health_cmd_buf, &toks) catch return error.BadCommand;
+    for (argv, 0..) |t, i| w.health_argv[i] = @ptrCast(t.ptr);
+    w.health_argv[argv.len] = null;
+    w.has_health = true;
+}
+
+/// Fork/exec a health probe: stdio to /dev/null, no process group of its
+/// own (worker-group signals must not hit probes). Returns the probe pid.
+pub fn spawnCheck(
+    w: *Worker,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+    now_ms: u64,
+) bool {
+    const rc = linux.fork();
+    if (posix.errno(rc) != .SUCCESS) return false;
+    if (rc == 0) {
+        const empty = posix.sigemptyset();
+        posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+        const null_rc = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        if (posix.errno(null_rc) == .SUCCESS) {
+            const null_fd: i32 = @intCast(null_rc);
+            _ = linux.dup2(null_fd, 1);
+            _ = linux.dup2(null_fd, 2);
+        }
+        execArgv(@ptrCast(&w.health_argv), envp, path_env);
+    }
+    w.health_pid = @intCast(rc);
+    w.health_started_ms = now_ms;
+    return true;
 }
 
 pub const InitError = error{BadCommand};
@@ -210,6 +263,8 @@ pub fn spawn(
     w.status = .running;
     w.last_start_ms = now_ms;
     w.next_restart_ms = 0;
+    w.next_health_ms = 0; // runHealth reschedules the first probe
+    w.health_fails = 0;
     // New pid: CPU tick baseline restarts from zero (history stays).
     w.stats.prev_ticks = 0;
     w.stats.prev_t_ms = 0;
@@ -263,9 +318,16 @@ fn execChild(
 ) noreturn {
     const empty = posix.sigemptyset();
     posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+    execArgv(@ptrCast(&w.argv), envp, path_env);
+}
 
-    const argv: [*:null]const ?[*:0]const u8 = @ptrCast(&w.argv);
-    const argv0z = w.argv[0].?;
+/// exec with PATH candidates; never returns (127 on total failure).
+fn execArgv(
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) noreturn {
+    const argv0z = argv[0].?;
     const argv0 = std.mem.span(argv0z);
 
     if (std.mem.indexOfScalar(u8, argv0, '/') != null) {

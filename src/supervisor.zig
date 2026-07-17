@@ -41,6 +41,21 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         std.debug.print("[mandor] invalid command line\n", .{});
         return 2;
     };
+    for (cfg.health[0..cfg.health_n]) |spec| {
+        var matched = false;
+        for (workers) |*w| {
+            if (std.mem.eql(u8, w.nameSlice(), spec.worker)) {
+                spawner.setHealth(w, spec.cmd) catch {
+                    std.debug.print("[mandor] invalid health command for {s}\n", .{spec.worker});
+                    return 2;
+                };
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+            std.debug.print("[mandor] --health: no worker named {s}\n", .{spec.worker});
+    }
     const path_env = spawner.findPath(environ);
     const envp: [*:null]const ?[*:0]const u8 = environ.ptr;
 
@@ -84,9 +99,24 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         }
         if (live == 0 and (shutting_down or pending == 0)) break;
 
+        // Before computing the poll timeout so first probes schedule
+        // immediately after a (re)spawn.
+        if (!shutting_down) runHealth(cfg, workers, state_dir, envp, path_env);
+
         var wake_at: u64 = next_sample_ms;
         if (!shutting_down and next_deadline != 0 and next_deadline < wake_at)
             wake_at = next_deadline;
+        if (!shutting_down) {
+            for (workers) |*w| {
+                if (!w.has_health or w.pid == 0) continue;
+                if (w.health_pid != 0) {
+                    const to = w.health_started_ms + health_timeout_ms;
+                    if (to < wake_at) wake_at = to;
+                } else if (w.next_health_ms != 0 and w.next_health_ms < wake_at) {
+                    wake_at = w.next_health_ms;
+                }
+            }
+        }
         if (shutting_down and !kill_escalated and shutdown_deadline_ms != 0 and
             shutdown_deadline_ms < wake_at)
             wake_at = shutdown_deadline_ms;
@@ -239,6 +269,55 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     var worst: u8 = 0;
     for (workers) |*w| worst = @max(worst, w.final_code);
     return worst;
+}
+
+const health_timeout_ms: u64 = 10_000;
+const health_fail_threshold: u8 = 3;
+
+/// Drive health probes: consume results, time out hung probes, start due
+/// ones, and declare workers unhealthy at the failure threshold.
+fn runHealth(
+    cfg: cli.Config,
+    workers: []spawner.Worker,
+    state_dir: []const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) void {
+    const now = nowMs();
+    for (workers) |*w| {
+        if (!w.has_health) continue;
+        if (w.health_done) {
+            w.health_done = false;
+            if (w.health_ok) {
+                w.health_fails = 0;
+            } else {
+                w.health_fails += 1;
+                std.debug.print("[mandor] health check failed for {s} ({d}/{d})\n", .{
+                    w.nameSlice(), w.health_fails, health_fail_threshold,
+                });
+                if (w.health_fails >= health_fail_threshold and w.pid > 0) {
+                    w.health_fails = 0;
+                    incident.onUnhealthy(state_dir, workers, w, health_fail_threshold, now);
+                    if (cfg.restart_on_unhealthy) {
+                        std.debug.print("[mandor] {s} unhealthy, sending SIGTERM\n", .{w.nameSlice()});
+                        posix.kill(-w.pid, .TERM) catch {};
+                    }
+                }
+            }
+        }
+        if (w.pid == 0) continue;
+        if (w.health_pid == 0 and w.next_health_ms == 0) {
+            // freshly (re)spawned: first probe one interval from now
+            w.next_health_ms = now + cfg.health_interval_ms;
+        }
+        if (w.health_pid != 0 and now -| w.health_started_ms > health_timeout_ms) {
+            posix.kill(w.health_pid, .KILL) catch {}; // reaped as a failure
+        }
+        if (w.health_pid == 0 and w.next_health_ms != 0 and now >= w.next_health_ms) {
+            w.next_health_ms = now + cfg.health_interval_ms;
+            _ = spawner.spawnCheck(w, envp, path_env, now);
+        }
+    }
 }
 
 fn spawnWorker(

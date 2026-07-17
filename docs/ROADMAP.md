@@ -25,7 +25,7 @@ fixture tests.
 | 8 | Structured `cause` object (kind / exit_code / signal / oom delta) | S | ● ● ○ | Kills "exit 137 archaeology"; mirrors old string during transition |
 | 9 | `--stop-grace=DUR` + `--expected-exit=CODES` | S | ● ● ○ | Exit-143-after-TERM must not spawn false incidents; table stakes elsewhere |
 
-## Tier 2 — v0.6 "liveness" (M items, high value)
+## Tier 2 — v0.6 "liveness" — ✅ SHIPPED 2026-07-17
 
 | # | Feature | Cx | Value | Notes |
 |---|---------|----|-------|-------|

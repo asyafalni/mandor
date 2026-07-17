@@ -337,6 +337,12 @@ pub fn verdictRestartLoop(buf: []u8, count: u32, window_s: u64, last_cause: []co
     }) catch "restart loop";
 }
 
+pub fn verdictUnhealthy(buf: []u8, fails: u8, uptime_s: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "alive but unhealthy: {d} consecutive probe failures at {d}s uptime", .{
+        fails, uptime_s,
+    }) catch "alive but unhealthy";
+}
+
 pub fn verdictLeak(buf: []u8, growth_mb: u64, minutes: u64) []const u8 {
     const rate10 = if (minutes == 0) 0 else growth_mb * 10 / minutes;
     return std.fmt.bufPrint(buf, "RSS grew ~{d}.{d}MB/min for {d}min (+{d}MB) — leak suspect", .{

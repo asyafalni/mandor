@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/mandor-logo.png" alt="mandor logo" width="220">
+  <img src="docs/mandor-logo.webp" alt="mandor logo" width="220">
 </p>
 
 # mandor
@@ -86,6 +86,10 @@ mandor report --json     # machine-readable
 | `--metrics` | port for Prometheus text metrics on 127.0.0.1 | off |
 | `--stop-grace` | TERM→KILL escalation grace period | `10s` |
 | `--expected-exit` | extra exit codes treated as success, e.g. `143,129` | none |
+| `--health` | `NAME=CMD` probe (repeatable; exit 0 = healthy) | none |
+| `--health-interval` | probe cadence | `30s` |
+| `--restart-on-unhealthy` | SIGTERM a worker after 3 failed probes | off |
+| `--ready-fd` | fd workers write a newline to when ready (s6-style) | off |
 
 ### Configuration file (optional)
 
@@ -164,8 +168,9 @@ PID-1 semantics. On other systems the binary compiles for cross-target use.
       spawn-time snapshot, structured cause + exception, release ids via
       `MANDOR_RELEASE`, redacted env, siblings, stop-grace, expected-exit,
       whole-ring log dedup with repeat counts)
-- [ ] **v0.6** — liveness: health checks, readiness notification, structured
-      trace frames
+- [x] **v0.6** — liveness: schema v4 with structured trace frames
+      (`function`/`file`/`line`/`in_app`), command health checks catching
+      hung workers, s6-style readiness fd, ELF build-id extraction
 
 Full prioritized list with complexity/value ranking: [docs/ROADMAP.md](docs/ROADMAP.md).
 

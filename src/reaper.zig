@@ -23,6 +23,12 @@ pub fn drain(workers: []spawner.Worker) ReapSummary {
         const pid: i32 = @intCast(rc);
         if (pid == 0) return summary; // children exist, none exited
         for (workers) |*w| {
+            if (w.health_pid == pid) {
+                w.health_pid = 0;
+                w.health_done = true;
+                w.health_ok = linux.W.IFEXITED(st) and linux.W.EXITSTATUS(st) == 0;
+                break;
+            }
             if (w.pid != pid) continue;
             w.pid = 0;
             if (linux.W.IFEXITED(st)) {

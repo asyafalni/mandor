@@ -100,6 +100,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (!cfg.expected_exit_set) {
                 if (file_cfg.expected_exit) |set| cfg.expected_exit = set;
             }
+            if (cfg.ready_fd == null) cfg.ready_fd = file_cfg.ready_fd;
+            if (!cfg.health_interval_set) {
+                if (file_cfg.health_interval_ms) |ms| cfg.health_interval_ms = ms;
+            }
+            if (file_cfg.restart_on_unhealthy) |b| {
+                if (b) cfg.restart_on_unhealthy = true;
+            }
+            if (cfg.health_n == 0) {
+                cfg.health = file_cfg.health;
+                cfg.health_n = file_cfg.health_n;
+            }
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {

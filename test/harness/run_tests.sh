@@ -98,16 +98,17 @@ export MANDOR_STATE_DIR="$TMP/state2"
 timeout 10 "$MANDOR" "sh $TMP/crash_go.sh" >"$TMP/11" 2>&1
 c=$?
 f=$(ls "$TMP/state2/incidents/"*.json 2>/dev/null | head -1)
-if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":3' "$f" \
+if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":4' "$f" \
    && grep -q '"kind":"exit"' "$f" && grep -q '"exit_code":2' "$f" \
    && grep -q '"cause_str":"exit:2"' "$f" \
-   && grep -q '"lang":"go"' "$f" && grep -q 'main.crash /app/main.go:10' "$f" \
+   && grep -q '"lang":"go"' "$f" \
+   && grep -q '"function":"main.crash","file":"/app/main.go","line":10,"in_app":true' "$f" \
    && grep -q '"type":"runtime error"' "$f" \
    && grep -q '"exe":"[^"]*/sh"' "$f" \
    && grep -q 'go panic in main.crash' "$f"; then
-  ok "incident bundle v2 with go trace + exception + verdict"
+  ok "incident bundle v4: structured frames + exception + verdict"
 else
-  bad "incident bundle v2" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
+  bad "incident bundle v4" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
 fi
 unset MANDOR_STATE_DIR
 
@@ -202,6 +203,27 @@ took=$(( $(date +%s) - start ))
 if [ $c -eq 137 ] && [ "$took" -le 6 ] && grep -q "stop-grace expired" "$TMP/17"; then
   ok "stop-grace escalates to SIGKILL"
 else bad "stop-grace escalates" "exit $c after ${took}s: $(tail -2 "$TMP/17")"; fi
+
+# 18. readiness fd: worker announces, mandor logs it
+"$MANDOR" --ready-fd=5 "bash -c 'sleep 0.3; echo up >&5; sleep 30'" >"$TMP/18" 2>&1 &
+mpid=$!
+sleep 1.5
+kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
+if grep -q "is ready" "$TMP/18"; then ok "readiness fd observed"
+else bad "readiness fd" "$(head -4 "$TMP/18")"; fi
+
+# 19. health checks: failing probe -> unhealthy incident with worker alive
+export MANDOR_STATE_DIR="$TMP/state19"
+"$MANDOR" --health='sleep=/bin/false' --health-interval=1s "sleep 30" >"$TMP/19" 2>&1 &
+mpid=$!
+sleep 6
+f=$(ls "$TMP/state19/incidents/"*.json 2>/dev/null | head -1)
+kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
+if [ -n "$f" ] && grep -q '"kind":"unhealthy"' "$f" && grep -q 'alive but unhealthy' "$f" \
+   && grep -q '"ready":false' "$f"; then
+  ok "failing health probe spools unhealthy incident"
+else bad "health probe incident" "file=$f $(head -c 200 "$f" 2>/dev/null) log: $(tail -3 "$TMP/19")"; fi
+unset MANDOR_STATE_DIR
 
 echo
 echo "passed $pass, failed $fail"

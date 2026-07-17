@@ -14,8 +14,15 @@ pub const FileConfig = struct {
     metrics_port: ?u16 = null,
     stop_grace_ms: ?u64 = null,
     expected_exit: ?[256]bool = null,
+    ready_fd: ?u8 = null,
+    health: [cli.max_health]cli.HealthSpec = undefined,
+    health_n: u8 = 0,
+    health_interval_ms: ?u64 = null,
+    restart_on_unhealthy: ?bool = null,
     commands: []const []const u8 = &.{},
 };
+
+const ArrayTarget = enum { none, workers, health };
 
 pub const ParseError = error{ Syntax, BadValue, TooManyWorkers };
 
@@ -27,25 +34,23 @@ pub fn parse(
 ) ParseError!FileConfig {
     var cfg: FileConfig = .{};
     var ncmd: usize = 0;
-    var in_workers_array = false;
+    var target: ArrayTarget = .none;
 
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw_line| {
         const line = std.mem.trim(u8, stripComment(raw_line), " \t\r");
         if (line.len == 0) continue;
 
-        if (in_workers_array) {
+        if (target != .none) {
             if (std.mem.eql(u8, line, "]")) {
-                in_workers_array = false;
+                target = .none;
                 continue;
             }
             const item = std.mem.trim(u8, line, " \t,");
             if (item.len == 0) continue;
             const s = parseString(item) orelse return error.Syntax;
-            if (ncmd == cli.max_workers) return error.TooManyWorkers;
-            cmd_storage[ncmd] = s;
-            ncmd += 1;
-            if (std.mem.endsWith(u8, line, "]")) in_workers_array = false;
+            try appendItem(&cfg, cmd_storage, &ncmd, target, s);
+            if (std.mem.endsWith(u8, line, "]")) target = .none;
             continue;
         }
 
@@ -78,7 +83,22 @@ pub fn parse(
             cfg.expected_exit = set;
         } else if (std.mem.eql(u8, key, "metrics_port")) {
             cfg.metrics_port = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
-        } else if (std.mem.eql(u8, key, "workers")) {
+        } else if (std.mem.eql(u8, key, "ready_fd")) {
+            const fd = std.fmt.parseInt(u8, value, 10) catch return error.BadValue;
+            if (fd < 3) return error.BadValue;
+            cfg.ready_fd = fd;
+        } else if (std.mem.eql(u8, key, "health_interval")) {
+            const s = parseString(value) orelse return error.BadValue;
+            cfg.health_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "restart_on_unhealthy")) {
+            cfg.restart_on_unhealthy = if (std.mem.eql(u8, value, "true"))
+                true
+            else if (std.mem.eql(u8, value, "false"))
+                false
+            else
+                return error.BadValue;
+        } else if (std.mem.eql(u8, key, "workers") or std.mem.eql(u8, key, "health")) {
+            const this_target: ArrayTarget = if (key[0] == 'w') .workers else .health;
             if (value.len == 0 or value[0] != '[') return error.BadValue;
             var rest = std.mem.trim(u8, value[1..], " \t");
             const closed = std.mem.endsWith(u8, rest, "]");
@@ -88,18 +108,40 @@ pub fn parse(
                 const item = std.mem.trim(u8, item_raw, " \t");
                 if (item.len == 0) continue;
                 const s = parseString(item) orelse return error.BadValue;
-                if (ncmd == cli.max_workers) return error.TooManyWorkers;
-                cmd_storage[ncmd] = s;
-                ncmd += 1;
+                try appendItem(&cfg, cmd_storage, &ncmd, this_target, s);
             }
-            if (!closed) in_workers_array = true;
+            if (!closed) target = this_target;
         } else {
             return error.Syntax; // unknown key: fail loudly, configs are small
         }
     }
-    if (in_workers_array) return error.Syntax;
+    if (target != .none) return error.Syntax;
     cfg.commands = cmd_storage[0..ncmd];
     return cfg;
+}
+
+fn appendItem(
+    cfg: *FileConfig,
+    cmd_storage: *[cli.max_workers][]const u8,
+    ncmd: *usize,
+    target: ArrayTarget,
+    s: []const u8,
+) ParseError!void {
+    switch (target) {
+        .workers => {
+            if (ncmd.* == cli.max_workers) return error.TooManyWorkers;
+            cmd_storage[ncmd.*] = s;
+            ncmd.* += 1;
+        },
+        .health => {
+            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
+            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
+            if (cfg.health_n == cli.max_health) return error.BadValue;
+            cfg.health[cfg.health_n] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
+            cfg.health_n += 1;
+        },
+        .none => unreachable, // callers always pass a real target
+    }
 }
 
 fn stripComment(line: []const u8) []const u8 {
@@ -137,6 +179,23 @@ test "full config parses" {
     try t.expectEqual(@as(u16, 9464), cfg.metrics_port.?);
     try t.expectEqual(@as(usize, 2), cfg.commands.len);
     try t.expectEqualStrings("./api --port 8080", cfg.commands[0]);
+}
+
+test "health, ready_fd and restart_on_unhealthy keys" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\ready_fd = 5
+        \\health_interval = "10s"
+        \\restart_on_unhealthy = true
+        \\health = ["api=/bin/check --fast"]
+    ;
+    const cfg = try parse(text, &storage);
+    try t.expectEqual(@as(?u8, 5), cfg.ready_fd);
+    try t.expectEqual(@as(u64, 10_000), cfg.health_interval_ms.?);
+    try t.expect(cfg.restart_on_unhealthy.?);
+    try t.expectEqual(@as(u8, 1), cfg.health_n);
+    try t.expectEqualStrings("api", cfg.health[0].worker);
+    try t.expectEqualStrings("/bin/check --fast", cfg.health[0].cmd);
 }
 
 test "stop_grace and expected_exit keys" {

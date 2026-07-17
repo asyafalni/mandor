@@ -3,7 +3,10 @@
 const std = @import("std");
 
 pub const max_workers = 64;
+pub const max_health = 8;
 pub const default_state_dir = "/var/lib/mandor";
+
+pub const HealthSpec = struct { worker: []const u8, cmd: []const u8 };
 
 pub const RestartPolicy = enum { never, on_failure, always };
 pub const Mode = enum { supervise, report };
@@ -27,6 +30,12 @@ pub const Config = struct {
     stop_grace_ms: u64 = 10_000,
     /// s6-style readiness: workers write a newline to this fd when ready.
     ready_fd: ?u8 = null,
+    /// Health checks: worker-name -> probe command (exit 0 = healthy).
+    health: [max_health]HealthSpec = undefined,
+    health_n: u8 = 0,
+    health_interval_ms: u64 = 30_000,
+    health_interval_set: bool = false,
+    restart_on_unhealthy: bool = false,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,
@@ -83,6 +92,19 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
                 cfg.backoff_max_ms = parseDuration(arg["--backoff-max=".len..]) orelse
                     return error.BadValue;
                 cfg.backoff_set = true;
+            } else if (std.mem.startsWith(u8, arg, "--health=")) {
+                const v = arg["--health=".len..];
+                const eq2 = std.mem.indexOfScalar(u8, v, '=') orelse return error.BadValue;
+                if (eq2 == 0 or eq2 + 1 >= v.len) return error.BadValue;
+                if (cfg.health_n == max_health) return error.BadValue;
+                cfg.health[cfg.health_n] = .{ .worker = v[0..eq2], .cmd = v[eq2 + 1 ..] };
+                cfg.health_n += 1;
+            } else if (std.mem.startsWith(u8, arg, "--health-interval=")) {
+                cfg.health_interval_ms = parseDuration(arg["--health-interval=".len..]) orelse
+                    return error.BadValue;
+                cfg.health_interval_set = true;
+            } else if (std.mem.eql(u8, arg, "--restart-on-unhealthy")) {
+                cfg.restart_on_unhealthy = true;
             } else if (std.mem.startsWith(u8, arg, "--ready-fd=")) {
                 const fd = std.fmt.parseInt(u8, arg["--ready-fd=".len..], 10) catch
                     return error.BadValue;
@@ -330,6 +352,23 @@ test "parse report subcommand" {
     try expectError(error.BadValue, parse(&.{ "report", "./cmd" }, &storage));
     // --json is report-only
     try expectError(error.UnknownFlag, parse(&.{ "--json", "./cmd" }, &storage));
+}
+
+test "health flags" {
+    var storage: [max_workers][]const u8 = undefined;
+    const cfg = try parse(&.{
+        "--health=api=/bin/check-api --fast",
+        "--health=worker=/bin/check-w",
+        "--health-interval=10s",
+        "--restart-on-unhealthy",
+        "./api",
+    }, &storage);
+    try expectEqual(@as(u8, 2), cfg.health_n);
+    try expectEqualStrings("api", cfg.health[0].worker);
+    try expectEqualStrings("/bin/check-api --fast", cfg.health[0].cmd);
+    try expectEqual(@as(u64, 10_000), cfg.health_interval_ms);
+    try expect(cfg.restart_on_unhealthy);
+    try expectError(error.BadValue, parse(&.{ "--health=nocmd", "./a" }, &storage));
 }
 
 test "ready-fd flag" {
