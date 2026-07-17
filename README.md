@@ -114,6 +114,9 @@ Everyday — this is the whole surface most deployments need:
 | `--health-interval` | probe cadence | `30s` |
 | `--restart-on-unhealthy` | SIGTERM a worker after 3 failed probes | off |
 | `--ready-fd` | fd workers write a newline to when ready (s6-style) | off |
+| `--max-restarts` | consecutive failed restarts before mandor gives up and exits with the worker's code | `0` (never) |
+| `--health-start-period` | probe failures ignored this long after spawn (until first success) | `10s` |
+| `--on-incident` | command exec'd after each incident bundle write (bundle path appended) | off |
 
 </details>
 
