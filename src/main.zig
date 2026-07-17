@@ -69,6 +69,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 test {
     _ = @import("cli.zig");
     _ = @import("backoff.zig");
+    _ = @import("ring.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");
