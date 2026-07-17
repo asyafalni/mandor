@@ -67,8 +67,15 @@ pub fn sigName(sig: u8) []const u8 {
 }
 
 /// Worker died uncleanly (outside shutdown): classify, dedup, spool.
-pub fn onDeath(state_dir: []const u8, w: *spawner.Worker, now_ms: u64) void {
-    const cause: []const u8 = switch (w.status) {
+/// `oom` = the cgroup's oom_kill counter rose across this death.
+pub fn onDeath(state_dir: []const u8, w: *spawner.Worker, now_ms: u64, oom: bool) void {
+    const killed_by_sigkill = switch (w.status) {
+        .signaled => |sig| sig == 9,
+        else => false,
+    };
+    const cause: []const u8 = if (oom and killed_by_sigkill)
+        "oom"
+    else switch (w.status) {
         .exited => |code| std.fmt.bufPrint(&cause_buf, "exit:{d}", .{code}) catch "exit:?",
         .signaled => |sig| blk: {
             const name = sigName(sig);
@@ -79,7 +86,9 @@ pub fn onDeath(state_dir: []const u8, w: *spawner.Worker, now_ms: u64) void {
         },
         else => return,
     };
-    const kind: []const u8 = switch (w.status) {
+    const kind: []const u8 = if (oom and killed_by_sigkill)
+        "oom"
+    else switch (w.status) {
         .exited => "exit",
         else => "signal",
     };

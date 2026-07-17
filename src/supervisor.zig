@@ -15,6 +15,7 @@ const ring = @import("ring.zig");
 const sampler = @import("sampler.zig");
 const report = @import("report.zig");
 const incident = @import("incident.zig");
+const cgroup = @import("cgroup.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -43,6 +44,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     var shutting_down = false;
     var kill_escalated = false;
     var next_sample_ms: u64 = nowMs() + sampler.interval_ms;
+    var oom_kills: u64 = cgroup.readOomKills() orelse 0;
 
     for (workers) |*w| spawnWorker(w, envp, path_env);
 
@@ -119,6 +121,12 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             const reaped = reaper.drain(workers).reaped_workers;
             const now = nowMs();
             if (reaped > 0) report.writeState(state_dir, workers, now);
+            var oom_hit = false;
+            if (reaped > 0) {
+                const cur = cgroup.readOomKills() orelse oom_kills;
+                oom_hit = cur > oom_kills;
+                oom_kills = cur;
+            }
             for (workers) |*w| {
                 if (w.pid != 0 or w.done or w.next_restart_ms != 0) continue;
                 const clean = switch (w.status) {
@@ -130,7 +138,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 logDeath(w);
                 if (!shutting_down and !clean) {
                     w.det.recordDeath(now);
-                    incident.onDeath(state_dir, w, now);
+                    incident.onDeath(state_dir, w, now, oom_hit);
                     if (w.det.restartLoopTriggered(now)) |count|
                         incident.onRestartLoop(state_dir, w, count, now);
                 }
