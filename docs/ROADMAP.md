@@ -1,0 +1,51 @@
+# mandor roadmap — ranked by value ÷ complexity
+
+Derived from the 2026-07-17 supervisor-landscape research
+([full report](research/2026-07-17-supervisor-landscape-and-bundle-v2.md)).
+Ordering rule: lowest-hanging fruit first — each tier is roughly "one
+milestone of work", and within a tier items are sorted by value-per-effort.
+Complexity scale: **XS** (< 1h) · **S** (half day) · **M** (1–3 days) ·
+**L** (a week+).
+
+## Tier 1 — v0.5 "forensics upgrade" (all XS/S, ships bundle schema v2)
+
+These convert the incident bundle from human-readable postmortem into
+LLM-localizable repair input. One coordinated schema bump to `"v": 2` with
+fixture tests.
+
+| # | Feature | Cx | Value | Why first |
+|---|---------|----|-------|-----------|
+| 1 | `core_dumped` flag from wait status | XS | ● ● ○ | One bit already in the wait status; disambiguates crash class for free |
+| 2 | Uptime / `spawned_at` / time-to-crash in bundle | XS | ● ● ○ | Instant-crash-on-boot vs. slow-death is a different fix; data already held |
+| 3 | `MANDOR_RELEASE` / `GIT_SHA` env passthrough → `build` field | XS | ● ● ● | The #1 RCA lever ("what changed"); Sentry-style convention, ~20 lines |
+| 4 | Sibling worker status in bundle | XS | ● ○ ○ | Isolated vs. cascade; state already in the worker table |
+| 5 | Per-line log timestamps (wall ms) in ring records | S | ● ● ● | Without them logs can't be ordered against the stats timeline; ~8 bytes/line |
+| 6 | Spawn-time /proc snapshot: `cwd`, `exe`, ulimits, filtered env | S | ● ● ● | Vanishes at exit — must be read at fork; maps runtime paths → repo paths |
+| 7 | First-class `exception.type` + `message` (parsers already find them) | S | ● ● ● | Ablation-proven: exception type beats the raw trace for LLM localization |
+| 8 | Structured `cause` object (kind / exit_code / signal / oom delta) | S | ● ● ○ | Kills "exit 137 archaeology"; mirrors old string during transition |
+| 9 | `--stop-grace=DUR` + `--expected-exit=CODES` | S | ● ● ○ | Exit-143-after-TERM must not spawn false incidents; table stakes elsewhere |
+
+## Tier 2 — v0.6 "liveness" (M items, high value)
+
+| # | Feature | Cx | Value | Notes |
+|---|---------|----|-------|-------|
+| 10 | Structured trace frames `{file, line, function, in_app}` | M | ● ● ● | The 15–17× repair lever; rework parsers to emit fields, Sentry vocabulary |
+| 11 | Command health checks + `--restart-on-unhealthy` | M | ● ● ● | The one failure exit-based supervision can't see: a hung worker. New incident cause `unhealthy` |
+| 12 | Readiness fd (s6-style newline notification) | M | ● ● ○ | Enables "died before ever becoming ready" — very high-signal field |
+| 13 | ELF build-id extraction from worker exe | M | ● ● ○ | Release correlation without app cooperation; small ELF note parser |
+
+## Tier 3 — v0.7+ (nice-to-have or policy-heavy)
+
+| # | Feature | Cx | Value | Notes |
+|---|---------|----|-------|-------|
+| 14 | `start-after` dependency ordering (flat list, no DAG) | M | ● ○ ○ | Needs readiness (#12) to be meaningful |
+| 15 | Incident history persistence (`first_seen`, `count` across supervisor restarts) | M | ● ○ ○ | Requires on-disk signature index in state dir |
+| 16 | Env redaction allowlist in mandor.toml | S | ● ○ ○ | Policy design > code; default-redact `*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `*KEY*` |
+| 17 | Release binaries + `ghcr.io` image publishing in CI | S | ● ● ○ | Distribution, not features — do whenever convenient |
+
+## Explicitly rejected (research-backed)
+
+- Log rotation to disk (ring buffers make the blocking-pipe failure class impossible)
+- PTY allocation / tmux-style attach (overmind's niche, not container PID 1)
+- rlimit *enforcement* (cgroup limits are the container runtime's job)
+- Full s6-rc-style dependency DAG / oneshot compiler

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/mandor-logo.png" alt="mandor logo" width="220">
+</p>
+
 # mandor
 
 > **the foreman for your containers** — a tiny PID-1 process supervisor that
@@ -152,6 +156,12 @@ PID-1 semantics. On other systems the binary compiles for cross-target use.
       trace parsing, restart-loop + leak detection, spool dir
 - [x] **v0.4** — cgroup v2 OOM detection, optional Prometheus text endpoint,
       `mandor.toml` (CLI-only always works)
+- [ ] **v0.5** — forensics upgrade: bundle schema v2 (log timestamps,
+      spawn-time /proc snapshot, structured cause + exception, release ids)
+- [ ] **v0.6** — liveness: health checks, readiness notification, structured
+      trace frames
+
+Full prioritized list with complexity/value ranking: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Contributing
 
