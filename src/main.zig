@@ -71,6 +71,7 @@ test {
     _ = @import("backoff.zig");
     _ = @import("ring.zig");
     _ = @import("capture.zig");
+    _ = @import("sampler.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

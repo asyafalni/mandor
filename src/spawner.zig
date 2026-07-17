@@ -7,6 +7,7 @@ const posix = std.posix;
 const cli = @import("cli.zig");
 const capture = @import("capture.zig");
 const ring = @import("ring.zig");
+const sampler = @import("sampler.zig");
 
 pub const max_args = 64;
 pub const name_cap = 32;
@@ -43,6 +44,7 @@ pub const Worker = struct {
     asm_out: capture.Assembler = .{},
     asm_err: capture.Assembler = .{},
     log: ring.Ring(log_ring_capacity) = .{},
+    stats: sampler.Window = .{},
 
     pub fn nameSlice(w: *const Worker) []const u8 {
         return w.name[0..w.name_len];
@@ -134,6 +136,9 @@ pub fn spawn(
     w.status = .running;
     w.last_start_ms = now_ms;
     w.next_restart_ms = 0;
+    // New pid: CPU tick baseline restarts from zero (history stays).
+    w.stats.prev_ticks = 0;
+    w.stats.prev_t_ms = 0;
 }
 
 fn closePair(pair: ?capture.PipePair) void {

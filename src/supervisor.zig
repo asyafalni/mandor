@@ -12,6 +12,7 @@ const spawner = @import("spawner.zig");
 const reaper = @import("reaper.zig");
 const capture = @import("capture.zig");
 const ring = @import("ring.zig");
+const sampler = @import("sampler.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -39,6 +40,7 @@ pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
 
     var shutting_down = false;
     var kill_escalated = false;
+    var next_sample_ms: u64 = nowMs() + sampler.interval_ms;
 
     for (workers) |*w| spawnWorker(w, envp, path_env);
 
@@ -57,14 +59,14 @@ pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
         }
         if (live == 0 and (shutting_down or pending == 0)) break;
 
-        var timeout: i32 = -1;
-        if (!shutting_down and next_deadline != 0) {
-            const now = nowMs();
-            timeout = if (next_deadline <= now)
-                0
-            else
-                @intCast(@min(next_deadline - now, 3_600_000));
-        }
+        var wake_at: u64 = next_sample_ms;
+        if (!shutting_down and next_deadline != 0 and next_deadline < wake_at)
+            wake_at = next_deadline;
+        const now_for_timeout = nowMs();
+        const timeout: i32 = if (wake_at <= now_for_timeout)
+            0
+        else
+            @intCast(@min(wake_at - now_for_timeout, 3_600_000));
 
         var pfds: [1 + 2 * cli.max_workers]posix.pollfd = undefined;
         var owners: [1 + 2 * cli.max_workers]*spawner.Worker = undefined;
@@ -143,6 +145,14 @@ pub fn run(cfg: cli.Config, environ: [:null]const ?[*:0]const u8) u8 {
                     continue;
                 w.restarts += 1;
                 spawnWorker(w, envp, path_env);
+            }
+        }
+
+        const now_sample = nowMs();
+        if (now_sample >= next_sample_ms) {
+            next_sample_ms = now_sample + sampler.interval_ms;
+            for (workers) |*w| {
+                if (w.pid > 0) sampler.sample(&w.stats, w.pid, now_sample);
             }
         }
     }

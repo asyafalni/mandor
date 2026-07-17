@@ -36,8 +36,11 @@ $ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
 | Size | < 500 KB | ~50 KB | MBs + runtime |
 | Network access required | **never** | never | varies |
 
-`mandor` is fully offline: no accounts, no phoning home, no LLM. Incident
-bundles are plain JSON on disk — yours to ignore, ship, or feed to tooling.
+The `mandor` binary is fully offline and self-contained: no accounts, no
+phoning home. Incident bundles are plain JSON on disk — yours to ignore, ship,
+or feed to tooling. The upcoming **mandor premium** sidecar picks those same
+bundles up and hands them to an AI coding agent that root-causes the crash,
+fixes the code, and opens a PR — supervision that closes the loop.
 
 ## Quick start
 
@@ -86,7 +89,7 @@ mandor (PID 1)
 ├── capture        stdout/stderr → ring buffers, [name] line prefixes
 ├── sampler        /proc polling: CPU%, RSS, fds, threads
 ├── detector       nonzero exit, fatal signal, OOM, restart-loop, RSS climb
-├── summarize      heuristic verdicts — error dedup, trace parsing, no LLM
+├── summarize      heuristic verdicts — error dedup, trace parsing, instant
 └── spool          incident bundles → /var/lib/mandor/incidents/*.json
 ```
 
