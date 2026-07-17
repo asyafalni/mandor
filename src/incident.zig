@@ -23,6 +23,18 @@ var stats_scratch: [sampler.window_len]sampler.Sample = undefined;
 var verdict_buf: [256]u8 = undefined;
 var cause_buf: [32]u8 = undefined;
 var siblings_scratch: [64]spool.Sibling = undefined;
+// Whole-ring log compaction (repeated lines -> one entry + count), so
+// bundles stay token-lean for LLM analysis. Cold path only.
+var compactor: summarize.Compactor(max_tail, 512) = .{};
+
+/// Sweep the ENTIRE ring (not just the tail) through the deduplicator.
+fn collectCompact(w: *spawner.Worker) []const summarize.CompactLine {
+    compactor.reset();
+    var copy_buf: [4096]u8 = undefined;
+    var it = w.log.iterate(&copy_buf);
+    while (it.next()) |rec| compactor.feed(rec.line, rec.flags, rec.t_ms);
+    return compactor.lines();
+}
 
 // Supervisor-wide snapshot, read once at startup (cold path).
 const cgroup = @import("cgroup.zig");
@@ -180,7 +192,8 @@ pub fn onDeath(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Wor
         .cause = cause,
         .cause_str = cause_str,
         .trace = trace,
-        .logs_tail = tail,
+        .logs_tail = collectCompact(w),
+        .logs_dropped = compactor.dropped,
         .stats = stats,
         .now_ms = now_ms,
         .siblings = collectSiblings(workers, w, now_ms),
@@ -232,7 +245,8 @@ pub fn onRestartLoop(state_dir: []const u8, workers: []spawner.Worker, w: *spawn
     };
     var in = commonInput(workers, w, now_ms, "restart-loop", 0);
     in.trace = summarize.extractTrace(tail, &trace_storage);
-    in.logs_tail = tail;
+    in.logs_tail = collectCompact(w);
+    in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);
     in.verdict = summarize.verdictRestartLoop(&verdict_buf, count, detector.restart_loop_window_ms / 1000, last_cause);
     spool.write(state_dir, in);
@@ -242,7 +256,8 @@ pub fn onRestartLoop(state_dir: []const u8, workers: []spawner.Worker, w: *spawn
 pub fn onLeak(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Worker, info: detector.LeakInfo, now_ms: u64) void {
     total += 1;
     var in = commonInput(workers, w, now_ms, "leak-suspect", w.pid);
-    in.logs_tail = collectTail(w);
+    in.logs_tail = collectCompact(w);
+    in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);
     in.verdict = summarize.verdictLeak(&verdict_buf, info.growth_mb, info.minutes);
     spool.write(state_dir, in);

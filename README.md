@@ -43,7 +43,9 @@ $ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
 
 The `mandor` binary is fully offline and self-contained: no accounts, no
 phoning home. Incident bundles are plain JSON on disk — yours to ignore, ship,
-or feed to tooling. The upcoming **mandor premium** sidecar picks those same
+or feed to tooling. Repeated log lines are deduplicated (`"repeat": 47`,
+digit-insensitive, first/last timestamps kept), so a retry storm costs one
+bundle entry instead of thousands of tokens. The upcoming **mandor premium** sidecar picks those same
 bundles up and hands them to an AI coding agent that root-causes the crash,
 fixes the code, and opens a PR — supervision that closes the loop.
 
@@ -158,9 +160,10 @@ PID-1 semantics. On other systems the binary compiles for cross-target use.
       trace parsing, restart-loop + leak detection, spool dir
 - [x] **v0.4** — cgroup v2 OOM detection, optional Prometheus text endpoint,
       `mandor.toml` (CLI-only always works)
-- [x] **v0.5** — forensics upgrade: bundle schema v2 (log timestamps,
+- [x] **v0.5** — forensics upgrade: bundle schema v3 (log timestamps,
       spawn-time snapshot, structured cause + exception, release ids via
-      `MANDOR_RELEASE`, redacted env, siblings, stop-grace, expected-exit)
+      `MANDOR_RELEASE`, redacted env, siblings, stop-grace, expected-exit,
+      whole-ring log dedup with repeat counts)
 - [ ] **v0.6** — liveness: health checks, readiness notification, structured
       trace frames
 

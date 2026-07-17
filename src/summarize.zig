@@ -70,6 +70,70 @@ pub fn firstErrorLine(lines: []const LogLine) []const u8 {
     return "";
 }
 
+// ------------------------------------------------------- log compaction
+
+/// A deduplicated log line: one representative text plus how often lines
+/// with the same digit-insensitive signature appeared, and when.
+pub const CompactLine = struct {
+    text: []const u8,
+    flags: u8,
+    first_t_ms: u64,
+    last_t_ms: u64,
+    count: u32,
+};
+
+/// Collapses a log stream into distinct lines (digit-insensitive), keeping
+/// first-occurrence order. Fixed storage, pure — bundle-time only, never on
+/// the capture hot path.
+pub fn Compactor(comptime cap: usize, comptime max_text: usize) type {
+    return struct {
+        const Self = @This();
+
+        texts: [cap][max_text]u8 = undefined,
+        entries: [cap]CompactLine = undefined,
+        hashes: [cap]u64 = undefined,
+        n: usize = 0,
+        /// Distinct lines that no longer fit once `cap` was reached.
+        dropped: u32 = 0,
+
+        pub fn reset(self: *Self) void {
+            self.n = 0;
+            self.dropped = 0;
+        }
+
+        pub fn feed(self: *Self, text: []const u8, flags: u8, t_ms: u64) void {
+            const h = signature("", "", text);
+            for (self.hashes[0..self.n], 0..) |seen, i| {
+                if (seen == h) {
+                    self.entries[i].count += 1;
+                    self.entries[i].last_t_ms = t_ms;
+                    self.entries[i].flags |= flags;
+                    return;
+                }
+            }
+            if (self.n == cap) {
+                self.dropped += 1;
+                return;
+            }
+            const len = @min(text.len, max_text);
+            @memcpy(self.texts[self.n][0..len], text[0..len]);
+            self.hashes[self.n] = h;
+            self.entries[self.n] = .{
+                .text = self.texts[self.n][0..len],
+                .flags = flags,
+                .first_t_ms = t_ms,
+                .last_t_ms = t_ms,
+                .count = 1,
+            };
+            self.n += 1;
+        }
+
+        pub fn lines(self: *const Self) []const CompactLine {
+            return self.entries[0..self.n];
+        }
+    };
+}
+
 const go = @import("parsers/go.zig");
 const rust = @import("parsers/rust.zig");
 const python = @import("parsers/python.zig");
@@ -257,6 +321,36 @@ pub fn verdictLeak(buf: []u8, growth_mb: u64, minutes: u64) []const u8 {
 }
 
 // ---------------------------------------------------------------- tests
+
+test "compactor collapses repeats digit-insensitively, keeps order" {
+    var c: Compactor(8, 64) = .{};
+    c.feed("boot ok", 0, 100);
+    c.feed("error: request 17 timed out", ring.flag_stderr, 200);
+    c.feed("error: request 42 timed out", ring.flag_stderr, 300);
+    c.feed("listening on :8080", 0, 400);
+    c.feed("error: request 99 timed out", ring.flag_stderr, 500);
+    const out = c.lines();
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqualStrings("boot ok", out[0].text);
+    try std.testing.expectEqualStrings("error: request 17 timed out", out[1].text);
+    try std.testing.expectEqual(@as(u32, 3), out[1].count);
+    try std.testing.expectEqual(@as(u64, 200), out[1].first_t_ms);
+    try std.testing.expectEqual(@as(u64, 500), out[1].last_t_ms);
+    try std.testing.expectEqualStrings("listening on :8080", out[2].text);
+    try std.testing.expectEqual(@as(u32, 0), c.dropped);
+}
+
+test "compactor overflow counts dropped distinct lines" {
+    var c: Compactor(2, 32) = .{};
+    c.feed("alpha", 0, 1);
+    c.feed("beta", 0, 2);
+    c.feed("gamma", 0, 3);
+    c.feed("delta", 0, 4);
+    c.feed("alpha", 0, 5); // existing entries still count repeats
+    try std.testing.expectEqual(@as(usize, 2), c.lines().len);
+    try std.testing.expectEqual(@as(u32, 2), c.dropped);
+    try std.testing.expectEqual(@as(u32, 2), c.lines()[0].count);
+}
 
 test "errorish detection" {
     try std.testing.expect(errorish("PANIC: oh no"));

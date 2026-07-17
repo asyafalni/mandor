@@ -98,7 +98,7 @@ export MANDOR_STATE_DIR="$TMP/state2"
 timeout 10 "$MANDOR" "sh $TMP/crash_go.sh" >"$TMP/11" 2>&1
 c=$?
 f=$(ls "$TMP/state2/incidents/"*.json 2>/dev/null | head -1)
-if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":2' "$f" \
+if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":3' "$f" \
    && grep -q '"kind":"exit"' "$f" && grep -q '"exit_code":2' "$f" \
    && grep -q '"cause_str":"exit:2"' "$f" \
    && grep -q '"lang":"go"' "$f" && grep -q 'main.crash /app/main.go:10' "$f" \
@@ -160,6 +160,27 @@ kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
 if echo "$body" | grep -q 'mandor_worker_up{worker="sh"} 1' && echo "$body" | grep -q 'mandor_incidents_total 0'; then
   ok "metrics endpoint serves prometheus text"
 else bad "metrics endpoint" "$(echo "$body" | head -3)"; fi
+
+# 15b. repeated log lines are compacted in the bundle
+cat > "$TMP/spam.sh" <<'SPAM'
+i=0
+while [ $i -lt 50 ]; do
+  echo "error: request $i timed out" >&2
+  i=$((i+1))
+done
+echo "unique final message" >&2
+exit 3
+SPAM
+export MANDOR_STATE_DIR="$TMP/state15b"
+timeout 10 "$MANDOR" "sh $TMP/spam.sh" >"$TMP/15b" 2>&1
+c=$?
+f=$(ls "$TMP/state15b/incidents/"*.json 2>/dev/null | head -1)
+reps=$(grep -o '"repeat":50' "$f" 2>/dev/null | head -1)
+entries=$(grep -o '"line":' "$f" 2>/dev/null | wc -l)
+if [ $c -eq 3 ] && [ "$reps" = '"repeat":50' ] && [ "$entries" -le 3 ]; then
+  ok "log compaction: 51 lines -> $entries entries, repeat:50"
+else bad "log compaction" "exit $c, entries=$entries, reps=[$reps]"; fi
+unset MANDOR_STATE_DIR
 
 # 16. --expected-exit: listed code behaves like success (exit 0, no incident)
 export MANDOR_STATE_DIR="$TMP/state16"

@@ -8,7 +8,7 @@ const sampler = @import("sampler.zig");
 const ring = @import("ring.zig");
 const summarize = @import("summarize.zig");
 
-pub const bundle_version = 2;
+pub const bundle_version = 3;
 
 // ------------------------------------------------------- wall clock
 
@@ -104,7 +104,10 @@ pub const BundleInput = struct {
     cause: CauseInfo,
     cause_str: []const u8, // v1-compatible mirror for the sidecar transition
     trace: TraceInfo,
-    logs_tail: []const LogLine, // oldest-first, already limited to ~200
+    /// Deduplicated log lines (first-occurrence order, whole-ring coverage).
+    logs_tail: []const summarize.CompactLine,
+    /// Distinct lines beyond the compactor's capacity.
+    logs_dropped: u32 = 0,
     stats: []const sampler.Sample, // oldest-first
     now_ms: u64, // monotonic reference for stats "t" offsets
     siblings: []const Sibling = &.{},
@@ -188,21 +191,28 @@ pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
     if (!jb.appendf(buf, p, "],\"raw\":", .{})) return null;
     if (!jb.appendJsonString(buf, p, in.trace.raw)) return null;
 
-    // logs_tail: objects with wall timestamp, stream, errorish flag
+    // logs_tail: deduplicated entries; repeats carry a count + last-seen time
     if (!jb.appendf(buf, p, "}},\"logs_tail\":[", .{})) return null;
     for (in.logs_tail, 0..) |l, i| {
         if (i > 0 and !jb.appendf(buf, p, ",", .{})) return null;
         var lt_buf: [24]u8 = undefined;
         const stream: []const u8 = if (l.flags & ring.flag_stderr != 0) "E" else "O";
         if (!jb.appendf(buf, p, "{{\"t\":\"{s}\",\"s\":\"{s}\",\"err\":{},\"line\":", .{
-            iso8601Ms(&lt_buf, l.t_ms), stream, summarize.errorish(l.text),
+            iso8601Ms(&lt_buf, l.first_t_ms), stream, summarize.errorish(l.text),
         })) return null;
         if (!jb.appendJsonString(buf, p, l.text)) return null;
+        if (l.count > 1) {
+            var lu_buf: [24]u8 = undefined;
+            if (!jb.appendf(buf, p, ",\"repeat\":{d},\"until\":\"{s}\"", .{
+                l.count, iso8601Ms(&lu_buf, l.last_t_ms),
+            })) return null;
+        }
         if (!jb.appendf(buf, p, "}}", .{})) return null;
     }
+    if (!jb.appendf(buf, p, "],\"logs_dropped\":{d}", .{in.logs_dropped})) return null;
 
     // stats + siblings + verdict
-    if (!jb.appendf(buf, p, "],\"stats_timeline\":[", .{})) return null;
+    if (!jb.appendf(buf, p, ",\"stats_timeline\":[", .{})) return null;
     for (in.stats, 0..) |s, i| {
         if (i > 0 and !jb.appendf(buf, p, ",", .{})) return null;
         const dt_s = (in.now_ms -| s.t_ms) / 1000;
@@ -288,11 +298,12 @@ test "envRedacted heuristics" {
     try std.testing.expect(!envRedacted("GOMAXPROCS"));
 }
 
-test "bundle golden output locks schema v2" {
+test "bundle golden output locks schema v3" {
     const frames = [_][]const u8{ "main.crash main.go:10", "main.main main.go:4" };
-    const logs = [_]LogLine{
-        .{ .text = "listening on :8080", .flags = 0, .t_ms = 1_784_328_420_500 },
-        .{ .text = "panic: nil deref", .flags = ring.flag_stderr, .t_ms = 1_784_328_422_881 },
+    const logs = [_]summarize.CompactLine{
+        .{ .text = "retry 7 failed", .flags = ring.flag_stderr, .first_t_ms = 1_784_328_419_000, .last_t_ms = 1_784_328_420_250, .count = 47 },
+        .{ .text = "listening on :8080", .flags = 0, .first_t_ms = 1_784_328_420_500, .last_t_ms = 1_784_328_420_500, .count = 1 },
+        .{ .text = "panic: nil deref", .flags = ring.flag_stderr, .first_t_ms = 1_784_328_422_881, .last_t_ms = 1_784_328_422_881, .count = 1 },
     };
     const stats = [_]sampler.Sample{
         .{ .t_ms = 40_000, .rss_kb = 831_488, .cpu_pct = 97 },
@@ -331,13 +342,14 @@ test "bundle golden output locks schema v2" {
             .exc_msg = "nil deref",
         },
         .logs_tail = &logs,
+        .logs_dropped = 3,
         .stats = &stats,
         .now_ms = 100_000,
         .siblings = &siblings,
         .verdict = "go panic in main.crash",
     }).?;
     const expected =
-        "{\"v\":2,\"ts\":\"2026-07-17T22:47:03Z\"," ++
+        "{\"v\":3,\"ts\":\"2026-07-17T22:47:03Z\"," ++
         "\"process\":{\"name\":\"api\",\"cmd\":\"./api --port 8080\",\"pid\":42,\"restarts\":3," ++
         "\"cwd\":\"/app\",\"exe\":\"/app/api\",\"spawned_at\":\"2026-07-17T22:46:16Z\",\"uptime_s\":47," ++
         "\"build\":{\"release\":\"api@1.4.2\"}," ++
@@ -349,8 +361,11 @@ test "bundle golden output locks schema v2" {
         "\"trace\":{\"lang\":\"go\",\"frames\":[\"main.crash main.go:10\",\"main.main main.go:4\"]," ++
         "\"raw\":\"panic: nil deref\"}," ++
         "\"logs_tail\":[" ++
+        "{\"t\":\"2026-07-17T22:46:59.000Z\",\"s\":\"E\",\"err\":false,\"line\":\"retry 7 failed\"," ++
+        "\"repeat\":47,\"until\":\"2026-07-17T22:47:00.250Z\"}," ++
         "{\"t\":\"2026-07-17T22:47:00.500Z\",\"s\":\"O\",\"err\":false,\"line\":\"listening on :8080\"}," ++
         "{\"t\":\"2026-07-17T22:47:02.881Z\",\"s\":\"E\",\"err\":true,\"line\":\"panic: nil deref\"}]," ++
+        "\"logs_dropped\":3," ++
         "\"stats_timeline\":[{\"t\":\"-60s\",\"rss_mb\":812,\"cpu_pct\":97}]," ++
         "\"siblings\":[{\"name\":\"worker\",\"state\":\"running\",\"uptime_s\":3600,\"restarts\":0}]," ++
         "\"verdict\":\"go panic in main.crash\"}";
