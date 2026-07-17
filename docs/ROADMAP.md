@@ -61,6 +61,22 @@ cuts, s6 oneshots, pm2). Strict lowest-hanging-fruit order: build top-down.
 | 25 | `replicas = N` scaling (no fd sharing) | S | ● ● ○ ○ | compose/VPS queue workers; hold until asked |
 | 26 | Watchdog heartbeat over readiness fd | S | ● ○ ○ ○ | Needs app integration; hold until asked |
 
+## Tier 5 — v0.10 candidates (round-3 research, 2026-07-17)
+
+From the [third landscape pass](research/2026-07-17-round3-tier5-features.md)
+(process-compose, Erlang/OTP, Nomad, SMF, Upstart, k8s lifecycle,
+Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
+
+| # | Feature | Cx | Value | Notes |
+|---|---------|----|-------|-------|
+| 27 | k8s termination-log writer (auto when `/dev/termination-log` exists) | XS | ● ● ● ● | The verdict in `kubectl describe pod`, zero config — cheapest possible k8s-native visibility for the summarize engine |
+| 28 | Recycle thresholds `max_rss_mb` / `max_lifetime` (per worker) | XS | ● ● ● ○ | pm2's most-cited flag; sampler already has RSS — detector becomes actor; planned recycling never counts toward give-up |
+| 29 | Per-worker `restart` / `max_restarts` / `backoff_max` overrides | XS | ● ● ● ○ | Consistency: everything else already scopes per worker |
+| 30 | Restart propagation along start_after (OTP `rest_for_one`) | S | ● ● ● ○ | compose retrofitted this after years of demand; hold until asked |
+| 31 | `essential` worker (leader exits ⇒ all stop, code propagates) | XS | ● ● ○ ○ | Nomad leader-task semantics; hold until asked |
+| 32 | `pre_stop` drain hook | S | ● ● ○ ○ | Narrower than it looks (pod-level preStop covers routing drain); hold |
+| 33 | TTY color prefixes / `.env` loading | XS | ● ○ ○ ○ | Dev-UX only; hold |
+
 ## Explicitly rejected (research-backed)
 
 - Log rotation to disk (ring buffers make the blocking-pipe failure class impossible)
@@ -73,3 +89,7 @@ cuts, s6 oneshots, pm2). Strict lowest-hanging-fruit order: build top-down.
 - Condition DSLs à la god/eye (opinionated zero-config detectors beat a language)
 - pm2-style cluster fd-sharing (Node-specific; `replicas` is the honest version)
 - FDStore-style state handoff, launchd KeepAlive conditions, cron scheduling (wrong layer)
+- `one_for_all` restart groups (= "restart the container" — the orchestrator's job)
+- Web GUI / XML-RPC control / remote syslog (Go-supervisord's additions; offline boundary + size)
+- PTY panes à la mprocs (VT100 emulator cost; plain prefixes win for non-interactive)
+- Upstart-style event bus; k8s postStart analog (racy); Nomad poststop phase; namespaces/replica expansion
