@@ -40,7 +40,7 @@ fn collectTail(w: *spawner.Worker) []summarize.LogLine {
         if (i < skip) continue;
         const len = @min(rec.line.len, tail_bufs[n].len);
         @memcpy(tail_bufs[n][0..len], rec.line[0..len]);
-        tail_lines[n] = .{ .text = tail_bufs[n][0..len], .flags = rec.flags };
+        tail_lines[n] = .{ .text = tail_bufs[n][0..len], .flags = rec.flags, .t_ms = rec.t_ms };
         n += 1;
         if (n == max_tail) break;
     }

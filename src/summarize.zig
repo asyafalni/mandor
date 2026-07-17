@@ -4,7 +4,7 @@
 const std = @import("std");
 const ring = @import("ring.zig");
 
-pub const LogLine = struct { text: []const u8, flags: u8 };
+pub const LogLine = struct { text: []const u8, flags: u8, t_ms: u64 = 0 };
 
 pub const TraceInfo = struct {
     lang: []const u8 = "unknown",

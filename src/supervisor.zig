@@ -28,6 +28,13 @@ pub fn nowMs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 
+/// Wall-clock ms since epoch (vDSO — cheap enough per log line).
+pub fn wallMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
 pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
     const workers = workers_buf[0..cfg.commands.len];
     spawner.initWorkers(workers, cfg.commands) catch {
@@ -248,7 +255,7 @@ const EchoCtx = struct { w: *spawner.Worker, err: bool };
 /// Ring-record the line and echo it, `[name] `-prefixed, to our own
 /// stdout/stderr in a single write (atomic below PIPE_BUF).
 fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
-    _ = ctx.w.log.push(text, flags);
+    _ = ctx.w.log.push(text, flags, wallMs());
     var buf: [capture.max_line + spawner.name_cap + 8]u8 = undefined;
     const name = ctx.w.nameSlice();
     buf[0] = '[';
