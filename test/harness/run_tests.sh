@@ -135,6 +135,28 @@ sleep 0.5
 if [ -f "$m1" ] && [ -f "$m2" ]; then ok "TERM reaches grandchildren (process group)"
 else bad "TERM reaches grandchildren" "parent=$([ -f $m1 ] && echo y || echo n) child=$([ -f $m2 ] && echo y || echo n)"; fi
 
+# 14. mandor.toml supplies workers and policy; CLI still wins
+cat > "$TMP/m.toml" <<'TOML'
+restart = "never"
+workers = [
+  "sh -c 'exit 4'",
+]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/m.toml" >"$TMP/14" 2>&1
+c=$?
+if [ $c -eq 4 ] && [ "$(grep -c spawned "$TMP/14")" -eq 1 ]; then ok "config file supplies workers"
+else bad "config file supplies workers" "exit $c: $(head -3 "$TMP/14")"; fi
+
+# 15. metrics endpoint serves prometheus text
+"$MANDOR" --metrics=19464 "sh -c 'sleep 6'" >"$TMP/15sup" 2>&1 &
+mpid=$!
+sleep 1
+body=$(curl -s --max-time 3 http://127.0.0.1:19464/metrics 2>&1)
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+if echo "$body" | grep -q 'mandor_worker_up{worker="sh"} 1' && echo "$body" | grep -q 'mandor_incidents_total 0'; then
+  ok "metrics endpoint serves prometheus text"
+else bad "metrics endpoint" "$(echo "$body" | head -3)"; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

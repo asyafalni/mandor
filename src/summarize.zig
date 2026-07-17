@@ -90,7 +90,7 @@ pub fn joinRaw(lines: []const LogLine, from: usize, to: usize, st: *TraceStorage
         st.raw[pos] = '\n';
         pos += 1;
     }
-    return st.raw[0..@max(pos, 1) - 1];
+    return st.raw[0 .. @max(pos, 1) - 1];
 }
 
 // ------------------------------------------------------- diagnosis

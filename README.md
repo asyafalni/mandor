@@ -75,6 +75,25 @@ mandor report --json     # machine-readable
 |---|---|---|
 | `--restart` | `never` \| `on-failure` \| `always` | `never` |
 | `--backoff-max` | duration (`500ms`, `30s`, `2m`) | `30s` |
+| `--config` | path to `mandor.toml` | `./mandor.toml` if present |
+| `--state-dir` | state + incident spool dir | `/var/lib/mandor` |
+| `--metrics` | port for Prometheus text metrics on 127.0.0.1 | off |
+
+### Configuration file (optional)
+
+CLI-only always works — `mandor.toml` just saves typing. CLI flags override
+file values; `MANDOR_STATE_DIR` overrides the file's `state_dir`.
+
+```toml
+restart = "on-failure"
+backoff_max = "30s"
+state_dir = "/var/lib/mandor"
+metrics_port = 9464
+workers = [
+  "./api --port 8080",
+  "./worker",
+]
+```
 
 Signals (dumb-init parity): every worker runs in its own process group, so
 signals reach shell-spawned grandchildren too. `SIGTERM`/`SIGINT` are
@@ -131,7 +150,7 @@ PID-1 semantics. On other systems the binary compiles for cross-target use.
       sampler, `mandor report`
 - [x] **v0.3** — incident detection with diagnosis verdicts, Go/Rust/Python
       trace parsing, restart-loop + leak detection, spool dir
-- [ ] **v0.4** — cgroup v2 OOM detection, optional Prometheus text endpoint,
+- [x] **v0.4** — cgroup v2 OOM detection, optional Prometheus text endpoint,
       `mandor.toml` (CLI-only always works)
 
 ## Contributing

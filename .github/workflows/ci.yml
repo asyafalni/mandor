@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (pinned)
+        run: |
+          ZV=$(cat .zigversion)
+          curl -sSL "https://ziglang.org/download/${ZV}/zig-x86_64-linux-${ZV}.tar.xz" | tar xJ
+          echo "$PWD/zig-x86_64-linux-${ZV}" >> "$GITHUB_PATH"
+
+      - name: Formatting
+        run: zig fmt --check src build.zig
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Integration harness
+        run: |
+          zig build
+          bash test/harness/run_tests.sh
+
+      - name: Release builds + size gate (< 500 KB)
+        run: |
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -p zig-out/x64
+          zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -p zig-out/a64
+          for f in zig-out/x64/bin/mandor zig-out/a64/bin/mandor; do
+            size=$(stat -c%s "$f")
+            echo "$f: ${size} bytes"
+            if [ "$size" -ge 512000 ]; then
+              echo "::error::size budget exceeded: $f is ${size} bytes (budget 512000)"
+              exit 1
+            fi
+          done

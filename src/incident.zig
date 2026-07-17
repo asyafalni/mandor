@@ -12,6 +12,9 @@ const ring = @import("ring.zig");
 
 const max_tail = 200;
 
+/// Incidents written this run (metrics counter).
+pub var total: u64 = 0;
+
 // Shared scratch (single-threaded supervisor; BSS, faulted lazily).
 var tail_bufs: [max_tail][4096]u8 = undefined;
 var tail_lines: [max_tail]summarize.LogLine = undefined;
@@ -28,8 +31,8 @@ fn epochNow() i64 {
 
 fn collectTail(w: *spawner.Worker) []summarize.LogLine {
     var copy_buf: [4096]u8 = undefined;
-    const total = w.log.count();
-    const skip = total -| max_tail;
+    const record_count = w.log.count();
+    const skip = record_count -| max_tail;
     var it = w.log.iterate(&copy_buf);
     var i: usize = 0;
     var n: usize = 0;
@@ -99,6 +102,7 @@ pub fn onDeath(state_dir: []const u8, w: *spawner.Worker, now_ms: u64, oom: bool
     const sig_hash = summarize.signature(kind, w.nameSlice(), if (err_line.len > 0) err_line else cause);
     if (!w.det.shouldEmit(sig_hash, now_ms)) return;
 
+    total += 1;
     const uptime_s = (now_ms -| w.last_start_ms) / 1000;
     const killed_by_kill = switch (w.status) {
         .signaled => |sig| sig == 9,
@@ -122,6 +126,7 @@ pub fn onDeath(state_dir: []const u8, w: *spawner.Worker, now_ms: u64, oom: bool
 
 /// Restart-loop threshold crossed.
 pub fn onRestartLoop(state_dir: []const u8, w: *spawner.Worker, count: u32, now_ms: u64) void {
+    total += 1;
     const tail = collectTail(w);
     const last_cause: []const u8 = switch (w.status) {
         .exited => |code| std.fmt.bufPrint(&cause_buf, "exit:{d}", .{code}) catch "exit:?",
@@ -145,6 +150,7 @@ pub fn onRestartLoop(state_dir: []const u8, w: *spawner.Worker, count: u32, now_
 
 /// RSS climb detected on a live worker.
 pub fn onLeak(state_dir: []const u8, w: *spawner.Worker, info: detector.LeakInfo, now_ms: u64) void {
+    total += 1;
     spool.write(state_dir, .{
         .ts_epoch = epochNow(),
         .name = w.nameSlice(),

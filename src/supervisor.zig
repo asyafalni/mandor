@@ -16,6 +16,7 @@ const sampler = @import("sampler.zig");
 const report = @import("report.zig");
 const incident = @import("incident.zig");
 const cgroup = @import("cgroup.zig");
+const metrics = @import("metrics.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -45,6 +46,14 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     var kill_escalated = false;
     var next_sample_ms: u64 = nowMs() + sampler.interval_ms;
     var oom_kills: u64 = cgroup.readOomKills() orelse 0;
+    const metrics_server: ?metrics.Server = if (cfg.metrics_port) |port| blk: {
+        const srv = metrics.Server.init(port);
+        if (srv == null)
+            std.debug.print("[mandor] cannot bind metrics port {d}; continuing without\n", .{port})
+        else
+            std.debug.print("[mandor] metrics on 127.0.0.1:{d}\n", .{port});
+        break :blk srv;
+    } else null;
 
     for (workers) |*w| spawnWorker(w, envp, path_env);
 
@@ -72,11 +81,17 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         else
             @intCast(@min(wake_at - now_for_timeout, 3_600_000));
 
-        var pfds: [1 + 2 * cli.max_workers]posix.pollfd = undefined;
-        var owners: [1 + 2 * cli.max_workers]*spawner.Worker = undefined;
-        var errs: [1 + 2 * cli.max_workers]bool = undefined;
+        var pfds: [2 + 2 * cli.max_workers]posix.pollfd = undefined;
+        var owners: [2 + 2 * cli.max_workers]*spawner.Worker = undefined;
+        var errs: [2 + 2 * cli.max_workers]bool = undefined;
         pfds[0] = .{ .fd = sigs.fd, .events = posix.POLL.IN, .revents = 0 };
         var nf: usize = 1;
+        var metrics_idx: usize = 0; // 0 = not in the set
+        if (metrics_server) |srv| {
+            pfds[nf] = .{ .fd = srv.fd, .events = posix.POLL.IN, .revents = 0 };
+            metrics_idx = nf;
+            nf += 1;
+        }
         for (workers) |*w| {
             if (w.out_r >= 0) {
                 pfds[nf] = .{ .fd = w.out_r, .events = posix.POLL.IN, .revents = 0 };
@@ -94,8 +109,12 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         _ = posix.poll(pfds[0..nf], timeout) catch 0;
 
         for (pfds[1..nf], 1..) |*pfd, i| {
-            if (pfd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0)
+            if (pfd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) continue;
+            if (i == metrics_idx) {
+                metrics_server.?.onReadable(workers, incident.total);
+            } else {
                 readPipe(owners[i], errs[i]);
+            }
         }
 
         const ev = sigs.drain();
