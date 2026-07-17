@@ -231,6 +231,14 @@ unchanged — CI runs the full integration harness on all three distro bases.
 
 Full prioritized list with complexity/value ranking: [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## Sister project: photon
+
+[photon](https://github.com/nevindra/photon) is an OTEL-native single-binary
+observability platform — and mandor's natural display layer: worker metrics
+via the Prometheus endpoint, worker logs via stdout collection, and incident
+bundles via the upcoming `on_incident` hook. Integration contract:
+[docs/INTEGRATION-PHOTON.md](docs/INTEGRATION-PHOTON.md).
+
 ## Contributing
 
 Issues and PRs welcome. Before submitting:
