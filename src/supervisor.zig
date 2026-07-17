@@ -49,6 +49,8 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         return 2;
     };
 
+    incident.initSnapshot(environ);
+
     var shutting_down = false;
     var kill_escalated = false;
     var shutdown_deadline_ms: u64 = 0;
@@ -177,9 +179,9 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 logDeath(w);
                 if (!shutting_down and !clean) {
                     w.det.recordDeath(now);
-                    incident.onDeath(state_dir, w, now, oom_hit);
+                    incident.onDeath(state_dir, workers, w, now, oom_hit);
                     if (w.det.restartLoopTriggered(now)) |count|
-                        incident.onRestartLoop(state_dir, w, count, now);
+                        incident.onRestartLoop(state_dir, workers, w, count, now);
                 }
                 if (!shutting_down and backoff.shouldRestart(cfg.restart, clean)) {
                     const uptime = now -| w.last_start_ms;
@@ -211,7 +213,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 if (w.pid > 0) {
                     sampler.sample(&w.stats, w.pid, now_sample);
                     if (w.det.leakCheck(&w.stats, now_sample)) |info|
-                        incident.onLeak(state_dir, w, info, now_sample);
+                        incident.onLeak(state_dir, workers, w, info, now_sample);
                 }
             }
             report.writeState(state_dir, workers, now_sample);

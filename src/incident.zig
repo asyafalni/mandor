@@ -22,6 +22,28 @@ var trace_storage: summarize.TraceStorage = .{};
 var stats_scratch: [sampler.window_len]sampler.Sample = undefined;
 var verdict_buf: [256]u8 = undefined;
 var cause_buf: [32]u8 = undefined;
+var siblings_scratch: [64]spool.Sibling = undefined;
+
+// Supervisor-wide snapshot, read once at startup (cold path).
+const cgroup = @import("cgroup.zig");
+var snap_environ: [:null]const ?[*:0]const u8 = &spool.empty_environ;
+var snap_cwd_buf: [512]u8 = undefined;
+var snap_cwd_len: usize = 0;
+var snap_nofile: u64 = 0;
+var snap_memory_max: ?u64 = null;
+var snap_release: []const u8 = "";
+
+pub fn initSnapshot(environ: [:null]const ?[*:0]const u8) void {
+    snap_environ = environ;
+    const rc = linux.getcwd(&snap_cwd_buf, snap_cwd_buf.len);
+    if (std.posix.errno(rc) == .SUCCESS and rc > 0) snap_cwd_len = rc - 1; // drop NUL
+    if (std.posix.getrlimit(.NOFILE)) |lim| {
+        snap_nofile = @intCast(@min(lim.cur, std.math.maxInt(u63)));
+    } else |_| {}
+    snap_memory_max = cgroup.readMemoryMax();
+    snap_release = spawner.findEnv(environ, "MANDOR_RELEASE") orelse
+        (spawner.findEnv(environ, "GIT_SHA") orelse "");
+}
 
 fn epochNow() i64 {
     var ts: linux.timespec = undefined;
@@ -69,14 +91,35 @@ pub fn sigName(sig: u8) []const u8 {
     };
 }
 
+fn collectSiblings(workers: []spawner.Worker, self: *const spawner.Worker, now_ms: u64) []const spool.Sibling {
+    var n: usize = 0;
+    for (workers) |*other| {
+        if (other == self or n == siblings_scratch.len) continue;
+        siblings_scratch[n] = .{
+            .name = other.nameSlice(),
+            .state = switch (other.status) {
+                .not_started => "not-started",
+                .running => "running",
+                .exited => "exited",
+                .signaled => "signaled",
+            },
+            .uptime_s = if (other.pid > 0) (now_ms -| other.last_start_ms) / 1000 else 0,
+            .restarts = other.restarts,
+        };
+        n += 1;
+    }
+    return siblings_scratch[0..n];
+}
+
 /// Worker died uncleanly (outside shutdown): classify, dedup, spool.
 /// `oom` = the cgroup's oom_kill counter rose across this death.
-pub fn onDeath(state_dir: []const u8, w: *spawner.Worker, now_ms: u64, oom: bool) void {
+pub fn onDeath(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Worker, now_ms: u64, oom: bool) void {
     const killed_by_sigkill = switch (w.status) {
         .signaled => |sig| sig == 9,
         else => false,
     };
-    const cause: []const u8 = if (oom and killed_by_sigkill)
+    const is_oom = oom and killed_by_sigkill;
+    const cause_str: []const u8 = if (is_oom)
         "oom"
     else switch (w.status) {
         .exited => |code| std.fmt.bufPrint(&cause_buf, "exit:{d}", .{code}) catch "exit:?",
@@ -89,25 +132,36 @@ pub fn onDeath(state_dir: []const u8, w: *spawner.Worker, now_ms: u64, oom: bool
         },
         else => return,
     };
-    const kind: []const u8 = if (oom and killed_by_sigkill)
-        "oom"
-    else switch (w.status) {
+    const kind: []const u8 = if (is_oom) "oom" else switch (w.status) {
         .exited => "exit",
         else => "signal",
+    };
+    const cause: spool.CauseInfo = .{
+        .kind = kind,
+        .exit_code = switch (w.status) {
+            .exited => |code| code,
+            else => null,
+        },
+        .sig_num = switch (w.status) {
+            .signaled => |sig| sig,
+            else => null,
+        },
+        .sig_name = switch (w.status) {
+            .signaled => |sig| sigName(sig),
+            else => "",
+        },
+        .core_dumped = w.core_dumped,
+        .oom_kill_delta = @intFromBool(is_oom),
     };
 
     const tail = collectTail(w);
     const trace = summarize.extractTrace(tail, &trace_storage);
     const err_line = summarize.firstErrorLine(tail);
-    const sig_hash = summarize.signature(kind, w.nameSlice(), if (err_line.len > 0) err_line else cause);
+    const sig_hash = summarize.signature(kind, w.nameSlice(), if (err_line.len > 0) err_line else cause_str);
     if (!w.det.shouldEmit(sig_hash, now_ms)) return;
 
     total += 1;
     const uptime_s = (now_ms -| w.last_start_ms) / 1000;
-    const killed_by_kill = switch (w.status) {
-        .signaled => |sig| sig == 9,
-        else => false,
-    };
     const stats = collectStats(w);
     spool.write(state_dir, .{
         .ts_epoch = epochNow(),
@@ -115,17 +169,60 @@ pub fn onDeath(state_dir: []const u8, w: *spawner.Worker, now_ms: u64, oom: bool
         .cmd = w.cmd,
         .pid = 0,
         .restarts = w.restarts,
+        .cwd = snap_cwd_buf[0..snap_cwd_len],
+        .exe = w.exe_buf[0..w.exe_len],
+        .spawned_at_epoch = w.spawned_at_epoch,
+        .uptime_s = uptime_s,
+        .release = snap_release,
+        .environ = snap_environ,
+        .limits_nofile = snap_nofile,
+        .memory_max_bytes = snap_memory_max,
         .cause = cause,
+        .cause_str = cause_str,
         .trace = trace,
         .logs_tail = tail,
         .stats = stats,
         .now_ms = now_ms,
-        .verdict = summarize.diagnose(&verdict_buf, cause, trace, tail, stats, uptime_s, killed_by_kill),
+        .siblings = collectSiblings(workers, w, now_ms),
+        .verdict = summarize.diagnose(&verdict_buf, cause_str, trace, tail, stats, uptime_s, killed_by_sigkill),
     });
 }
 
+/// Common v2 plumbing for the non-death incident kinds.
+fn commonInput(
+    workers: []spawner.Worker,
+    w: *spawner.Worker,
+    now_ms: u64,
+    kind: []const u8,
+    pid: i32,
+) spool.BundleInput {
+    return .{
+        .ts_epoch = epochNow(),
+        .name = w.nameSlice(),
+        .cmd = w.cmd,
+        .pid = pid,
+        .restarts = w.restarts,
+        .cwd = snap_cwd_buf[0..snap_cwd_len],
+        .exe = w.exe_buf[0..w.exe_len],
+        .spawned_at_epoch = w.spawned_at_epoch,
+        .uptime_s = (now_ms -| w.last_start_ms) / 1000,
+        .release = snap_release,
+        .environ = snap_environ,
+        .limits_nofile = snap_nofile,
+        .memory_max_bytes = snap_memory_max,
+        .cause = .{ .kind = kind },
+        .cause_str = kind,
+        .trace = .{},
+        .logs_tail = &.{},
+        .stats = &.{},
+        .now_ms = now_ms,
+        .siblings = collectSiblings(workers, w, now_ms),
+        .verdict = "",
+    };
+}
+
 /// Restart-loop threshold crossed.
-pub fn onRestartLoop(state_dir: []const u8, w: *spawner.Worker, count: u32, now_ms: u64) void {
+pub fn onRestartLoop(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Worker, count: u32, now_ms: u64) void {
     total += 1;
     const tail = collectTail(w);
     const last_cause: []const u8 = switch (w.status) {
@@ -133,35 +230,20 @@ pub fn onRestartLoop(state_dir: []const u8, w: *spawner.Worker, count: u32, now_
         .signaled => |sig| std.fmt.bufPrint(&cause_buf, "signal:{d}", .{sig}) catch "signal:?",
         else => "unknown",
     };
-    spool.write(state_dir, .{
-        .ts_epoch = epochNow(),
-        .name = w.nameSlice(),
-        .cmd = w.cmd,
-        .pid = 0,
-        .restarts = w.restarts,
-        .cause = "restart-loop",
-        .trace = summarize.extractTrace(tail, &trace_storage),
-        .logs_tail = tail,
-        .stats = collectStats(w),
-        .now_ms = now_ms,
-        .verdict = summarize.verdictRestartLoop(&verdict_buf, count, detector.restart_loop_window_ms / 1000, last_cause),
-    });
+    var in = commonInput(workers, w, now_ms, "restart-loop", 0);
+    in.trace = summarize.extractTrace(tail, &trace_storage);
+    in.logs_tail = tail;
+    in.stats = collectStats(w);
+    in.verdict = summarize.verdictRestartLoop(&verdict_buf, count, detector.restart_loop_window_ms / 1000, last_cause);
+    spool.write(state_dir, in);
 }
 
 /// RSS climb detected on a live worker.
-pub fn onLeak(state_dir: []const u8, w: *spawner.Worker, info: detector.LeakInfo, now_ms: u64) void {
+pub fn onLeak(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Worker, info: detector.LeakInfo, now_ms: u64) void {
     total += 1;
-    spool.write(state_dir, .{
-        .ts_epoch = epochNow(),
-        .name = w.nameSlice(),
-        .cmd = w.cmd,
-        .pid = w.pid,
-        .restarts = w.restarts,
-        .cause = "leak-suspect",
-        .trace = .{},
-        .logs_tail = collectTail(w),
-        .stats = collectStats(w),
-        .now_ms = now_ms,
-        .verdict = summarize.verdictLeak(&verdict_buf, info.growth_mb, info.minutes),
-    });
+    var in = commonInput(workers, w, now_ms, "leak-suspect", w.pid);
+    in.logs_tail = collectTail(w);
+    in.stats = collectStats(w);
+    in.verdict = summarize.verdictLeak(&verdict_buf, info.growth_mb, info.minutes);
+    spool.write(state_dir, in);
 }
