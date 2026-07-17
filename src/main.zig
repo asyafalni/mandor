@@ -148,6 +148,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.oom_pairs_n = file_cfg.oom_pairs_n;
             cfg.nice_pairs = file_cfg.nice_pairs;
             cfg.nice_pairs_n = file_cfg.nice_pairs_n;
+            cfg.max_rss_pairs = file_cfg.max_rss_pairs;
+            cfg.max_rss_pairs_n = file_cfg.max_rss_pairs_n;
+            cfg.lifetime_pairs = file_cfg.lifetime_pairs;
+            cfg.lifetime_pairs_n = file_cfg.lifetime_pairs_n;
+            cfg.restart_pairs = file_cfg.restart_pairs;
+            cfg.restart_pairs_n = file_cfg.restart_pairs_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.commands.len == 0) {

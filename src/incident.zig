@@ -101,13 +101,32 @@ fn firePhoton(bundle_path: []const u8) void {
 }
 
 fn writeBundle(state_dir: []const u8, in: spool.BundleInput) void {
+    writeTermLog(in.name, in.cause_str, in.verdict);
     if (spool.write(state_dir, in)) |path| {
         firePhoton(path);
         fireHook(path);
     }
 }
 
+// k8s death-rattle: when /dev/termination-log exists (kubelet mounts it),
+// every incident rewrites it so `kubectl describe pod` shows the final
+// verdict. Zero config — file presence IS the signal.
+const termlog_path = "/dev/termination-log";
+var termlog_enabled = false;
+
+fn writeTermLog(name: []const u8, cause_str: []const u8, verdict: []const u8) void {
+    if (!termlog_enabled) return;
+    const rc = linux.openat(linux.AT.FDCWD, termlog_path, .{ .ACCMODE = .WRONLY, .TRUNC = true }, 0);
+    if (std.posix.errno(rc) != .SUCCESS) return;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "mandor: {s} {s} — {s}\n", .{ name, cause_str, verdict }) catch return;
+    _ = linux.write(fd, msg.ptr, @min(msg.len, 4096));
+}
+
 pub fn initSnapshot(state_dir: []const u8, environ: [:null]const ?[*:0]const u8) void {
+    termlog_enabled = std.posix.errno(linux.faccessat(linux.AT.FDCWD, termlog_path, 2, 0)) == .SUCCESS; // W_OK
     history.load(state_dir);
     snap_environ = environ;
     const rc = linux.getcwd(&snap_cwd_buf, snap_cwd_buf.len);

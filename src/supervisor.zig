@@ -77,6 +77,37 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             };
         } else std.debug.print("[mandor] nice: no worker named {s}\n", .{pair.worker});
     }
+    for (cfg.max_rss_pairs[0..cfg.max_rss_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            const mb = std.fmt.parseInt(u64, pair.cmd, 10) catch {
+                std.debug.print("[mandor] max_rss_mb: bad value for {s}\n", .{pair.worker});
+                return 2;
+            };
+            w.max_rss_kb = mb * 1024;
+        } else std.debug.print("[mandor] max_rss_mb: no worker named {s}\n", .{pair.worker});
+    }
+    for (cfg.lifetime_pairs[0..cfg.lifetime_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            w.max_lifetime_ms = cli.parseDuration(pair.cmd) orelse {
+                std.debug.print("[mandor] max_lifetime: bad value for {s}\n", .{pair.worker});
+                return 2;
+            };
+        } else std.debug.print("[mandor] max_lifetime: no worker named {s}\n", .{pair.worker});
+    }
+    for (cfg.restart_pairs[0..cfg.restart_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            w.restart_override = if (std.mem.eql(u8, pair.cmd, "never"))
+                .never
+            else if (std.mem.eql(u8, pair.cmd, "on-failure"))
+                .on_failure
+            else if (std.mem.eql(u8, pair.cmd, "always"))
+                .always
+            else {
+                std.debug.print("[mandor] restart: bad value for {s}\n", .{pair.worker});
+                return 2;
+            };
+        } else std.debug.print("[mandor] restart: no worker named {s}\n", .{pair.worker});
+    }
     var oneshot_count: usize = 0;
     for (cfg.oneshot[0..cfg.oneshot_n]) |name| {
         if (findWorker(workers, name)) |w| {
@@ -344,11 +375,17 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             }
             for (workers) |*w| {
                 if (w.pid != 0 or w.done or w.next_restart_ms != 0) continue;
-                const clean = switch (w.status) {
+                var clean = switch (w.status) {
                     .exited => |code| cfg.expected_exit[code],
                     .signaled => false,
                     else => continue, // not_started/running: nothing new here
                 };
+                const was_recycle = w.recycling;
+                if (was_recycle) {
+                    w.recycling = false;
+                    clean = true; // planned recycling is never a failure
+                    w.final_code = 0;
+                }
                 if (clean) w.final_code = 0; // expected codes count as success
                 const uptime_ms = now -| w.last_start_ms;
                 w.fail_streak = if (clean)
@@ -382,7 +419,12 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     }
                     continue;
                 }
-                if (!shutting_down and backoff.shouldRestart(cfg.restart, clean)) {
+                if (!shutting_down and was_recycle) {
+                    // planned recycle: always come back, immediately
+                    w.next_restart_ms = now;
+                    continue;
+                }
+                if (!shutting_down and backoff.shouldRestart(w.restart_override orelse cfg.restart, clean)) {
                     if (cfg.max_restarts > 0 and w.fail_streak > cfg.max_restarts) {
                         // give up: make the failure visible to the orchestrator
                         std.debug.print("[mandor] {s} failed {d} consecutive restarts, giving up\n", .{
@@ -430,6 +472,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     sampler.sample(&w.stats, w.pid, now_sample);
                     if (w.det.leakCheck(&w.stats, now_sample)) |info|
                         incident.onLeak(state_dir, workers, w, info, now_sample);
+                    checkRecycle(w, now_sample);
                 }
             }
             // Near-zero idle footprint: deaths flush state immediately, so
@@ -445,6 +488,27 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     // On give-up, report the flapping worker's code — not the TERM fallout
     // from shutting its siblings down.
     return give_up_code orelse worst;
+}
+
+/// Planned recycling (pm2 max_memory_restart heritage): thresholds crossed
+/// ⇒ graceful TERM to the group; the death path sees `recycling` and
+/// restarts without counting failure or spooling an incident.
+fn checkRecycle(w: *spawner.Worker, now_ms: u64) void {
+    if (w.recycling) return;
+    var reason: ?[]const u8 = null;
+    if (w.max_rss_kb) |cap| {
+        if (w.stats.len > 0 and w.stats.at(w.stats.len - 1).rss_kb > cap) reason = "rss over limit";
+    }
+    if (reason == null) {
+        if (w.max_lifetime_ms) |cap| {
+            if (now_ms -| w.last_start_ms > cap) reason = "max lifetime reached";
+        }
+    }
+    if (reason) |r| {
+        std.debug.print("[mandor] recycling {s}: {s}\n", .{ w.nameSlice(), r });
+        w.recycling = true;
+        posix.kill(-w.pid, .TERM) catch {};
+    }
 }
 
 fn findWorker(workers: []spawner.Worker, name: []const u8) ?*spawner.Worker {

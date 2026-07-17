@@ -366,6 +366,46 @@ sleep 0.5
 if [ -n "$wpid" ] && ! kill -0 "$wpid" 2>/dev/null; then ok "PDEATHSIG kills workers when supervisor dies"
 else bad "PDEATHSIG" "wpid=$wpid $(kill -0 "$wpid" 2>/dev/null && echo alive)"; kill "$wpid" 2>/dev/null; fi
 
+# 32. max_lifetime recycles the worker (planned, not a failure)
+cat > "$TMP/rec.toml" <<'TOML'
+workers = ["sleep 30"]
+max_lifetime = ["sleep=1s"]
+TOML
+"$MANDOR" --config="$TMP/rec.toml" >"$TMP/32" 2>&1 &
+mpid=$!
+sleep 8
+kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
+n=$(grep -c "spawned sleep" "$TMP/32")
+if grep -q "recycling sleep: max lifetime" "$TMP/32" && [ "$n" -ge 2 ]; then
+  ok "max_lifetime recycles worker ($n spawns)"
+else bad "recycle" "spawns=$n $(grep recycl "$TMP/32" | head -1)"; fi
+
+# 33. per-worker restart override beats the global policy
+cat > "$TMP/ov.toml" <<'TOML'
+restart = "never"
+workers = ["sh -c 'exit 1'"]
+restart = ["sh=always"]
+TOML
+"$MANDOR" --config="$TMP/ov.toml" >"$TMP/33" 2>&1 &
+mpid=$!
+sleep 2
+kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
+n=$(grep -c "spawned sh" "$TMP/33")
+if [ "$n" -ge 2 ]; then ok "per-worker restart override ($n spawns under global never)"
+else bad "restart override" "spawns=$n"; fi
+
+# 34. termination-log death rattle (root only — CI containers)
+if [ "$(id -u)" -eq 0 ]; then
+  touch /dev/termination-log
+  export MANDOR_STATE_DIR="$TMP/state34"
+  timeout 10 "$MANDOR" "sh -c 'exit 3'" >/dev/null 2>&1
+  if grep -q "mandor: sh exit:3" /dev/termination-log; then ok "termination-log written"
+  else bad "termination-log" "$(cat /dev/termination-log)"; fi
+  rm -f /dev/termination-log; unset MANDOR_STATE_DIR
+else
+  echo "skip termination-log (not root)"
+fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

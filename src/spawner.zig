@@ -65,6 +65,10 @@ pub const Worker = struct {
     drop_gid: ?u32 = null,
     oom_adj: ?i16 = null, // -1000..1000, written to /proc/self/oom_score_adj
     nice_val: ?i8 = null,
+    max_rss_kb: ?u64 = null, // planned recycle thresholds
+    max_lifetime_ms: ?u64 = null,
+    recycling: bool = false, // current death is planned, not a failure
+    restart_override: ?cli.RestartPolicy = null,
     restarts: u32 = 0,
     /// Consecutive unclean deaths (reset by clean exit or stable uptime).
     fail_streak: u32 = 0,
@@ -141,6 +145,10 @@ fn resetWorker(w: *Worker) void {
     w.drop_gid = null;
     w.oom_adj = null;
     w.nice_val = null;
+    w.max_rss_kb = null;
+    w.max_lifetime_ms = null;
+    w.recycling = false;
+    w.restart_override = null;
 }
 
 /// "1000:1000" -> numeric uid/gid privilege drop for this worker.

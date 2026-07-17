@@ -38,10 +38,16 @@ pub const FileConfig = struct {
     oom_pairs_n: u8 = 0,
     nice_pairs: [16]cli.HealthSpec = undefined,
     nice_pairs_n: u8 = 0,
+    max_rss_pairs: [16]cli.HealthSpec = undefined,
+    max_rss_pairs_n: u8 = 0,
+    lifetime_pairs: [16]cli.HealthSpec = undefined,
+    lifetime_pairs_n: u8 = 0,
+    restart_pairs: [16]cli.HealthSpec = undefined,
+    restart_pairs_n: u8 = 0,
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, oom, nice };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, oom, nice, max_rss, lifetime, restart_override };
 
 /// name=value array keys share one parse shape; map key -> target + slot.
 fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSpec, n: *u8 } {
@@ -53,6 +59,9 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
         .user => .{ .arr = &cfg.user_pairs, .n = &cfg.user_pairs_n },
         .oom => .{ .arr = &cfg.oom_pairs, .n = &cfg.oom_pairs_n },
         .nice => .{ .arr = &cfg.nice_pairs, .n = &cfg.nice_pairs_n },
+        .max_rss => .{ .arr = &cfg.max_rss_pairs, .n = &cfg.max_rss_pairs_n },
+        .lifetime => .{ .arr = &cfg.lifetime_pairs, .n = &cfg.lifetime_pairs_n },
+        .restart_override => .{ .arr = &cfg.restart_pairs, .n = &cfg.restart_pairs_n },
         else => null,
     };
 }
@@ -91,7 +100,20 @@ pub fn parse(
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
 
-        if (std.mem.eql(u8, key, "restart")) {
+        if (std.mem.eql(u8, key, "restart") and value.len > 0 and value[0] == '[') {
+            // per-worker override form: restart = ["api=always"]
+            var rest = std.mem.trim(u8, value[1..], " \t");
+            const closed = std.mem.endsWith(u8, rest, "]");
+            if (closed) rest = std.mem.trim(u8, rest[0 .. rest.len - 1], " \t");
+            var items = std.mem.splitScalar(u8, rest, ',');
+            while (items.next()) |item_raw| {
+                const item = std.mem.trim(u8, item_raw, " \t");
+                if (item.len == 0) continue;
+                const s = parseString(item) orelse return error.BadValue;
+                try appendItem(&cfg, cmd_storage, &ncmd, .restart_override, s);
+            }
+            if (!closed) target = .restart_override;
+        } else if (std.mem.eql(u8, key, "restart")) {
             const s = parseString(value) orelse return error.BadValue;
             cfg.restart = if (std.mem.eql(u8, s, "never"))
                 .never
@@ -167,7 +189,8 @@ fn arrayKey(key: []const u8) ?ArrayTarget {
         .{ "start_after", ArrayTarget.start_after }, .{ "env", ArrayTarget.env },
         .{ "cwd", ArrayTarget.cwd },                 .{ "oneshot", ArrayTarget.oneshot },
         .{ "user", ArrayTarget.user },               .{ "oom_score_adj", ArrayTarget.oom },
-        .{ "nice", ArrayTarget.nice },
+        .{ "nice", ArrayTarget.nice },               .{ "max_rss_mb", ArrayTarget.max_rss },
+        .{ "max_lifetime", ArrayTarget.lifetime },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, key, entry[0])) return entry[1];

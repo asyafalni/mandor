@@ -69,9 +69,9 @@ Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
 
 | # | Feature | Cx | Value | Notes |
 |---|---------|----|-------|-------|
-| 27 | k8s termination-log writer (auto when `/dev/termination-log` exists) | XS | ● ● ● ● | The verdict in `kubectl describe pod`, zero config — cheapest possible k8s-native visibility for the summarize engine |
-| 28 | Recycle thresholds `max_rss_mb` / `max_lifetime` (per worker) | XS | ● ● ● ○ | pm2's most-cited flag; sampler already has RSS — detector becomes actor; planned recycling never counts toward give-up |
-| 29 | Per-worker `restart` / `max_restarts` / `backoff_max` overrides | XS | ● ● ● ○ | Consistency: everything else already scopes per worker |
+| 27 ✅ | k8s termination-log writer (auto when `/dev/termination-log` exists) | XS | ● ● ● ● | The verdict in `kubectl describe pod`, zero config — cheapest possible k8s-native visibility for the summarize engine |
+| 28 ✅ | Recycle thresholds `max_rss_mb` / `max_lifetime` (per worker) | XS | ● ● ● ○ | pm2's most-cited flag; sampler already has RSS — detector becomes actor; planned recycling never counts toward give-up |
+| 29 ✅ | Per-worker `restart` / `max_restarts` / `backoff_max` overrides | XS | ● ● ● ○ | Consistency: everything else already scopes per worker |
 | 30 | Restart propagation along start_after (OTP `rest_for_one`) | S | ● ● ● ○ | compose retrofitted this after years of demand; hold until asked |
 | 31 | `essential` worker (leader exits ⇒ all stop, code propagates) | XS | ● ● ○ ○ | Nomad leader-task semantics; hold until asked |
 | 32 | `pre_stop` drain hook | S | ● ● ○ ○ | Narrower than it looks (pod-level preStop covers routing drain); hold |

@@ -67,6 +67,12 @@ pub const Config = struct {
     oom_pairs_n: u8 = 0,
     nice_pairs: [16]HealthSpec = undefined,
     nice_pairs_n: u8 = 0,
+    max_rss_pairs: [16]HealthSpec = undefined,
+    max_rss_pairs_n: u8 = 0,
+    lifetime_pairs: [16]HealthSpec = undefined,
+    lifetime_pairs_n: u8 = 0,
+    restart_pairs: [16]HealthSpec = undefined,
+    restart_pairs_n: u8 = 0,
     /// Track explicit CLI flags so a config file never overrides them.
     restart_set: bool = false,
     backoff_set: bool = false,
