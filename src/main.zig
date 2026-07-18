@@ -153,6 +153,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (cfg.photon == null) cfg.photon = file_cfg.photon;
             cfg.essential = file_cfg.essential;
             cfg.essential_n = file_cfg.essential_n;
+            if (file_cfg.restart_dependents) |b| cfg.restart_dependents = b;
+            cfg.prestop_pairs = file_cfg.prestop_pairs;
+            cfg.prestop_pairs_n = file_cfg.prestop_pairs_n;
             if (cfg.env_file == null) cfg.env_file = file_cfg.env_file;
             cfg.env_pairs = file_cfg.env_pairs;
             cfg.env_pairs_n = file_cfg.env_pairs_n;

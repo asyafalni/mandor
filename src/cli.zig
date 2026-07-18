@@ -76,6 +76,11 @@ pub const Config = struct {
     /// Worker names whose exit stops everything (Nomad leader-task).
     essential: [16][]const u8 = undefined,
     essential_n: u8 = 0,
+    /// OTP rest_for_one: a dependency's restart also restarts dependents.
+    restart_dependents: bool = false,
+    /// "name=CMD" drain hooks exec'd before TERM on graceful shutdown.
+    prestop_pairs: [16]HealthSpec = undefined,
+    prestop_pairs_n: u8 = 0,
     /// Optional KEY=VAL file loaded into every worker's environment.
     env_file: ?[]const u8 = null,
     /// Track explicit CLI flags so a config file never overrides them.

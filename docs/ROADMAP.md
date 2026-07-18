@@ -58,7 +58,7 @@ cuts, s6 oneshots, pm2). Strict lowest-hanging-fruit order: build top-down.
 | 22 ✅ | Oneshot init tasks (gates dependents via `start_after`) | S | ● ● ● ● | Migrations-before-workers; failed oneshot = LLM-fixable bundle + hard exit |
 | 23 ✅ | Per-worker `user = "uid:gid"` drop (numeric) | S | ● ● ● ○ | SHIPPED 2026-07-17 — fail-closed (worker exits 126 if the drop fails) |
 | 24 ✅ | `oom_score_adj` / `nice` knobs | XS | ● ● ○ ○ | SHIPPED 2026-07-17 (TOML-only) |
-| 25 | `replicas = N` scaling (no fd sharing) | S | ● ● ○ ○ | compose/VPS queue workers; hold until asked |
+| ~~25~~ | ~~`replicas = N` scaling~~ | S | — | REJECTED 2026-07-18 (user): replication belongs outside the binary — bash/orchestrator territory |
 | 26 | Watchdog heartbeat over readiness fd | S | ● ○ ○ ○ | Needs app integration; hold until asked |
 
 ## Tier 5 — v0.10 candidates (round-3 research, 2026-07-17)
@@ -72,9 +72,9 @@ Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
 | 27 ✅ | k8s termination-log writer (auto when `/dev/termination-log` exists) | XS | ● ● ● ● | The verdict in `kubectl describe pod`, zero config — cheapest possible k8s-native visibility for the summarize engine |
 | 28 ✅ | Recycle thresholds `max_rss_mb` / `max_lifetime` (per worker) | XS | ● ● ● ○ | pm2's most-cited flag; sampler already has RSS — detector becomes actor; planned recycling never counts toward give-up |
 | 29 ✅ | Per-worker `restart` / `max_restarts` / `backoff_max` overrides | XS | ● ● ● ○ | Consistency: everything else already scopes per worker |
-| 30 | Restart propagation along start_after (OTP `rest_for_one`) | S | ● ● ● ○ | compose retrofitted this after years of demand; hold until asked |
+| 30 ✅ | Restart propagation along start_after (OTP `rest_for_one`) | S | ● ● ● ○ | SHIPPED 2026-07-18 (opt-in `restart_dependents = true`; dependents recycle, never counted as failure) |
 | 31 ✅ | `essential` worker (leader exits ⇒ all stop, code propagates) | XS | ● ● ○ ○ | SHIPPED 2026-07-17 |
-| 32 | `pre_stop` drain hook | S | ● ● ○ ○ | Narrower than it looks (pod-level preStop covers routing drain); hold |
+| 32 ✅ | `pre_stop` drain hook | S | ● ● ○ ○ | SHIPPED 2026-07-18 (hook completes → TERM follows; stop-grace KILLs hung hooks) |
 | 33 ✅ | TTY color prefixes + `env_file` loading | XS | ● ○ ○ ○ | SHIPPED 2026-07-17 |
 | 34 ✅ | Ultra-low-latency capture path, nanozlog-inspired (https://github.com/wyzdwdz/nanozlog) | M | ● ● ○ ○ | User-parked 2026-07-17 — make logging MORE EFFICIENT: study nanozlog's lock-free SPSC/deferred-IO/zero-alloc techniques for the read→assemble→ring→echo hot path (batched writev echo, fewer wallMs calls, single-copy framing). Compared vs logly.zig 2026-07-17: nanozlog wins decisively (6.8 ns/msg ~147M msg/s lock-free SPSC vs logly's 8.5 µs simple path; logly is a feature-rich app logger — wrong shape for a PID-1 hot path). Reference stays nanozlog. |
 

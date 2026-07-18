@@ -440,6 +440,41 @@ else
   echo "skip TTY colors (no script cmd)"
 fi
 
+# 38. restart_dependents: dependency restart recycles the dependent
+cat > "$TMP/rd.toml" <<'TOML'
+restart = "always"
+restart_dependents = true
+backoff_max = "300ms"
+workers = [
+  "sh -c 'sleep 1; exit 1'",
+  "sleep 30",
+]
+start_after = ["sleep=sh"]
+TOML
+"$MANDOR" --config="$TMP/rd.toml" >"$TMP/38" 2>&1 &
+mpid=$!
+sleep 5
+kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
+if grep -q "restarting sleep with its dependency sh" "$TMP/38" \
+   && [ "$(grep -c 'spawned sleep' "$TMP/38")" -ge 2 ]; then
+  ok "restart_dependents recycles dependents"
+else bad "restart_dependents" "$(grep -E 'restarting|spawned sleep' "$TMP/38" | head -4)"; fi
+
+# 39. pre_stop runs before TERM on graceful shutdown
+m="$TMP/drained"
+cat > "$TMP/ps.toml" <<TOML
+workers = ["bash -c 'trap exit TERM; while true; do sleep 1; done'"]
+pre_stop = ["bash=sh -c 'sleep 0.3; touch $m'"]
+expected_exit = "143"
+TOML
+"$MANDOR" --config="$TMP/ps.toml" >"$TMP/39" 2>&1 &
+mpid=$!
+sleep 1
+kill -TERM "$mpid"; wait "$mpid"; c=$?
+if [ $c -eq 0 ] && [ -f "$m" ] && grep -q "running pre_stop for bash" "$TMP/39"; then
+  ok "pre_stop drains before TERM"
+else bad "pre_stop" "exit $c marker=$([ -f $m ] && echo y || echo n): $(tail -2 "$TMP/39")"; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

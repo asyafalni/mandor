@@ -34,6 +34,11 @@ pub fn drain(workers: []spawner.Worker) ReapSummary {
                 w.health_ok = linux.W.IFEXITED(st) and linux.W.EXITSTATUS(st) == 0;
                 break;
             }
+            if (w.prestop_pid == pid) {
+                w.prestop_pid = 0;
+                w.prestop_done = true;
+                break;
+            }
             if (w.pid != pid) continue;
             w.pid = 0;
             if (linux.W.IFEXITED(st)) {

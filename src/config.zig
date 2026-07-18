@@ -47,10 +47,13 @@ pub const FileConfig = struct {
     essential: [16][]const u8 = undefined,
     essential_n: u8 = 0,
     env_file: ?[]const u8 = null,
+    restart_dependents: ?bool = null,
+    prestop_pairs: [16]cli.HealthSpec = undefined,
+    prestop_pairs_n: u8 = 0,
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, oom, nice, max_rss, lifetime, restart_override, essential };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, oom, nice, max_rss, lifetime, restart_override, essential, pre_stop };
 
 /// name=value array keys share one parse shape; map key -> target + slot.
 fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSpec, n: *u8 } {
@@ -65,6 +68,7 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
         .max_rss => .{ .arr = &cfg.max_rss_pairs, .n = &cfg.max_rss_pairs_n },
         .lifetime => .{ .arr = &cfg.lifetime_pairs, .n = &cfg.lifetime_pairs_n },
         .restart_override => .{ .arr = &cfg.restart_pairs, .n = &cfg.restart_pairs_n },
+        .pre_stop => .{ .arr = &cfg.prestop_pairs, .n = &cfg.prestop_pairs_n },
         else => null,
     };
 }
@@ -156,6 +160,13 @@ pub fn parse(
             cfg.photon = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "env_file")) {
             cfg.env_file = parseString(value) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "restart_dependents")) {
+            cfg.restart_dependents = if (std.mem.eql(u8, value, "true"))
+                true
+            else if (std.mem.eql(u8, value, "false"))
+                false
+            else
+                return error.BadValue;
         } else if (std.mem.eql(u8, key, "health_interval")) {
             const s = parseString(value) orelse return error.BadValue;
             cfg.health_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
@@ -196,6 +207,7 @@ fn arrayKey(key: []const u8) ?ArrayTarget {
         .{ "user", ArrayTarget.user },               .{ "oom_score_adj", ArrayTarget.oom },
         .{ "nice", ArrayTarget.nice },               .{ "max_rss_mb", ArrayTarget.max_rss },
         .{ "max_lifetime", ArrayTarget.lifetime },   .{ "essential", ArrayTarget.essential },
+        .{ "pre_stop", ArrayTarget.pre_stop },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, key, entry[0])) return entry[1];

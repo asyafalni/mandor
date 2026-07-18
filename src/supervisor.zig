@@ -109,6 +109,14 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             };
         } else logmod.print("[mandor] restart: no worker named {s}\n", .{pair.worker});
     }
+    for (cfg.prestop_pairs[0..cfg.prestop_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker)) |w| {
+            spawner.setPreStop(w, pair.cmd) catch {
+                logmod.print("[mandor] invalid pre_stop command for {s}\n", .{pair.worker});
+                return 2;
+            };
+        } else logmod.print("[mandor] pre_stop: no worker named {s}\n", .{pair.worker});
+    }
     for (cfg.essential[0..cfg.essential_n]) |name| {
         if (findWorker(workers, name)) |w| {
             w.essential = true;
@@ -350,7 +358,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 shutting_down = true;
                 shutdown_deadline_ms = nowMs() + cfg.stop_grace_ms;
                 logmod.print("[mandor] SIG{t} received, forwarding to workers\n", .{sig});
-                forwardAll(workers, sig);
+                stopWorkers(workers, envp, path_env, sig);
                 for (workers, 0..) |*w, i| {
                     w.next_restart_ms = 0;
                     waiting[i] = false;
@@ -359,7 +367,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             } else if (!kill_escalated) {
                 kill_escalated = true;
                 logmod.print("[mandor] second signal, sending SIGKILL\n", .{});
-                forwardAll(workers, .KILL);
+                killAll(workers);
             }
         }
         if (shutting_down and !kill_escalated and shutdown_deadline_ms != 0 and
@@ -367,7 +375,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         {
             kill_escalated = true;
             logmod.print("[mandor] stop-grace expired, sending SIGKILL\n", .{});
-            forwardAll(workers, .KILL);
+            killAll(workers);
         }
         for (ev.pass[0..ev.pass_n]) |sig| forwardAll(workers, sig);
 
@@ -418,7 +426,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                         give_up_code = w.final_code;
                         shutting_down = true;
                         shutdown_deadline_ms = now + cfg.stop_grace_ms;
-                        forwardAll(workers, .TERM);
+                        stopWorkers(workers, envp, path_env, .TERM);
                         for (workers, 0..) |*other, oi| {
                             other.next_restart_ms = 0;
                             waiting[oi] = false;
@@ -442,7 +450,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                         give_up_code = w.final_code;
                         shutting_down = true;
                         shutdown_deadline_ms = now + cfg.stop_grace_ms;
-                        forwardAll(workers, .TERM);
+                        stopWorkers(workers, envp, path_env, .TERM);
                         for (workers, 0..) |*other, oi| {
                             other.next_restart_ms = 0;
                             waiting[oi] = false;
@@ -465,7 +473,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     give_up_code = w.final_code;
                     shutting_down = true;
                     shutdown_deadline_ms = now + cfg.stop_grace_ms;
-                    forwardAll(workers, .TERM);
+                    stopWorkers(workers, envp, path_env, .TERM);
                     for (workers, 0..) |*other, oi| {
                         other.next_restart_ms = 0;
                         waiting[oi] = false;
@@ -475,13 +483,47 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             }
         }
 
+        // preStop ordering: a finished drain hook (recorded by the reaper
+        // just above) releases its worker's TERM in the same iteration.
+        if (shutting_down) {
+            for (workers) |*w| {
+                if (w.prestop_done and w.pid > 0) {
+                    w.prestop_done = false;
+                    posix.kill(-w.pid, .TERM) catch {
+                        posix.kill(w.pid, .TERM) catch {};
+                    };
+                }
+            }
+        }
+
         if (!shutting_down) {
             const now = nowMs();
-            for (workers) |*w| {
+            for (workers, 0..) |*w, wi| {
                 if (w.done or w.pid != 0 or w.next_restart_ms == 0 or w.next_restart_ms > now)
                     continue;
                 w.restarts += 1;
                 spawnWorker(w, envp, path_env, cfg.ready_fd);
+                // OTP rest_for_one (opt-in): a dependency's restart recycles
+                // its live dependents — planned, never counted as failure.
+                if (cfg.restart_dependents) {
+                    for (workers, 0..) |*dep_w, di| {
+                        if (dep_w.pid <= 0 or dep_w.recycling) continue;
+                        var cur = dep_of[di];
+                        var hops: usize = 0;
+                        while (cur) |c| : (hops += 1) {
+                            if (hops > workers.len) break;
+                            if (c == wi) {
+                                logmod.print("[mandor] restarting {s} with its dependency {s}\n", .{
+                                    dep_w.nameSlice(), w.nameSlice(),
+                                });
+                                dep_w.recycling = true;
+                                posix.kill(-dep_w.pid, .TERM) catch {};
+                                break;
+                            }
+                            cur = dep_of[c];
+                        }
+                    }
+                }
             }
         }
 
@@ -633,6 +675,37 @@ fn forwardAll(workers: []spawner.Worker, sig: posix.SIG) void {
         // Negative pid = the worker's whole process group (set at spawn), so
         // grandchildren under a shell wrapper receive the signal too.
         if (w.pid > 0) posix.kill(-w.pid, sig) catch {
+            posix.kill(w.pid, sig) catch {};
+        };
+    }
+}
+
+/// Escalation: KILL workers AND any still-running drain hooks.
+fn killAll(workers: []spawner.Worker) void {
+    forwardAll(workers, .KILL);
+    for (workers) |*w| {
+        if (w.prestop_pid > 0) posix.kill(w.prestop_pid, .KILL) catch {};
+    }
+}
+
+/// Graceful stop with preStop ordering: hooked workers get their drain
+/// command first — the TERM follows when the hook exits (or stop-grace
+/// KILLs everything, hooks included). Un-hooked workers get the signal now.
+fn stopWorkers(
+    workers: []spawner.Worker,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+    sig: posix.SIG,
+) void {
+    for (workers) |*w| {
+        if (w.pid <= 0) continue;
+        if (w.has_prestop and w.prestop_pid == 0 and !w.prestop_done) {
+            if (spawner.spawnPreStop(w, envp, path_env)) {
+                logmod.print("[mandor] running pre_stop for {s}\n", .{w.nameSlice()});
+                continue;
+            }
+        }
+        posix.kill(-w.pid, sig) catch {
             posix.kill(w.pid, sig) catch {};
         };
     }

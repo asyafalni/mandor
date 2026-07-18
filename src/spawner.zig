@@ -71,6 +71,13 @@ pub const Worker = struct {
     restart_override: ?cli.RestartPolicy = null,
     essential: bool = false, // leader semantics: its exit stops everything
     color: u8 = 0, // ANSI 31..36 cycle for TTY prefixes
+
+    // pre_stop drain hook (v0.13): runs before TERM on graceful shutdown.
+    has_prestop: bool = false,
+    prestop_cmd_buf: [512]u8 = undefined,
+    prestop_argv: [9]?[*:0]const u8 = undefined,
+    prestop_pid: i32 = 0,
+    prestop_done: bool = false,
     restarts: u32 = 0,
     /// Consecutive unclean deaths (reset by clean exit or stable uptime).
     fail_streak: u32 = 0,
@@ -153,6 +160,38 @@ fn resetWorker(w: *Worker) void {
     w.restart_override = null;
     w.essential = false;
     w.color = 0;
+    w.has_prestop = false;
+    w.prestop_pid = 0;
+    w.prestop_done = false;
+}
+
+pub fn setPreStop(w: *Worker, cmd: []const u8) InitError!void {
+    var toks: [8][]const u8 = undefined;
+    const argv = cli.tokenize(cmd, &w.prestop_cmd_buf, &toks) catch return error.BadCommand;
+    for (argv, 0..) |t, i| w.prestop_argv[i] = @ptrCast(t.ptr);
+    w.prestop_argv[argv.len] = null;
+    w.has_prestop = true;
+}
+
+/// Fork/exec the pre_stop drain hook; tracked so the supervisor can TERM
+/// the worker only after the hook finishes.
+pub fn spawnPreStop(
+    w: *Worker,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) bool {
+    const supervisor_pid = linux.getpid();
+    const rc = linux.fork();
+    if (posix.errno(rc) != .SUCCESS) return false;
+    if (rc == 0) {
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        if (linux.getppid() != supervisor_pid) linux.exit(1);
+        const empty = posix.sigemptyset();
+        posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+        execArgv(@ptrCast(&w.prestop_argv), envp, path_env);
+    }
+    w.prestop_pid = @intCast(rc);
+    return true;
 }
 
 /// "1000:1000" -> numeric uid/gid privilege drop for this worker.
