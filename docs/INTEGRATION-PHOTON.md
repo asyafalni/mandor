@@ -52,8 +52,14 @@ One config key. When set, mandor forwards every incident bundle to photon's
 OTLP/HTTP logs endpoint by fire-and-forget re-exec of its own invisible
 `mandor relay` subcommand — the supervision path never touches a socket,
 and without the key mandor is fully offline. `--photon=ip:port` works on
-the CLI too. The generic `on_incident` hook remains for custom tooling and
-the premium sidecar.
+the CLI too. Auth: set `PHOTON_TOKEN` in the environment and the relay sends
+`Authorization: Bearer …`. The generic `on_incident` hook remains for custom
+tooling and the premium sidecar.
+
+**Current photon-side gap (2026-07-18 recon):** photon's `/v1/logs` decodes
+protobuf only; mandor sends OTLP/JSON (which the OTLP spec requires servers
+to accept). The exact, afternoon-sized fix for photon is specced in
+[docs/photon-contrib/otlp-json-ingest-spec.md](photon-contrib/otlp-json-ingest-spec.md).
 
 **Proposed OTLP mapping** (for the shim / photon-side importer):
 

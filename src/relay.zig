@@ -36,7 +36,9 @@ pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const
         err("bundle too large");
         return 1;
     };
-    return post(host, port, body);
+    // photon requires a bearer token; inherited env keeps it off /proc cmdline.
+    const token = spawner.findEnv(environ, "PHOTON_TOKEN") orelse "";
+    return post(host, port, body, token);
 }
 
 fn err(msg: []const u8) void {
@@ -132,7 +134,7 @@ fn buildOtlp(bundle: []const u8) ?[]const u8 {
     return body_buf[0..pos];
 }
 
-fn post(host: u32, port: u16, body: []const u8) u8 {
+fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (posix.errno(rc) != .SUCCESS) {
         err("socket failed");
@@ -148,9 +150,14 @@ fn post(host: u32, port: u16, body: []const u8) u8 {
         err("connect failed — is photon listening?");
         return 1;
     }
+    var auth_buf: [300]u8 = undefined;
+    const auth: []const u8 = if (token.len > 0)
+        std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}\r\n", .{token}) catch ""
+    else
+        "";
     const req = std.fmt.bufPrint(&req_buf, "POST /v1/logs HTTP/1.1\r\nHost: photon\r\n" ++
-        "Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
-        body.len, body,
+        "Content-Type: application/json\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+        auth, body.len, body,
     }) catch return 1;
     var off: usize = 0;
     while (off < req.len) {
