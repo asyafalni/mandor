@@ -13,6 +13,10 @@ pass=0 fail=0
 ok()   { pass=$((pass+1)); echo "ok   $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL $1 — $2"; }
 
+# Poll up to ~5s for a pid to disappear (lifecycle assertions are eventual,
+# not instantaneous — a fixed sleep races under a loaded CI runner).
+wait_dead() { local pid=$1 i=0; while kill -0 "$pid" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; ! kill -0 "$pid" 2>/dev/null; }
+
 # 1. all workers clean -> exit 0
 timeout 10 "$MANDOR" "sh -c 'exit 0'" "sh -c 'exit 0'" >"$TMP/1" 2>&1
 [ $? -eq 0 ] && ok "clean workers exit 0" || bad "clean workers exit 0" "exit $?"
@@ -352,8 +356,7 @@ else bad "oom_score_adj" "$(grep '\[sh\]' "$TMP/29")"; fi
 # 30. dead worker's grandchildren are swept (no strays across restarts)
 timeout 10 "$MANDOR" "bash -c 'sleep 30 & echo BGPID=\$!; exit 0'" >"$TMP/30" 2>&1
 bg=$(grep -o "BGPID=[0-9]*" "$TMP/30" | cut -d= -f2)
-sleep 0.5
-if [ -n "$bg" ] && ! kill -0 "$bg" 2>/dev/null; then ok "grandchildren swept on worker death"
+if [ -n "$bg" ] && wait_dead "$bg"; then ok "grandchildren swept on worker death"
 else bad "grandchild sweep" "bg=$bg still=$(kill -0 "$bg" 2>/dev/null && echo alive)"; fi
 
 # 31. workers die if the supervisor is SIGKILLed (PDEATHSIG, non-PID-1 safety)
@@ -362,8 +365,7 @@ mpid=$!
 sleep 1
 wpid=$(grep -o "spawned sleep (pid [0-9]*)" "$TMP/31" | grep -o "[0-9]*")
 kill -9 "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
-sleep 0.5
-if [ -n "$wpid" ] && ! kill -0 "$wpid" 2>/dev/null; then ok "PDEATHSIG kills workers when supervisor dies"
+if [ -n "$wpid" ] && wait_dead "$wpid"; then ok "PDEATHSIG kills workers when supervisor dies"
 else bad "PDEATHSIG" "wpid=$wpid $(kill -0 "$wpid" 2>/dev/null && echo alive)"; kill "$wpid" 2>/dev/null; fi
 
 # 32. max_lifetime recycles the worker (planned, not a failure)
