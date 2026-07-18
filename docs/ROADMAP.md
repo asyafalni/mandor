@@ -96,8 +96,24 @@ Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
 - Upstart-style event bus; k8s postStart analog (racy); Nomad poststop phase; namespaces/replica expansion
 - Watchdog/sd_notify heartbeat (would make worker-code cooperation load-bearing for core restart; health checks cover it with zero app changes)
 
+## Tier 6 — round-4 research (2026-07-18)
+
+From the [fourth landscape pass](research/2026-07-18-round4-tier6-features.md)
+(procd/finit, preforking app servers, Linux security primitives, PSI,
+core-dump, JSON logging). Only extensions of existing subsystems survived.
+
+| # | Feature | Cx | Value | Notes |
+|---|---------|----|-------|-------|
+| 35 | PSI stall sampling (cgroup v2 pressure) → `stall:*` detector cause | S | ● ● ● ○ | Catches CPU-throttle / I/O-stall (blind spot today); earlier than RSS slope. Bundle schema → v6 |
+| 36 | `no_new_privs` + `cap_drop` at exec | S | ● ● ● ○ | Closes the setuid re-escalation hole after uid drop; per-worker cap bounding-set, no libcap |
+| 37 | JSON supervisor-event log (`--log-format=json`) | S | ● ● ○ ○ | mandor's own events for Loki/Datadog; supervisor events only, never worker stdout |
+| 38 | `RLIMIT_CORE` in bundle | XS | ● ○ ○ ○ | `core_dumped` already shipped (v0.5); only the size-limit detail is new — marginal |
+
 ## Backlog status
 
-**Every researched feature is now shipped or rejected — the parked list is
-empty.** Remaining non-feature work: distribution (aports/apt/AUR,
-announcement), v1.0 fuzz-hardening, and the premium sidecar (separate repo).
+Four research rounds complete; the well is nearly dry. The two Tier-6 picks
+(35, 36) survive only because they deepen existing strengths (forensic
+detection, security drop) — not net-new subsystems. Everything else across
+four rounds is shipped or rejected-with-reason. Remaining non-feature work:
+distribution (aports/apt/AUR, announcement), v1.0 fuzz-hardening, and the
+premium sidecar (separate repo).
