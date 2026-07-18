@@ -41,7 +41,9 @@ jobs:
 
       - name: aarch64 unit tests under qemu
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static binfmt-support
+          # zig -fqemu execs `qemu-aarch64` (the qemu-user name, not
+          # qemu-user-static's `qemu-aarch64-static`)
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user
           zig build test -Dtarget=aarch64-linux-musl -fqemu
 
       - name: Release builds + size gate (< 500 KB)
