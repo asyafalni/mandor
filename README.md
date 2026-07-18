@@ -241,15 +241,9 @@ bundles via the upcoming `on_incident` hook. Integration contract:
 
 ## Contributing
 
-Issues and PRs welcome. Before submitting:
-
-```console
-zig build test    # all unit tests green
-zig fmt src       # formatting
-```
-
-The size budget is a feature: changes that grow the stripped ReleaseSafe
-binary past 500 KB need a very good story.
+Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for build,
+test, and the ground rules (size budget, offline-by-default, simplicity).
+Working config recipes live in [examples/](examples/).
 
 ## License
 

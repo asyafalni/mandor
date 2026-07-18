@@ -1,0 +1,15 @@
+# Run a one-time setup task to completion BEFORE any long-running worker
+# starts. Common uses: schema migrations, cache warming, config generation,
+# asset compilation — whatever your app needs ready first. mandor has no
+# database of its own; this is purely your app's init step.
+#
+# A failed init task aborts startup with its exit code, so the orchestrator
+# sees a hard failure instead of workers crash-looping against a bad state.
+restart = "on-failure"
+
+workers = [
+  "./setup",              # your init task (e.g. "./manage migrate")
+  "./api --port 8080",
+]
+
+oneshot = ["setup"]       # runs first; workers wait for it to exit 0

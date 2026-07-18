@@ -477,6 +477,25 @@ if [ $c -eq 0 ] && [ -f "$m" ] && grep -q "running pre_stop for bash" "$TMP/39";
   ok "pre_stop drains before TERM"
 else bad "pre_stop" "exit $c marker=$([ -f $m ] && echo y || echo n): $(tail -2 "$TMP/39")"; fi
 
+# 40. validate: clean config passes, typo'd worker reference fails
+printf "workers=[\"sh -c true\"]\n" > "$TMP/v-ok.toml"
+"$MANDOR" validate --config="$TMP/v-ok.toml" >/dev/null 2>&1
+[ $? -eq 0 ] && ok "validate accepts a sound config" || bad "validate ok" "rc=$?"
+printf "workers=[\"sh -c true\"]\nhealth=[\"nope=/bin/true\"]\n" > "$TMP/v-bad.toml"
+"$MANDOR" validate --config="$TMP/v-bad.toml" >/dev/null 2>&1
+[ $? -ne 0 ] && ok "validate rejects unknown worker reference" || bad "validate typo" "rc=0"
+
+# 41. report --incident=N dumps one bundle as raw JSON
+export MANDOR_STATE_DIR="$TMP/state41"
+timeout 10 "$MANDOR" "sh -c 'exit 3'" >/dev/null 2>&1
+"$MANDOR" report --incident=1 >"$TMP/41" 2>&1
+if head -c1 "$TMP/41" | grep -q '{' && grep -q '"cause_str":"exit:3"' "$TMP/41"; then
+  ok "report --incident=N dumps raw bundle"
+else bad "report --incident" "$(head -c80 "$TMP/41")"; fi
+"$MANDOR" report --incident=99 >/dev/null 2>&1
+[ $? -ne 0 ] && ok "report --incident rejects out-of-range" || bad "incident range" "rc=0"
+unset MANDOR_STATE_DIR
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

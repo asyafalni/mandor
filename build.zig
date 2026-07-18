@@ -6,6 +6,11 @@ pub fn build(b: *std.Build) void {
     const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse
         (optimize != .Debug);
 
+    // Version stamped into the binary; overridable in CI: -Dversion=v0.15.0.
+    const version = b.option([]const u8, "version", "Version string") orelse "0.15.0-dev";
+    const build_opts = b.addOptions();
+    build_opts.addOption([]const u8, "version", version);
+
     const exe = b.addExecutable(.{
         .name = "mandor",
         .root_module = b.createModule(.{
@@ -17,6 +22,7 @@ pub fn build(b: *std.Build) void {
             .error_tracing = false,
         }),
     });
+    exe.root_module.addOptions("build_options", build_opts);
     b.installArtifact(exe);
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });

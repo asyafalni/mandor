@@ -1,0 +1,16 @@
+# Typical web app: an API, a background worker, and a cron loop.
+# Run:  mandor --config=mandor.toml   (or just `mandor` if named mandor.toml)
+restart = "on-failure"
+
+workers = [
+  "./api --port 8080",
+  "./worker",
+  "./cron-loop",
+]
+
+# The worker should only start once the API is accepting connections.
+start_after = ["worker=api"]
+
+# Liveness: mandor restarts the API if this probe fails 3× in a row.
+health = ["api=curl -fsS localhost:8080/healthz"]
+restart_on_unhealthy = true

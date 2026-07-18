@@ -1,0 +1,75 @@
+.TH MANDOR 1 "2026-07-18" "mandor" "User Commands"
+.SH NAME
+mandor \- the foreman for your containers: a tiny PID-1 process supervisor
+.SH SYNOPSIS
+.B mandor
+[\fIflags\fR] [--] \fI"CMD"\fR [\fI"CMD"\fR ...]
+.br
+.B mandor report
+[\fINAME\fR|\fIPID\fR] [\fB--json\fR]
+.br
+.B mandor report --incidents
+[\fINAME\fR] [\fB--since=\fIDUR\fR] [\fB--incident=\fIN\fR]
+.br
+.B mandor validate
+[\fB--config=\fIPATH\fR]
+.br
+.B mandor
+[\fB--help\fR | \fB--version\fR]
+.SH DESCRIPTION
+.B mandor
+runs as PID 1 in a container, spawns worker processes, forwards signals,
+reaps zombies, restarts what crashes, and\(emwhen a worker dies\(emwrites a
+structured JSON incident bundle explaining what happened. It is a single
+static binary (~230 KB), fully offline unless a network feature is configured.
+.PP
+Each \fICMD\fR is one worker: a quoted command line tokenized by mandor (no
+shell required). Workers are named by the basename of their first token.
+.SH COMMON FLAGS
+.TP
+.BR \-\-restart= never|on\-failure|always
+Restart policy (default: never).
+.TP
+.BR \-\-config= PATH
+Load a mandor.toml (default: ./mandor.toml if present).
+.TP
+.BR \-\-health= "\fINAME=CMD\fR"
+Liveness probe for a worker (exit 0 = healthy). Repeatable.
+.TP
+.BR \-\-metrics= PORT
+Serve Prometheus text metrics on 127.0.0.1:PORT.
+.PP
+Advanced flags (\fB--backoff-max\fR, \fB--stop-grace\fR,
+\fB--expected-exit\fR, \fB--max-restarts\fR, \fB--state-dir\fR,
+\fB--ready-fd\fR, \fB--on-incident\fR, \fB--photon\fR) and all TOML-only keys
+are documented in \fBdocs/CONFIG.md\fR.
+.SH SIGNALS
+TERM/INT start graceful shutdown (forwarded to worker process groups; a
+second signal or \fB--stop-grace\fR expiry escalates to KILL). HUP, QUIT,
+USR1, USR2, and WINCH are passed through to workers.
+.SH EXIT STATUS
+The worst worker exit code (128+N for signal deaths), honoring
+\fB--expected-exit\fR; the give-up, essential, or oneshot worker's code when
+those mechanisms trigger; 2 for a configuration or startup error.
+.SH ENVIRONMENT
+.TP
+.B MANDOR_STATE_DIR
+State and incident spool directory (default: /var/lib/mandor).
+.TP
+.B MANDOR_RELEASE ", " GIT_SHA
+Release identifier recorded in incident bundles.
+.TP
+.B PHOTON_TOKEN
+Bearer token for photon OTLP forwarding.
+.SH FILES
+.TP
+.I <state-dir>/state.json
+Live worker status (read by \fBmandor report\fR).
+.TP
+.I <state-dir>/incidents/*.json
+Incident bundles (newest 200 retained).
+.TP
+.I /dev/termination-log
+When present (Kubernetes), receives the latest incident verdict.
+.SH SEE ALSO
+Project home and full documentation: https://github.com/asyafalni/mandor

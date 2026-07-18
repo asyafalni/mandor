@@ -22,8 +22,9 @@ jobs:
 
       - name: Build static binaries
         run: |
-          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -p zig-out/x64
-          zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -p zig-out/a64
+          V="${GITHUB_REF_NAME#v}"
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dversion="$V" -p zig-out/x64
+          zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -Dversion="$V" -p zig-out/a64
           mkdir -p dist/amd64 dist/arm64
           cp zig-out/x64/bin/mandor dist/amd64/mandor
           cp zig-out/a64/bin/mandor dist/arm64/mandor

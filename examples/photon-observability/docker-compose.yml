@@ -1,0 +1,22 @@
+# mandor + photon (sister project): incidents auto-forward to photon over
+# OTLP with a single config key, and a shared volume persists crash history
+# across container restarts. mandor stays offline until `photon` is set.
+services:
+  app:
+    build: .            # image ENTRYPOINT: ["/mandor", "--config=/mandor.toml"]
+    volumes:
+      - mandor-state:/var/lib/mandor
+    environment:
+      - PHOTON_TOKEN=${PHOTON_TOKEN}   # relay sends Authorization: Bearer …
+      - MANDOR_RELEASE=app@1.4.2       # groups incidents by deploy
+
+  photon:
+    image: ghcr.io/nevindra/photon:latest
+    ports: ["8080:8080"]
+
+volumes:
+  mandor-state:
+# mandor.toml inside the app image:
+#   restart = "on-failure"
+#   photon  = "photon:4318"
+#   workers = ["./api --port 3000", "./worker"]

@@ -16,7 +16,20 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
 - Setup code DRY: one table drives all per-worker settings (bad values now
   consistently fail startup).
 
-## [0.13.0] - 2026-07-18
+## [0.15.0] - 2026-07-18
+### Added
+- `mandor validate [--config=PATH]` — dry-run config check (bad values,
+  cycles, and unknown worker references), sharing run()'s exact setup path.
+- `mandor report --incident=N` — dump one bundle raw; incident list now
+  numbered oldest-first.
+- Version stamped into the binary at build time (`-Dversion=`).
+- `docs/mandor.1` man page, `CONTRIBUTING.md`, `examples/` recipes
+  (web+worker+cron, migrations, photon).
+### Changed
+- Setup phase extracted to a shared `applyConfig` so `run` and `validate`
+  can never drift.
+
+## [0.14.0] - 2026-07-18
 ### Added
 - `restart_dependents = true` — OTP `rest_for_one`: a dependency's restart
   recycles its `start_after` dependents (planned, never counted as failure).

@@ -23,14 +23,17 @@ fn rawPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @trap();
 }
 
-const version = "0.1.0-dev";
+const build_options = @import("build_options");
+const version = build_options.version;
 
 const usage_text =
     \\mandor — the foreman for your containers
     \\
     \\usage:
     \\  mandor [flags] [--] "CMD" ["CMD" ...]     supervise workers
-    \\  mandor report [--json | --incidents]      live status / crash history
+    \\  mandor report [NAME|PID] [--json]         live worker status
+    \\  mandor report --incidents [NAME]          crash history (--incident=N dumps one)
+    \\  mandor validate [--config=PATH]           check config without running
     \\  mandor --help | --version
     \\
     \\flags:
@@ -102,7 +105,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const config = @import("config.zig");
     var file_cfg: config.FileConfig = .{};
     var file_cmds: [cli.max_workers][]const u8 = undefined;
-    if (cfg.mode == .supervise) {
+    if (cfg.mode == .supervise or cfg.mode == .validate) {
         var text: ?[]const u8 = null;
         if (cfg.config_path) |path| {
             text = readSmallFile(path, &config_buf) orelse {
@@ -204,11 +207,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             (file_cfg.state_dir orelse cli.default_state_dir));
 
     if (cfg.mode == .report) {
-        if (cfg.incidents) return runIncidentList(state_dir, cfg.report_filter, cfg.since_ms);
+        if (cfg.incidents) return runIncidentList(state_dir, cfg.report_filter, cfg.since_ms, cfg.incident_index);
         return runReport(state_dir, cfg.json, cfg.report_filter);
     }
 
     const supervisor = @import("supervisor.zig");
+    if (cfg.mode == .validate) return supervisor.validate(cfg);
     return supervisor.run(cfg, state_dir, environ);
 }
 
@@ -218,39 +222,56 @@ var incident_entries: [256]@import("spool.zig").DirEntry = undefined;
 
 /// `mandor report --incidents` — recall the spooled history (survives
 /// restarts when the state dir is a mounted volume).
-fn runIncidentList(state_dir: []const u8, filter: ?[]const u8, since_ms: ?u64) u8 {
+fn readIncidentFile(state_dir: []const u8, e: *const @import("spool.zig").DirEntry) ?[]const u8 {
+    const linux = std.os.linux;
+    var path_buf: [640]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
+        state_dir, e.name[0..e.name_len],
+    }) catch return null;
+    const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
+    if (std.posix.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const got = linux.read(fd, &report_read_buf, report_read_buf.len);
+    if (std.posix.errno(got) != .SUCCESS) return null;
+    return report_read_buf[0..got];
+}
+
+/// `mandor report --incidents [NAME] [--since=DUR]` lists history (survives
+/// restarts on a mounted volume); `--incident=N` dumps bundle N raw JSON.
+fn runIncidentList(state_dir: []const u8, filter: ?[]const u8, since_ms: ?u64, index: ?usize) u8 {
     const spool = @import("spool.zig");
     const report = @import("report.zig");
     const supervisor = @import("supervisor.zig");
-    const linux = std.os.linux;
     const cutoff_ms: u64 = if (since_ms) |s| supervisor.wallMs() -| s else 0;
     const n = spool.listIncidents(state_dir, &incident_entries);
     if (n == 0) {
         logmod.print("[mandor] no incidents in {s}/incidents\n", .{state_dir});
         return 0;
     }
+    if (index) |want| {
+        if (want == 0 or want > n) {
+            logmod.print("[mandor] no incident #{d} (have 1..{d})\n", .{ want, n });
+            return 1;
+        }
+        const text = readIncidentFile(state_dir, &incident_entries[want - 1]) orelse return 1;
+        writeOut(text);
+        writeOut("\n");
+        return 0;
+    }
     var out_pos: usize = 0;
     const jb = @import("jsonbuf.zig");
     _ = jb.appendf(&report_out_buf, &out_pos, "{d} incident(s) in {s}/incidents (oldest first)\n\n", .{ n, state_dir });
-    _ = jb.appendf(&report_out_buf, &out_pos, "{s:<21} {s:<14} {s:<14} {s}\n", .{ "TIME", "WORKER", "CAUSE", "VERDICT" });
-    for (incident_entries[0..n]) |*e| {
+    _ = jb.appendf(&report_out_buf, &out_pos, "{s:>3} {s:<21} {s:<14} {s:<14} {s}\n", .{ "#", "TIME", "WORKER", "CAUSE", "VERDICT" });
+    for (incident_entries[0..n], 1..) |*e, idx| {
         if (e.key < cutoff_ms) continue; // filename prefix = epoch ms
-        var path_buf: [640]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
-            state_dir, e.name[0..e.name_len],
-        }) catch continue;
-        const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
-        if (std.posix.errno(rc) != .SUCCESS) continue;
-        const fd: i32 = @intCast(rc);
-        const got = linux.read(fd, &report_read_buf, report_read_buf.len);
-        _ = linux.close(fd);
-        if (std.posix.errno(got) != .SUCCESS) continue;
-        const text = report_read_buf[0..got];
+        const text = readIncidentFile(state_dir, e) orelse continue;
         if (filter) |f| {
             const bname = report.scanStr(text, "name") orelse "";
             if (!std.mem.eql(u8, bname, f)) continue;
         }
-        _ = jb.appendf(&report_out_buf, &out_pos, "{s:<21} {s:<14} {s:<14} {s}\n", .{
+        _ = jb.appendf(&report_out_buf, &out_pos, "{d:>3} {s:<21} {s:<14} {s:<14} {s}\n", .{
+            idx,
             report.scanStr(text, "ts") orelse "?",
             report.scanStr(text, "name") orelse "?",
             report.scanStr(text, "cause_str") orelse "?",

@@ -9,7 +9,7 @@ pub const default_state_dir = "/var/lib/mandor";
 pub const HealthSpec = struct { worker: []const u8, cmd: []const u8 };
 
 pub const RestartPolicy = enum { never, on_failure, always };
-pub const Mode = enum { supervise, report };
+pub const Mode = enum { supervise, report, validate };
 
 pub const Config = struct {
     mode: Mode = .supervise,
@@ -24,6 +24,8 @@ pub const Config = struct {
     report_filter: ?[]const u8 = null,
     /// report --incidents: only bundles newer than now - since.
     since_ms: ?u64 = null,
+    /// report --incident=N: dump the Nth incident bundle (1-based) raw.
+    incident_index: ?usize = null,
     /// null = not given on the CLI; caller resolves env/config/default.
     state_dir: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
@@ -119,6 +121,10 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
             cfg.mode = .report;
             continue;
         }
+        if (arg_idx == 0 and std.mem.eql(u8, arg, "validate")) {
+            cfg.mode = .validate;
+            continue;
+        }
         if (!no_more_flags and std.mem.eql(u8, arg, "--")) {
             no_more_flags = true;
             continue;
@@ -205,6 +211,11 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
             } else if (std.mem.startsWith(u8, arg, "--since=")) {
                 if (cfg.mode != .report) return error.UnknownFlag;
                 cfg.since_ms = parseDuration(arg["--since=".len..]) orelse
+                    return error.BadValue;
+            } else if (std.mem.startsWith(u8, arg, "--incident=")) {
+                if (cfg.mode != .report) return error.UnknownFlag;
+                cfg.incidents = true;
+                cfg.incident_index = std.fmt.parseInt(usize, arg["--incident=".len..], 10) catch
                     return error.BadValue;
             } else {
                 return error.UnknownFlag;

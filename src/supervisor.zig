@@ -36,8 +36,22 @@ pub fn wallMs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 
-pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
-    const workers = workers_buf[0..cfg.commands.len];
+/// Worker-table + per-worker config application shared by run() and
+/// validate(): worker init, the pair-settings table, essential/oneshot
+/// flags, and the start_after dependency graph (with cycle check). Fills
+/// `dep_of`; returns an exit code on any hard error, else null.
+/// Unknown-worker-name references seen during the last applyConfig — a
+/// warning for run() (setting ignored, keep supervising) but a hard failure
+/// for validate() (typo detection is the point).
+var setup_warnings: u32 = 0;
+
+fn applyConfig(
+    cfg: cli.Config,
+    workers: []spawner.Worker,
+    dep_of: *[cli.max_workers]?u8,
+    oneshot_count: *usize,
+) ?u8 {
+    setup_warnings = 0;
     spawner.initWorkers(workers, cfg.commands) catch {
         logmod.print("[mandor] invalid command line\n", .{});
         return 2;
@@ -64,6 +78,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         for (action.pairs) |pair| {
             const w = findWorker(workers, pair.worker) orelse {
                 logmod.print("[mandor] {s}: no worker named {s}\n", .{ action.label, pair.worker });
+                setup_warnings += 1;
                 continue;
             };
             if (!action.apply(w, pair.cmd)) {
@@ -75,44 +90,22 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     for (cfg.essential[0..cfg.essential_n]) |name| {
         if (findWorker(workers, name)) |w| {
             w.essential = true;
-        } else logmod.print("[mandor] essential: no worker named {s}\n", .{name});
+        } else {
+            logmod.print("[mandor] essential: no worker named {s}\n", .{name});
+            setup_warnings += 1;
+        }
     }
-    tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
-    tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
-    var oneshot_count: usize = 0;
+    oneshot_count.* = 0;
     for (cfg.oneshot[0..cfg.oneshot_n]) |name| {
         if (findWorker(workers, name)) |w| {
             w.is_oneshot = true;
-            oneshot_count += 1;
-        } else logmod.print("[mandor] oneshot: no worker named {s}\n", .{name});
-    }
-    const path_env = spawner.findPath(environ);
-    const envp: [*:null]const ?[*:0]const u8 = environ.ptr;
-
-    const sigs = signals.Signals.init() catch {
-        logmod.print("[mandor] cannot create signalfd\n", .{});
-        return 2;
-    };
-
-    incident.initSnapshot(state_dir, environ);
-    if (cfg.on_incident) |cmd| {
-        if (!incident.setHook(cmd)) {
-            logmod.print("[mandor] invalid on-incident command\n", .{});
-            return 2;
+            oneshot_count.* += 1;
+        } else {
+            logmod.print("[mandor] oneshot: no worker named {s}\n", .{name});
+            setup_warnings += 1;
         }
     }
-    if (cfg.photon) |endpoint| {
-        if (@import("relay.zig").parseHostPort(endpoint) == null or !incident.setPhoton(endpoint)) {
-            logmod.print("[mandor] invalid photon endpoint (want ip:port)\n", .{});
-            return 2;
-        }
-        logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
-    }
-    var give_up_code: ?u8 = null;
-
     // start-after ordering: dep_of[i] = worker index i must wait for.
-    var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
-    var waiting: [cli.max_workers]bool = .{false} ** cli.max_workers;
     for (cfg.start_after[0..cfg.start_after_n]) |pair| {
         var dependent: ?usize = null;
         var dependency: ?usize = null;
@@ -137,6 +130,65 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             cur = dep_of[c];
         }
     }
+    if (cfg.on_incident) |cmd| {
+        if (!incident.setHook(cmd)) {
+            logmod.print("[mandor] invalid on-incident command\n", .{});
+            return 2;
+        }
+    }
+    if (cfg.photon) |endpoint| {
+        if (@import("relay.zig").parseHostPort(endpoint) == null) {
+            logmod.print("[mandor] invalid photon endpoint (want ip:port)\n", .{});
+            return 2;
+        }
+    }
+    return null;
+}
+
+/// `mandor validate` — apply the full config to the worker table without
+/// spawning anything, then report. Exit 0 = config is sound.
+pub fn validate(cfg: cli.Config) u8 {
+    const workers = workers_buf[0..cfg.commands.len];
+    var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
+    var oneshot_count: usize = 0;
+    if (applyConfig(cfg, workers, &dep_of, &oneshot_count)) |code| {
+        logmod.print("[mandor] config invalid\n", .{});
+        return code;
+    }
+    if (setup_warnings > 0) {
+        logmod.print("[mandor] config invalid: {d} unknown worker reference(s)\n", .{setup_warnings});
+        return 1;
+    }
+    logmod.print("[mandor] config OK: {d} worker(s)", .{workers.len});
+    if (oneshot_count > 0) logmod.print(", {d} oneshot", .{oneshot_count});
+    logmod.print("\n", .{});
+    return 0;
+}
+
+pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
+    const workers = workers_buf[0..cfg.commands.len];
+    var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
+    var oneshot_count: usize = 0;
+    if (applyConfig(cfg, workers, &dep_of, &oneshot_count)) |code| return code;
+
+    tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
+    tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
+    const path_env = spawner.findPath(environ);
+    const envp: [*:null]const ?[*:0]const u8 = environ.ptr;
+
+    const sigs = signals.Signals.init() catch {
+        logmod.print("[mandor] cannot create signalfd\n", .{});
+        return 2;
+    };
+
+    incident.initSnapshot(state_dir, environ);
+    if (cfg.photon) |endpoint| {
+        _ = incident.setPhoton(endpoint);
+        logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
+    }
+    var give_up_code: ?u8 = null;
+
+    var waiting: [cli.max_workers]bool = .{false} ** cli.max_workers;
 
     var shutting_down = false;
     var kill_escalated = false;
