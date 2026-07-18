@@ -59,7 +59,7 @@ cuts, s6 oneshots, pm2). Strict lowest-hanging-fruit order: build top-down.
 | 23 ✅ | Per-worker `user = "uid:gid"` drop (numeric) | S | ● ● ● ○ | SHIPPED 2026-07-17 — fail-closed (worker exits 126 if the drop fails) |
 | 24 ✅ | `oom_score_adj` / `nice` knobs | XS | ● ● ○ ○ | SHIPPED 2026-07-17 (TOML-only) |
 | ~~25~~ | ~~`replicas = N` scaling~~ | S | — | REJECTED 2026-07-18 (user): replication belongs outside the binary — bash/orchestrator territory |
-| 26 | Watchdog heartbeat over readiness fd | S | ● ○ ○ ○ | Needs app integration; hold until asked |
+| ~~26~~ | ~~Watchdog heartbeat over readiness fd~~ | S | — | REJECTED 2026-07-18 (user): would make worker-code cooperation *load-bearing* for the core restart function — mandor's identity is zero-cooperation supervision. (`ready_fd` stays: it's an optional ordering enhancement, not load-bearing.) Command health checks cover ~90% of hangs with no app changes. |
 
 ## Tier 5 — v0.10 candidates (round-3 research, 2026-07-17)
 
@@ -94,3 +94,10 @@ Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
 - Web GUI / XML-RPC control / remote syslog (Go-supervisord's additions; offline boundary + size)
 - PTY panes à la mprocs (VT100 emulator cost; plain prefixes win for non-interactive)
 - Upstart-style event bus; k8s postStart analog (racy); Nomad poststop phase; namespaces/replica expansion
+- Watchdog/sd_notify heartbeat (would make worker-code cooperation load-bearing for core restart; health checks cover it with zero app changes)
+
+## Backlog status
+
+**Every researched feature is now shipped or rejected — the parked list is
+empty.** Remaining non-feature work: distribution (aports/apt/AUR,
+announcement), v1.0 fuzz-hardening, and the premium sidecar (separate repo).
