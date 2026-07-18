@@ -227,36 +227,9 @@ unchanged — CI runs the full integration harness on all three distro bases.
 
 ## Status
 
-- [x] **v0.1** — multirun parity: spawn, forward signals, reap, restart
-      policies with exponential backoff, worst-exit-code propagation
-- [x] **v0.2** — log capture (ring buffers, `[name]` prefixes), `/proc`
-      sampler, `mandor report`
-- [x] **v0.3** — incident detection with diagnosis verdicts, Go/Rust/Python
-      trace parsing, restart-loop + leak detection, spool dir
-- [x] **v0.4** — cgroup v2 OOM detection, optional Prometheus text endpoint,
-      `mandor.toml` (CLI-only always works)
-- [x] **v0.5** — forensics upgrade: bundle schema v3 (log timestamps,
-      spawn-time snapshot, structured cause + exception, release ids via
-      `MANDOR_RELEASE`, redacted env, siblings, stop-grace, expected-exit,
-      whole-ring log dedup with repeat counts)
-- [x] **v0.6** — liveness: schema v4 with structured trace frames
-      (`function`/`file`/`line`/`in_app`), command health checks catching
-      hung workers, s6-style readiness fd, ELF build-id extraction
-- [x] **v0.7** — start_after ordering, persistent incident history (schema
-      v5), release pipeline (binaries + .deb/.apk/.rpm + ghcr.io image)
-- [x] **v0.8** — max-restarts give-up, on-incident hook, health start-period,
-      oneshot init tasks, per-worker env/cwd
-- [x] **v0.9** — per-worker privilege drop (`user`), OOM-killer steering
-      (`oom_score_adj`/`nice`), Alpine APKBUILD, photon auto-forward
-      (`photon = "ip:port"` — one key, offline otherwise)
-- [x] **v0.10** — k8s termination-log death rattle, recycle thresholds
-      (`max_rss_mb`/`max_lifetime`), per-worker restart overrides; size diet:
-      **487 KB → ~215 KB** via raw panic handler
-- [x] **v0.11** — TTY color prefixes, `env_file`, `essential` leader workers,
-      no-orphan hardening (PDEATHSIG + group sweep), nanozlog-inspired
-      batched capture (one writev per chunk — 6× less kernel time)
-
-Full prioritized list with complexity/value ranking: [docs/ROADMAP.md](docs/ROADMAP.md).
+Actively developed; current release line **v0.11.x**. Version history lives
+in [CHANGELOG.md](CHANGELOG.md); planned and researched-but-parked work in
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Sister project: photon
 
