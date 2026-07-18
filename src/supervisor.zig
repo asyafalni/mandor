@@ -8,6 +8,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const cli = @import("cli.zig");
 const backoff = @import("backoff.zig");
+const detector = @import("detector.zig");
 const signals = @import("signals.zig");
 const spawner = @import("spawner.zig");
 const reaper = @import("reaper.zig");
@@ -66,6 +67,7 @@ fn applyConfig(
         .{ .pairs = cfg.env_pairs[0..cfg.env_pairs_n], .label = "env", .apply = applyEnv },
         .{ .pairs = cfg.cwd_pairs[0..cfg.cwd_pairs_n], .label = "cwd", .apply = applyCwd },
         .{ .pairs = cfg.user_pairs[0..cfg.user_pairs_n], .label = "user", .apply = applyUser },
+        .{ .pairs = cfg.cap_drop_pairs[0..cfg.cap_drop_pairs_n], .label = "cap_drop", .apply = applyCapDrop },
         .{ .pairs = cfg.oom_pairs[0..cfg.oom_pairs_n], .label = "oom_score_adj", .apply = applyOom },
         .{ .pairs = cfg.nice_pairs[0..cfg.nice_pairs_n], .label = "nice", .apply = applyNice },
         .{ .pairs = cfg.max_rss_pairs[0..cfg.max_rss_pairs_n], .label = "max_rss_mb", .apply = applyMaxRss },
@@ -196,6 +198,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     var next_sample_ms: u64 = nowMs() + sampler.interval_ms;
     var sample_tick: u32 = 0;
     var oom_kills: u64 = cgroup.readOomKills() orelse 0;
+    var stall_det: detector.StallState = .{};
     const metrics_server: ?metrics.Server = if (cfg.metrics_port) |port| blk: {
         const srv = metrics.Server.init(port);
         if (srv == null)
@@ -523,14 +526,19 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         if (now_sample >= next_sample_ms) {
             next_sample_ms = now_sample + sampler.interval_ms;
             sample_tick +%= 1;
+            const psi = sampler.readPsi(); // container-wide, read once per tick
             for (workers) |*w| {
                 if (w.pid > 0) {
-                    sampler.sample(&w.stats, w.pid, now_sample);
+                    sampler.sample(&w.stats, w.pid, now_sample, psi);
                     if (w.det.leakCheck(&w.stats, now_sample)) |info|
                         incident.onLeak(state_dir, workers, w, info, now_sample);
                     checkRecycle(w, now_sample);
                 }
             }
+            // PSI stall is container-scoped: check once, attribute the
+            // incident to the largest consumer of the pressured resource.
+            if (stall_det.stallCheck(psi, cfg.psi_mem_pct, cfg.psi_cpu_pct, now_sample)) |res|
+                incident.onStall(state_dir, workers, res, psi, now_sample);
             // Near-zero idle footprint: deaths flush state immediately, so
             // the periodic freshness write only needs to run every 30 s.
             if (sample_tick % 6 == 0) report.writeState(state_dir, workers, now_sample);
@@ -576,6 +584,9 @@ fn applyCwd(w: *spawner.Worker, v: []const u8) bool {
 }
 fn applyUser(w: *spawner.Worker, v: []const u8) bool {
     return spawner.setUser(w, v);
+}
+fn applyCapDrop(w: *spawner.Worker, v: []const u8) bool {
+    return spawner.setCapDrop(w, v);
 }
 fn applyOom(w: *spawner.Worker, v: []const u8) bool {
     w.oom_adj = std.fmt.parseInt(i16, v, 10) catch return false;

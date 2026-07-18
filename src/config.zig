@@ -23,6 +23,8 @@ pub const FileConfig = struct {
     health_start_period_ms: ?u64 = null,
     on_incident: ?[]const u8 = null,
     photon: ?[]const u8 = null,
+    psi_mem_pct: ?u16 = null,
+    psi_cpu_pct: ?u16 = null,
     /// "dependent=dependency" worker-name pairs.
     start_after: [cli.max_workers]cli.HealthSpec = undefined,
     start_after_n: u8 = 0,
@@ -34,6 +36,8 @@ pub const FileConfig = struct {
     oneshot_n: u8 = 0,
     user_pairs: [16]cli.HealthSpec = undefined,
     user_pairs_n: u8 = 0,
+    cap_drop_pairs: [16]cli.HealthSpec = undefined,
+    cap_drop_pairs_n: u8 = 0,
     oom_pairs: [16]cli.HealthSpec = undefined,
     oom_pairs_n: u8 = 0,
     nice_pairs: [16]cli.HealthSpec = undefined,
@@ -53,7 +57,7 @@ pub const FileConfig = struct {
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, oom, nice, max_rss, lifetime, restart_override, essential, pre_stop };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, cap_drop, oom, nice, max_rss, lifetime, restart_override, essential, pre_stop };
 
 /// name=value array keys share one parse shape; map key -> target + slot.
 fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSpec, n: *u8 } {
@@ -63,6 +67,7 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
         .env => .{ .arr = &cfg.env_pairs, .n = &cfg.env_pairs_n },
         .cwd => .{ .arr = &cfg.cwd_pairs, .n = &cfg.cwd_pairs_n },
         .user => .{ .arr = &cfg.user_pairs, .n = &cfg.user_pairs_n },
+        .cap_drop => .{ .arr = &cfg.cap_drop_pairs, .n = &cfg.cap_drop_pairs_n },
         .oom => .{ .arr = &cfg.oom_pairs, .n = &cfg.oom_pairs_n },
         .nice => .{ .arr = &cfg.nice_pairs, .n = &cfg.nice_pairs_n },
         .max_rss => .{ .arr = &cfg.max_rss_pairs, .n = &cfg.max_rss_pairs_n },
@@ -158,6 +163,10 @@ pub fn parse(
             cfg.on_incident = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "photon")) {
             cfg.photon = parseString(value) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "psi_mem_pct")) {
+            cfg.psi_mem_pct = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
+        } else if (std.mem.eql(u8, key, "psi_cpu_pct")) {
+            cfg.psi_cpu_pct = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
         } else if (std.mem.eql(u8, key, "env_file")) {
             cfg.env_file = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "restart_dependents")) {
@@ -204,10 +213,10 @@ fn arrayKey(key: []const u8) ?ArrayTarget {
         .{ "workers", ArrayTarget.workers },         .{ "health", ArrayTarget.health },
         .{ "start_after", ArrayTarget.start_after }, .{ "env", ArrayTarget.env },
         .{ "cwd", ArrayTarget.cwd },                 .{ "oneshot", ArrayTarget.oneshot },
-        .{ "user", ArrayTarget.user },               .{ "oom_score_adj", ArrayTarget.oom },
-        .{ "nice", ArrayTarget.nice },               .{ "max_rss_mb", ArrayTarget.max_rss },
-        .{ "max_lifetime", ArrayTarget.lifetime },   .{ "essential", ArrayTarget.essential },
-        .{ "pre_stop", ArrayTarget.pre_stop },
+        .{ "user", ArrayTarget.user },               .{ "cap_drop", ArrayTarget.cap_drop },
+        .{ "oom_score_adj", ArrayTarget.oom },       .{ "nice", ArrayTarget.nice },
+        .{ "max_rss_mb", ArrayTarget.max_rss },      .{ "max_lifetime", ArrayTarget.lifetime },
+        .{ "essential", ArrayTarget.essential },     .{ "pre_stop", ArrayTarget.pre_stop },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, key, entry[0])) return entry[1];

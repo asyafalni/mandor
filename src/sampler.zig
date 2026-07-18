@@ -17,7 +17,38 @@ pub const Sample = struct {
     cpu_pct: u16 = 0,
     fds: u16 = 0,
     threads: u16 = 0,
+    /// cgroup v2 pressure-stall: "some avg60" ×100 (whole percent) for
+    /// memory / cpu / io. 0 when PSI is unavailable.
+    psi_mem: u16 = 0,
+    psi_cpu: u16 = 0,
+    psi_io: u16 = 0,
 };
+
+/// Parse the `some avg60=` field of a PSI line block, ×100 as whole percent.
+/// Input is the full /proc or cgroup pressure file (memory has some+full;
+/// we take the first "some" line). Fixed scan, no regex.
+pub fn parsePsiAvg60(text: []const u8) u16 {
+    const some = std.mem.indexOf(u8, text, "some ") orelse return 0;
+    const pat = "avg60=";
+    const at = std.mem.indexOfPos(u8, text, some, pat) orelse return 0;
+    var j = at + pat.len;
+    // parse a decimal like 12.34 -> 1234 (percent ×100), clamp to u16
+    var whole: u32 = 0;
+    while (j < text.len and text[j] >= '0' and text[j] <= '9') : (j += 1) {
+        whole = whole * 10 + (text[j] - '0');
+    }
+    var frac: u32 = 0;
+    var fdigits: u32 = 0;
+    if (j < text.len and text[j] == '.') {
+        j += 1;
+        while (j < text.len and text[j] >= '0' and text[j] <= '9' and fdigits < 2) : (j += 1) {
+            frac = frac * 10 + (text[j] - '0');
+            fdigits += 1;
+        }
+    }
+    while (fdigits < 2) : (fdigits += 1) frac *= 10;
+    return @intCast(@min(whole * 100 + frac, std.math.maxInt(u16)));
+}
 
 /// Rolling window of the most recent samples.
 pub const Window = struct {
@@ -117,8 +148,26 @@ fn countFds(pid: i32, path_buf: *[64]u8) u16 {
     return @intCast(@min(count, std.math.maxInt(u16)));
 }
 
+pub const Psi = struct { mem: u16 = 0, cpu: u16 = 0, io: u16 = 0 };
+
+fn readPsiFile(path: [*:0]const u8) u16 {
+    var buf: [256]u8 = undefined;
+    const text = readFile(path, &buf) orelse return 0;
+    return parsePsiAvg60(text);
+}
+
+/// Container-wide pressure (cgroup v2, /proc fallback). Read once per tick —
+/// PSI is cgroup-scoped, not per-process.
+pub fn readPsi() Psi {
+    return .{
+        .mem = readPsiFile("/sys/fs/cgroup/memory.pressure"),
+        .cpu = readPsiFile("/sys/fs/cgroup/cpu.pressure"),
+        .io = readPsiFile("/sys/fs/cgroup/io.pressure"),
+    };
+}
+
 /// Take one sample for a live pid and push it into the window.
-pub fn sample(window: *Window, pid: i32, now_ms: u64) void {
+pub fn sample(window: *Window, pid: i32, now_ms: u64, psi: Psi) void {
     var path_buf: [64]u8 = undefined;
     var stat_buf: [1024]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return;
@@ -137,6 +186,9 @@ pub fn sample(window: *Window, pid: i32, now_ms: u64) void {
         .cpu_pct = pct,
         .fds = countFds(pid, &path_buf),
         .threads = @intCast(@min(fields.threads, std.math.maxInt(u16))),
+        .psi_mem = psi.mem,
+        .psi_cpu = psi.cpu,
+        .psi_io = psi.io,
     });
 }
 
@@ -151,6 +203,14 @@ test "parseStat handles evil comm names" {
     try std.testing.expectEqual(@as(u64, 300), f.stime);
     try std.testing.expectEqual(@as(u64, 7), f.threads);
     try std.testing.expectEqual(@as(u64, 2048), f.rss_pages);
+}
+
+test "parsePsiAvg60 extracts some avg60 as percent x100" {
+    const t = "some avg10=0.04 avg60=12.34 avg300=0.00 total=75201\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
+    try std.testing.expectEqual(@as(u16, 1234), parsePsiAvg60(t));
+    try std.testing.expectEqual(@as(u16, 0), parsePsiAvg60("some avg10=0.0 avg60=0.00 avg300=0.0 total=0"));
+    try std.testing.expectEqual(@as(u16, 10000), parsePsiAvg60("some avg60=100.00 total=1"));
+    try std.testing.expectEqual(@as(u16, 0), parsePsiAvg60("garbage"));
 }
 
 test "parseStat rejects garbage" {
@@ -180,7 +240,7 @@ test "window rolls over keeping newest" {
 test "live sample of our own pid" {
     if (builtin.os.tag != .linux) return;
     var w: Window = .{};
-    sample(&w, @intCast(linux.getpid()), 1000);
+    sample(&w, @intCast(linux.getpid()), 1000, .{});
     try std.testing.expectEqual(@as(usize, 1), w.len);
     try std.testing.expect(w.at(0).rss_kb > 0);
     try std.testing.expect(w.at(0).threads >= 1);

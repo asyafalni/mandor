@@ -58,6 +58,9 @@ pub const Config = struct {
     on_incident: ?[]const u8 = null,
     /// photon OTLP endpoint ("ip:port"); when set, incidents auto-forward.
     photon: ?[]const u8 = null,
+    /// Container-wide PSI stall thresholds (whole percent; 0 = off).
+    psi_mem_pct: u16 = 0,
+    psi_cpu_pct: u16 = 0,
     /// Per-worker extras (TOML-only): "name=KEY=VAL" env pairs, "name=/path"
     /// working dirs, and names of workers that are one-shot init tasks.
     env_pairs: [64]HealthSpec = undefined,
@@ -69,6 +72,8 @@ pub const Config = struct {
     /// "name=uid:gid" privilege drops (numeric only — scratch has no passwd).
     user_pairs: [16]HealthSpec = undefined,
     user_pairs_n: u8 = 0,
+    cap_drop_pairs: [16]HealthSpec = undefined,
+    cap_drop_pairs_n: u8 = 0,
     oom_pairs: [16]HealthSpec = undefined,
     oom_pairs_n: u8 = 0,
     nice_pairs: [16]HealthSpec = undefined,
@@ -165,6 +170,12 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
                 const v = arg["--photon=".len..];
                 if (v.len == 0) return error.BadValue;
                 cfg.photon = v;
+            } else if (std.mem.startsWith(u8, arg, "--psi-mem=")) {
+                cfg.psi_mem_pct = std.fmt.parseInt(u16, arg["--psi-mem=".len..], 10) catch
+                    return error.BadValue;
+            } else if (std.mem.startsWith(u8, arg, "--psi-cpu=")) {
+                cfg.psi_cpu_pct = std.fmt.parseInt(u16, arg["--psi-cpu=".len..], 10) catch
+                    return error.BadValue;
             } else if (std.mem.startsWith(u8, arg, "--health=")) {
                 const v = arg["--health=".len..];
                 const eq2 = std.mem.indexOfScalar(u8, v, '=') orelse return error.BadValue;

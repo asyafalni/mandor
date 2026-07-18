@@ -14,6 +14,36 @@ pub const dedup_cooldown_ms: u64 = 10 * 60 * 1000;
 
 pub const LeakInfo = struct { growth_mb: u64, minutes: u64 };
 
+pub const stall_min_consecutive: u8 = 3; // sustained, not a transient spike
+pub const stall_cooldown_ms: u64 = 15 * 60 * 1000;
+pub const StallKind = enum { memory, cpu };
+
+/// Container-wide pressure-stall detector: fires when "some avg60" for a
+/// resource stays above its threshold for N consecutive ticks. Fixed state,
+/// no allocation; one instance for the whole supervisor.
+pub const StallState = struct {
+    mem_streak: u8 = 0,
+    cpu_streak: u8 = 0,
+    fired_at_ms: u64 = 0,
+
+    /// thresholds are whole-percent (0 = disabled). Returns the stalled
+    /// resource once its streak crosses the bar, honoring the cooldown.
+    pub fn stallCheck(self: *StallState, psi: sampler.Psi, mem_pct: u16, cpu_pct: u16, now_ms: u64) ?StallKind {
+        self.mem_streak = if (mem_pct > 0 and psi.mem >= mem_pct *| 100) self.mem_streak +| 1 else 0;
+        self.cpu_streak = if (cpu_pct > 0 and psi.cpu >= cpu_pct *| 100) self.cpu_streak +| 1 else 0;
+        if (self.fired_at_ms != 0 and now_ms -| self.fired_at_ms < stall_cooldown_ms) return null;
+        if (self.mem_streak >= stall_min_consecutive) {
+            self.fired_at_ms = now_ms;
+            return .memory;
+        }
+        if (self.cpu_streak >= stall_min_consecutive) {
+            self.fired_at_ms = now_ms;
+            return .cpu;
+        }
+        return null;
+    }
+};
+
 pub const State = struct {
     death_times: [restart_loop_threshold]u64 = .{0} ** restart_loop_threshold,
     death_next: u8 = 0,
@@ -141,6 +171,24 @@ test "leak does not fire on flat or sawtooth rss" {
     var w2: sampler.Window = .{};
     for (0..10) |i| w2.push(.{ .t_ms = i * 5_000, .rss_kb = 100 * 1024 });
     try t.expectEqual(@as(?LeakInfo, null), s.leakCheck(&w2, 60_000));
+}
+
+test "stall fires after sustained pressure, respects cooldown, resets on relief" {
+    var s: StallState = .{};
+    // below threshold: nothing
+    try t.expectEqual(@as(?StallKind, null), s.stallCheck(.{ .mem = 5000 }, 80, 0, 1000));
+    // over 80% but not yet sustained
+    try t.expectEqual(@as(?StallKind, null), s.stallCheck(.{ .mem = 9000 }, 80, 0, 2000));
+    try t.expectEqual(@as(?StallKind, null), s.stallCheck(.{ .mem = 9000 }, 80, 0, 3000));
+    try t.expectEqual(@as(?StallKind, .memory), s.stallCheck(.{ .mem = 9000 }, 80, 0, 4000));
+    // cooldown suppresses immediate refire
+    try t.expectEqual(@as(?StallKind, null), s.stallCheck(.{ .mem = 9000 }, 80, 0, 5000));
+    // relief resets the streak
+    try t.expectEqual(@as(?StallKind, null), s.stallCheck(.{ .mem = 100 }, 80, 0, 6000));
+    try t.expectEqual(@as(u8, 0), s.mem_streak);
+    // disabled threshold never fires
+    var s2: StallState = .{};
+    try t.expectEqual(@as(?StallKind, null), s2.stallCheck(.{ .mem = 9000 }, 0, 0, 1000));
 }
 
 test "dedup suppresses identical signature within cooldown" {

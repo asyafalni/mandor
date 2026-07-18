@@ -8,7 +8,7 @@ const sampler = @import("sampler.zig");
 const ring = @import("ring.zig");
 const summarize = @import("summarize.zig");
 
-pub const bundle_version = 5;
+pub const bundle_version = 6;
 
 // ------------------------------------------------------- wall clock
 
@@ -101,6 +101,7 @@ pub const BundleInput = struct {
     build_id: []const u8 = "", // hex GNU build-id of the resolved exe
     environ: [:null]const ?[*:0]const u8 = &empty_environ,
     limits_nofile: u64 = 0,
+    limits_core: u64 = 0,
     memory_max_bytes: ?u64 = null,
     cause: CauseInfo,
     cause_str: []const u8, // v1-compatible mirror for the sidecar transition
@@ -160,8 +161,8 @@ pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
         if (!jb.appendJsonString(buf, p, value)) return null;
         env_n += 1;
     }
-    if (!jb.appendf(buf, p, "}},\"limits\":{{\"nofile\":{d},\"memory_max_bytes\":", .{
-        in.limits_nofile,
+    if (!jb.appendf(buf, p, "}},\"limits\":{{\"nofile\":{d},\"core\":{d},\"memory_max_bytes\":", .{
+        in.limits_nofile, in.limits_core,
     })) return null;
     if (in.memory_max_bytes) |m| {
         if (!jb.appendf(buf, p, "{d}}}}},", .{m})) return null;
@@ -228,8 +229,9 @@ pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
     for (in.stats, 0..) |s, i| {
         if (i > 0 and !jb.appendf(buf, p, ",", .{})) return null;
         const dt_s = (in.now_ms -| s.t_ms) / 1000;
-        if (!jb.appendf(buf, p, "{{\"t\":\"-{d}s\",\"rss_mb\":{d},\"cpu_pct\":{d}}}", .{
-            dt_s, s.rss_kb / 1024, s.cpu_pct,
+        // psi_* are whole-percent ×100; emit as a plain percent integer.
+        if (!jb.appendf(buf, p, "{{\"t\":\"-{d}s\",\"rss_mb\":{d},\"cpu_pct\":{d},\"psi_mem\":{d},\"psi_cpu\":{d},\"psi_io\":{d}}}", .{
+            dt_s, s.rss_kb / 1024, s.cpu_pct, s.psi_mem / 100, s.psi_cpu / 100, s.psi_io / 100,
         })) return null;
     }
     if (!jb.appendf(buf, p, "],\"siblings\":[", .{})) return null;
@@ -400,7 +402,7 @@ test "envRedacted heuristics" {
     try std.testing.expect(!envRedacted("GOMAXPROCS"));
 }
 
-test "bundle golden output locks schema v4" {
+test "bundle golden output locks schema v6" {
     const frames = [_]summarize.Frame{
         .{ .function = "main.crash", .file = "main.go", .line = 10, .in_app = true },
         .{ .function = "runtime.gopanic", .file = "/usr/local/go/src/runtime/panic.go", .line = 770, .in_app = false },
@@ -411,7 +413,7 @@ test "bundle golden output locks schema v4" {
         .{ .text = "panic: nil deref", .flags = ring.flag_stderr, .first_t_ms = 1_784_328_422_881, .last_t_ms = 1_784_328_422_881, .count = 1 },
     };
     const stats = [_]sampler.Sample{
-        .{ .t_ms = 40_000, .rss_kb = 831_488, .cpu_pct = 97 },
+        .{ .t_ms = 40_000, .rss_kb = 831_488, .cpu_pct = 97, .psi_mem = 4250, .psi_cpu = 1200, .psi_io = 0 },
     };
     const environ = [_:null]?[*:0]const u8{ "PORT=8080", "DB_PASSWORD=hunter2" };
     const siblings = [_]Sibling{
@@ -433,6 +435,7 @@ test "bundle golden output locks schema v4" {
         .build_id = "a1b2c3d4",
         .environ = &environ,
         .limits_nofile = 1024,
+        .limits_core = 0,
         .memory_max_bytes = 536_870_912,
         .cause = .{
             .kind = "signal",
@@ -459,12 +462,12 @@ test "bundle golden output locks schema v4" {
         .verdict = "go panic in main.crash",
     }).?;
     const expected =
-        "{\"v\":5,\"ts\":\"2026-07-17T22:47:03Z\"," ++
+        "{\"v\":6,\"ts\":\"2026-07-17T22:47:03Z\"," ++
         "\"process\":{\"name\":\"api\",\"cmd\":\"./api --port 8080\",\"pid\":42,\"restarts\":3," ++
         "\"cwd\":\"/app\",\"exe\":\"/app/api\",\"spawned_at\":\"2026-07-17T22:46:16Z\",\"uptime_s\":47," ++
         "\"ready\":true,\"build\":{\"release\":\"api@1.4.2\",\"elf_build_id\":\"a1b2c3d4\"}," ++
         "\"env\":{\"PORT\":\"8080\",\"DB_PASSWORD\":\"<redacted>\"}," ++
-        "\"limits\":{\"nofile\":1024,\"memory_max_bytes\":536870912}}," ++
+        "\"limits\":{\"nofile\":1024,\"core\":0,\"memory_max_bytes\":536870912}}," ++
         "\"cause\":{\"kind\":\"signal\",\"exit_code\":null,\"signal\":{\"num\":11,\"name\":\"SIGSEGV\"}," ++
         "\"core_dumped\":true,\"oom_kill_delta\":0},\"cause_str\":\"signal:SIGSEGV\"," ++
         "\"exception\":{\"type\":\"runtime error\",\"message\":\"nil deref\"}," ++
@@ -478,7 +481,7 @@ test "bundle golden output locks schema v4" {
         "{\"t\":\"2026-07-17T22:47:00.500Z\",\"s\":\"O\",\"err\":false,\"line\":\"listening on :8080\"}," ++
         "{\"t\":\"2026-07-17T22:47:02.881Z\",\"s\":\"E\",\"err\":true,\"line\":\"panic: nil deref\"}]," ++
         "\"logs_dropped\":3," ++
-        "\"stats_timeline\":[{\"t\":\"-60s\",\"rss_mb\":812,\"cpu_pct\":97}]," ++
+        "\"stats_timeline\":[{\"t\":\"-60s\",\"rss_mb\":812,\"cpu_pct\":97,\"psi_mem\":42,\"psi_cpu\":12,\"psi_io\":0}]," ++
         "\"siblings\":[{\"name\":\"worker\",\"state\":\"running\",\"uptime_s\":3600,\"restarts\":0}]," ++
         "\"history\":{\"signature\":\"deadbeef12345678\",\"first_seen\":\"2026-07-16T22:47:03Z\",\"count\":5}," ++
         "\"verdict\":\"go panic in main.crash\"}";

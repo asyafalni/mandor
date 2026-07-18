@@ -154,6 +154,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
             if (cfg.photon == null) cfg.photon = file_cfg.photon;
+            if (cfg.psi_mem_pct == 0) {
+                if (file_cfg.psi_mem_pct) |v| cfg.psi_mem_pct = v;
+            }
+            if (cfg.psi_cpu_pct == 0) {
+                if (file_cfg.psi_cpu_pct) |v| cfg.psi_cpu_pct = v;
+            }
             cfg.essential = file_cfg.essential;
             cfg.essential_n = file_cfg.essential_n;
             if (file_cfg.restart_dependents) |b| cfg.restart_dependents = b;
@@ -168,6 +174,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.oneshot_n = file_cfg.oneshot_n;
             cfg.user_pairs = file_cfg.user_pairs;
             cfg.user_pairs_n = file_cfg.user_pairs_n;
+            cfg.cap_drop_pairs = file_cfg.cap_drop_pairs;
+            cfg.cap_drop_pairs_n = file_cfg.cap_drop_pairs_n;
             cfg.oom_pairs = file_cfg.oom_pairs;
             cfg.oom_pairs_n = file_cfg.oom_pairs_n;
             cfg.nice_pairs = file_cfg.nice_pairs;
@@ -334,6 +342,7 @@ test {
     _ = @import("parsers/node.zig");
     _ = @import("parsers/java.zig");
     _ = @import("parsers/zigp.zig");
+    _ = @import("caps.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

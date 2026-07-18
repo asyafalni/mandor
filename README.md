@@ -165,6 +165,8 @@ oneshot = ["migrate"]          # init tasks run first; failure aborts startup
 env = ["api=PORT=8080"]        # per-worker environment additions
 cwd = ["api=/srv/app"]         # per-worker working directory
 user = ["api=1000:1000"]       # drop root before exec (numeric uid:gid)
+cap_drop = ["api=all"]         # drop Linux capabilities + set no_new_privs
+psi_mem_pct = 80               # incident if container memory pressure sustains >80%
 essential = ["api"]            # api exiting stops everything (leader)
 env_file = ".env"              # KEY=VAL lines for all workers
 max_rss_mb = ["api=768"]       # recycle worker beyond this RSS (planned, not a failure)

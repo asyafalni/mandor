@@ -42,6 +42,7 @@ var snap_environ: [:null]const ?[*:0]const u8 = &spool.empty_environ;
 var snap_cwd_buf: [512]u8 = undefined;
 var snap_cwd_len: usize = 0;
 var snap_nofile: u64 = 0;
+var snap_core: u64 = 0;
 var snap_memory_max: ?u64 = null;
 var snap_release: []const u8 = "";
 
@@ -133,6 +134,9 @@ pub fn initSnapshot(state_dir: []const u8, environ: [:null]const ?[*:0]const u8)
     if (std.posix.errno(rc) == .SUCCESS and rc > 0) snap_cwd_len = rc - 1; // drop NUL
     if (std.posix.getrlimit(.NOFILE)) |lim| {
         snap_nofile = @intCast(@min(lim.cur, std.math.maxInt(u63)));
+    } else |_| {}
+    if (std.posix.getrlimit(.CORE)) |lim| {
+        snap_core = @intCast(@min(lim.cur, std.math.maxInt(u63)));
     } else |_| {}
     snap_memory_max = cgroup.readMemoryMax();
     snap_release = spawner.findEnv(environ, "MANDOR_RELEASE") orelse
@@ -275,6 +279,7 @@ pub fn onDeath(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Wor
         .build_id = w.build_id_buf[0..w.build_id_len],
         .environ = snap_environ,
         .limits_nofile = snap_nofile,
+        .limits_core = snap_core,
         .memory_max_bytes = snap_memory_max,
         .cause = cause,
         .cause_str = cause_str,
@@ -322,6 +327,7 @@ fn commonInput(
         .build_id = w.build_id_buf[0..w.build_id_len],
         .environ = snap_environ,
         .limits_nofile = snap_nofile,
+        .limits_core = snap_core,
         .memory_max_bytes = snap_memory_max,
         .cause = .{ .kind = kind },
         .cause_str = kind,
@@ -386,5 +392,35 @@ pub fn onLeak(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Work
     in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);
     in.verdict = summarize.verdictLeak(&verdict_buf, info.growth_mb, info.minutes);
+    writeBundle(state_dir, in);
+}
+
+/// Container-wide PSI stall: attribute to the largest live consumer of the
+/// pressured resource (RSS for memory, CPU% for cpu) as the likely culprit.
+pub fn onStall(state_dir: []const u8, workers: []spawner.Worker, kind: detector.StallKind, psi: sampler.Psi, now_ms: u64) void {
+    var culprit: ?*spawner.Worker = null;
+    var best: u64 = 0;
+    for (workers) |*w| {
+        if (w.pid <= 0 or w.stats.len == 0) continue;
+        const s = w.stats.at(w.stats.len - 1);
+        const metric: u64 = if (kind == .memory) s.rss_kb else s.cpu_pct;
+        if (metric >= best) {
+            best = metric;
+            culprit = w;
+        }
+    }
+    const w = culprit orelse return; // no live workers → nothing to blame
+    total += 1;
+    const cause_str: []const u8 = if (kind == .memory) "stall:memory" else "stall:cpu";
+    var in = commonInput(workers, w, now_ms, cause_str, w.pid);
+    const hist = recordKindHistory(state_dir, cause_str, w);
+    in.history_sig = hist.sig;
+    in.history_first_epoch = hist.first_seen;
+    in.history_count = hist.count;
+    in.logs_tail = collectCompact(w);
+    in.logs_dropped = compactor.dropped;
+    in.stats = collectStats(w);
+    const pct: u16 = if (kind == .memory) psi.mem / 100 else psi.cpu / 100;
+    in.verdict = summarize.verdictStall(&verdict_buf, cause_str, pct, w.nameSlice());
     writeBundle(state_dir, in);
 }

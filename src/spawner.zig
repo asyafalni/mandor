@@ -10,6 +10,7 @@ const ring = @import("ring.zig");
 const sampler = @import("sampler.zig");
 const detector = @import("detector.zig");
 const elf = @import("elf.zig");
+const caps = @import("caps.zig");
 
 pub const max_args = 64;
 pub const name_cap = 32;
@@ -63,6 +64,10 @@ pub const Worker = struct {
     is_oneshot: bool = false,
     drop_uid: ?u32 = null,
     drop_gid: ?u32 = null,
+    /// Capability bits to drop from the bounding set; drop_all_caps drops
+    /// every known cap (cap_drop = "all").
+    cap_drop_mask: u64 = 0,
+    drop_all_caps: bool = false,
     oom_adj: ?i16 = null, // -1000..1000, written to /proc/self/oom_score_adj
     nice_val: ?i8 = null,
     max_rss_kb: ?u64 = null, // planned recycle thresholds
@@ -152,6 +157,8 @@ fn resetWorker(w: *Worker) void {
     w.is_oneshot = false;
     w.drop_uid = null;
     w.drop_gid = null;
+    w.cap_drop_mask = 0;
+    w.drop_all_caps = false;
     w.oom_adj = null;
     w.nice_val = null;
     w.max_rss_kb = null;
@@ -199,6 +206,22 @@ pub fn setUser(w: *Worker, spec: []const u8) bool {
     const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return false;
     w.drop_uid = std.fmt.parseInt(u32, spec[0..colon], 10) catch return false;
     w.drop_gid = std.fmt.parseInt(u32, spec[colon + 1 ..], 10) catch return false;
+    return true;
+}
+
+/// Comma-separated capability names to drop from the bounding set, or "all".
+pub fn setCapDrop(w: *Worker, spec: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(spec, "all")) {
+        w.drop_all_caps = true;
+        return true;
+    }
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |raw| {
+        const name = std.mem.trim(u8, raw, " ");
+        if (name.len == 0) continue;
+        const b = caps.bit(name) orelse return false;
+        w.cap_drop_mask |= @as(u64, 1) << b;
+    }
     return true;
 }
 
@@ -414,6 +437,7 @@ pub fn spawn(
                 linux.exit(126);
             }
         }
+        applyHardening(w);
         execChild(w, child_envp, path_env);
     }
     // Parent sets it too — whichever side wins the race, the group exists
@@ -491,6 +515,27 @@ fn mergeEnv(envp: [*:null]const ?[*:0]const u8, w: *const Worker) [*:null]const 
     }
     merged_env[n] = null;
     return @ptrCast(&merged_env);
+}
+
+/// Post-drop, pre-exec hardening (child only). cap_drop shrinks the
+/// bounding set; no_new_privs is set unconditionally once a uid is dropped
+/// so a setuid binary can never re-escalate. Best-effort: a container that
+/// forbids these keeps running (worse case = no extra hardening).
+fn applyHardening(w: *const Worker) void {
+    if (w.drop_all_caps) {
+        var b: u8 = 0;
+        while (b <= caps.last_cap) : (b += 1) {
+            _ = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), b, 0, 0, 0);
+        }
+    } else if (w.cap_drop_mask != 0) {
+        var b: u6 = 0;
+        while (b < 64) : (b += 1) {
+            if (w.cap_drop_mask & (@as(u64, 1) << b) != 0)
+                _ = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), b, 0, 0, 0);
+        }
+    }
+    if (w.drop_uid != null or w.drop_all_caps or w.cap_drop_mask != 0)
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
 }
 
 fn closePair(pair: ?capture.PipePair) void {

@@ -349,6 +349,12 @@ pub fn verdictUnhealthy(buf: []u8, fails: u8, uptime_s: u64) []const u8 {
     }) catch "alive but unhealthy";
 }
 
+pub fn verdictStall(buf: []u8, cause: []const u8, pct: u16, culprit: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s} — container under sustained pressure ({d}% avg60); largest consumer: {s}", .{
+        cause, pct, culprit,
+    }) catch cause;
+}
+
 pub fn verdictLeak(buf: []u8, growth_mb: u64, minutes: u64) []const u8 {
     const rate10 = if (minutes == 0) 0 else growth_mb * 10 / minutes;
     return std.fmt.bufPrint(buf, "RSS grew ~{d}.{d}MB/min for {d}min (+{d}MB) — leak suspect", .{

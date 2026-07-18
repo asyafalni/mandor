@@ -102,7 +102,7 @@ export MANDOR_STATE_DIR="$TMP/state2"
 timeout 10 "$MANDOR" "sh $TMP/crash_go.sh" >"$TMP/11" 2>&1
 c=$?
 f=$(ls "$TMP/state2/incidents/"*.json 2>/dev/null | head -1)
-if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":5' "$f" \
+if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":6' "$f" \
    && grep -q '"kind":"exit"' "$f" && grep -q '"exit_code":2' "$f" \
    && grep -q '"cause_str":"exit:2"' "$f" \
    && grep -q '"lang":"go"' "$f" \
@@ -110,9 +110,9 @@ if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":5' "$f" \
    && grep -q '"type":"runtime error"' "$f" \
    && grep -q '"exe":"[^"]*/sh"' "$f" \
    && grep -q 'go panic in main.crash' "$f"; then
-  ok "incident bundle v4: structured frames + exception + verdict"
+  ok "incident bundle v6: structured frames + exception + verdict"
 else
-  bad "incident bundle v4" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
+  bad "incident bundle v6" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
 fi
 unset MANDOR_STATE_DIR
 
@@ -494,6 +494,30 @@ if head -c1 "$TMP/41" | grep -q '{' && grep -q '"cause_str":"exit:3"' "$TMP/41";
 else bad "report --incident" "$(head -c80 "$TMP/41")"; fi
 "$MANDOR" report --incident=99 >/dev/null 2>&1
 [ $? -ne 0 ] && ok "report --incident rejects out-of-range" || bad "incident range" "rc=0"
+unset MANDOR_STATE_DIR
+
+# 44. cap_drop + no_new_privs: worker cannot regain privs (root only)
+if [ "$(id -u)" -eq 0 ]; then
+  cat > "$TMP/cap.toml" <<'TOML'
+workers = ["sh -c 'cat /proc/self/status | grep NoNewPrivs'"]
+user = ["sh=12345:12345"]
+cap_drop = ["sh=all"]
+TOML
+  timeout 10 "$MANDOR" --config="$TMP/cap.toml" >"$TMP/44" 2>&1
+  if grep -q "NoNewPrivs:.*1" "$TMP/44"; then ok "no_new_privs set after user+cap_drop"
+  else bad "no_new_privs" "$(grep NoNewPrivs "$TMP/44")"; fi
+else
+  echo "skip cap_drop/no_new_privs (not root)"
+fi
+
+# 45. PSI fields present in the incident bundle stats timeline (schema v6).
+# Worker lives past the first 5s sample so stats_timeline is populated.
+export MANDOR_STATE_DIR="$TMP/state45"
+timeout 12 "$MANDOR" "sh -c 'sleep 6; exit 3'" >/dev/null 2>&1
+f=$(ls "$TMP/state45/incidents/"*.json 2>/dev/null | head -1)
+if [ -n "$f" ] && grep -q '"v":6' "$f" && grep -q '"psi_mem"' "$f" && grep -q '"core":' "$f"; then
+  ok "bundle v6 carries psi_mem + limits.core"
+else bad "psi/core in bundle" "$(head -c 200 "$f" 2>/dev/null)"; fi
 unset MANDOR_STATE_DIR
 
 echo

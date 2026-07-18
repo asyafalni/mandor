@@ -16,6 +16,21 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
 - Setup code DRY: one table drives all per-worker settings (bad values now
   consistently fail startup).
 
+## [0.16.0] - 2026-07-18
+### Added
+- PSI stall detection: samples cgroup v2 memory/cpu/io pressure once per
+  tick; `psi_mem_pct`/`psi_cpu_pct` thresholds raise a `stall:memory|cpu`
+  incident attributed to the largest consumer. PSI recorded in every
+  bundle stats timeline (schema v6).
+- Per-worker `cap_drop` (capability bounding-set drop; names or "all") plus
+  automatic `no_new_privs` after a uid drop — closes the setuid
+  re-escalation hole. No libcap dependency.
+- `limits.core` (RLIMIT_CORE) in bundles, alongside the existing
+  core_dumped flag.
+### Notes
+- #37 JSON supervisor-log folded into existing paths: offline = plain
+  `[mandor]` stdout lines; online = photon. No separate sink built.
+
 ## [0.15.0] - 2026-07-18
 ### Added
 - `mandor validate [--config=PATH]` — dry-run config check (bad values,
