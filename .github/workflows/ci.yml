@@ -96,11 +96,12 @@ jobs:
 
       - name: Run harness
         run: |
-          set -o pipefail
           chmod +x zig-out/bin/mandor
-          bash test/harness/run_tests.sh 2>&1 | tee /tmp/harness.log || {
-            grep -E "FAIL" /tmp/harness.log | while read -r line; do
-              echo "::error::${line}"
-            done
-            exit 1
-          }
+          bash -x test/harness/run_tests.sh > /tmp/harness.log 2>&1
+          rc=$?
+          echo "harness exit=$rc"
+          tail -25 /tmp/harness.log
+          if [ "$rc" -ne 0 ]; then
+            tail -25 /tmp/harness.log | while IFS= read -r line; do echo "::error::${line}"; done
+            exit "$rc"
+          fi
