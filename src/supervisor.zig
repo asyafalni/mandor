@@ -42,80 +42,35 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         logmod.print("[mandor] invalid command line\n", .{});
         return 2;
     };
-    for (cfg.env_pairs[0..cfg.env_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            if (!spawner.addEnv(w, pair.cmd))
-                logmod.print("[mandor] env overflow for {s}\n", .{pair.worker});
-        } else logmod.print("[mandor] env: no worker named {s}\n", .{pair.worker});
-    }
-    for (cfg.cwd_pairs[0..cfg.cwd_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            if (!spawner.setCwd(w, pair.cmd))
-                logmod.print("[mandor] cwd too long for {s}\n", .{pair.worker});
-        } else logmod.print("[mandor] cwd: no worker named {s}\n", .{pair.worker});
-    }
-    for (cfg.user_pairs[0..cfg.user_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            if (!spawner.setUser(w, pair.cmd)) {
-                logmod.print("[mandor] user: bad uid:gid for {s}\n", .{pair.worker});
+    // One table drives every "name=value" per-worker setting: unknown worker
+    // warns, bad value fails startup (fail-fast on typos beats silence).
+    const pair_actions = [_]struct {
+        pairs: []const cli.HealthSpec,
+        label: []const u8,
+        apply: *const fn (*spawner.Worker, []const u8) bool,
+    }{
+        .{ .pairs = cfg.env_pairs[0..cfg.env_pairs_n], .label = "env", .apply = applyEnv },
+        .{ .pairs = cfg.cwd_pairs[0..cfg.cwd_pairs_n], .label = "cwd", .apply = applyCwd },
+        .{ .pairs = cfg.user_pairs[0..cfg.user_pairs_n], .label = "user", .apply = applyUser },
+        .{ .pairs = cfg.oom_pairs[0..cfg.oom_pairs_n], .label = "oom_score_adj", .apply = applyOom },
+        .{ .pairs = cfg.nice_pairs[0..cfg.nice_pairs_n], .label = "nice", .apply = applyNice },
+        .{ .pairs = cfg.max_rss_pairs[0..cfg.max_rss_pairs_n], .label = "max_rss_mb", .apply = applyMaxRss },
+        .{ .pairs = cfg.lifetime_pairs[0..cfg.lifetime_pairs_n], .label = "max_lifetime", .apply = applyLifetime },
+        .{ .pairs = cfg.restart_pairs[0..cfg.restart_pairs_n], .label = "restart", .apply = applyRestart },
+        .{ .pairs = cfg.prestop_pairs[0..cfg.prestop_pairs_n], .label = "pre_stop", .apply = applyPreStop },
+        .{ .pairs = cfg.health[0..cfg.health_n], .label = "health", .apply = applyHealth },
+    };
+    for (pair_actions) |action| {
+        for (action.pairs) |pair| {
+            const w = findWorker(workers, pair.worker) orelse {
+                logmod.print("[mandor] {s}: no worker named {s}\n", .{ action.label, pair.worker });
+                continue;
+            };
+            if (!action.apply(w, pair.cmd)) {
+                logmod.print("[mandor] {s}: bad value for {s}\n", .{ action.label, pair.worker });
                 return 2;
             }
-        } else logmod.print("[mandor] user: no worker named {s}\n", .{pair.worker});
-    }
-    for (cfg.oom_pairs[0..cfg.oom_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            w.oom_adj = std.fmt.parseInt(i16, pair.cmd, 10) catch {
-                logmod.print("[mandor] oom_score_adj: bad value for {s}\n", .{pair.worker});
-                return 2;
-            };
-        } else logmod.print("[mandor] oom_score_adj: no worker named {s}\n", .{pair.worker});
-    }
-    for (cfg.nice_pairs[0..cfg.nice_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            w.nice_val = std.fmt.parseInt(i8, pair.cmd, 10) catch {
-                logmod.print("[mandor] nice: bad value for {s}\n", .{pair.worker});
-                return 2;
-            };
-        } else logmod.print("[mandor] nice: no worker named {s}\n", .{pair.worker});
-    }
-    for (cfg.max_rss_pairs[0..cfg.max_rss_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            const mb = std.fmt.parseInt(u64, pair.cmd, 10) catch {
-                logmod.print("[mandor] max_rss_mb: bad value for {s}\n", .{pair.worker});
-                return 2;
-            };
-            w.max_rss_kb = mb * 1024;
-        } else logmod.print("[mandor] max_rss_mb: no worker named {s}\n", .{pair.worker});
-    }
-    for (cfg.lifetime_pairs[0..cfg.lifetime_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            w.max_lifetime_ms = cli.parseDuration(pair.cmd) orelse {
-                logmod.print("[mandor] max_lifetime: bad value for {s}\n", .{pair.worker});
-                return 2;
-            };
-        } else logmod.print("[mandor] max_lifetime: no worker named {s}\n", .{pair.worker});
-    }
-    for (cfg.restart_pairs[0..cfg.restart_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            w.restart_override = if (std.mem.eql(u8, pair.cmd, "never"))
-                .never
-            else if (std.mem.eql(u8, pair.cmd, "on-failure"))
-                .on_failure
-            else if (std.mem.eql(u8, pair.cmd, "always"))
-                .always
-            else {
-                logmod.print("[mandor] restart: bad value for {s}\n", .{pair.worker});
-                return 2;
-            };
-        } else logmod.print("[mandor] restart: no worker named {s}\n", .{pair.worker});
-    }
-    for (cfg.prestop_pairs[0..cfg.prestop_pairs_n]) |pair| {
-        if (findWorker(workers, pair.worker)) |w| {
-            spawner.setPreStop(w, pair.cmd) catch {
-                logmod.print("[mandor] invalid pre_stop command for {s}\n", .{pair.worker});
-                return 2;
-            };
-        } else logmod.print("[mandor] pre_stop: no worker named {s}\n", .{pair.worker});
+        }
     }
     for (cfg.essential[0..cfg.essential_n]) |name| {
         if (findWorker(workers, name)) |w| {
@@ -130,21 +85,6 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             w.is_oneshot = true;
             oneshot_count += 1;
         } else logmod.print("[mandor] oneshot: no worker named {s}\n", .{name});
-    }
-    for (cfg.health[0..cfg.health_n]) |spec| {
-        var matched = false;
-        for (workers) |*w| {
-            if (std.mem.eql(u8, w.nameSlice(), spec.worker)) {
-                spawner.setHealth(w, spec.cmd) catch {
-                    logmod.print("[mandor] invalid health command for {s}\n", .{spec.worker});
-                    return 2;
-                };
-                matched = true;
-                break;
-            }
-        }
-        if (!matched)
-            logmod.print("[mandor] --health: no worker named {s}\n", .{spec.worker});
     }
     const path_env = spawner.findPath(environ);
     const envp: [*:null]const ?[*:0]const u8 = environ.ptr;
@@ -573,6 +513,53 @@ fn checkRecycle(w: *spawner.Worker, now_ms: u64) void {
         w.recycling = true;
         posix.kill(-w.pid, .TERM) catch {};
     }
+}
+
+// Per-worker setting appliers for the setup table (false = bad value).
+fn applyEnv(w: *spawner.Worker, v: []const u8) bool {
+    return spawner.addEnv(w, v);
+}
+fn applyCwd(w: *spawner.Worker, v: []const u8) bool {
+    return spawner.setCwd(w, v);
+}
+fn applyUser(w: *spawner.Worker, v: []const u8) bool {
+    return spawner.setUser(w, v);
+}
+fn applyOom(w: *spawner.Worker, v: []const u8) bool {
+    w.oom_adj = std.fmt.parseInt(i16, v, 10) catch return false;
+    return true;
+}
+fn applyNice(w: *spawner.Worker, v: []const u8) bool {
+    w.nice_val = std.fmt.parseInt(i8, v, 10) catch return false;
+    return true;
+}
+fn applyMaxRss(w: *spawner.Worker, v: []const u8) bool {
+    const mb = std.fmt.parseInt(u64, v, 10) catch return false;
+    w.max_rss_kb = mb * 1024;
+    return true;
+}
+fn applyLifetime(w: *spawner.Worker, v: []const u8) bool {
+    w.max_lifetime_ms = cli.parseDuration(v) orelse return false;
+    return true;
+}
+fn applyRestart(w: *spawner.Worker, v: []const u8) bool {
+    w.restart_override = if (std.mem.eql(u8, v, "never"))
+        .never
+    else if (std.mem.eql(u8, v, "on-failure"))
+        .on_failure
+    else if (std.mem.eql(u8, v, "always"))
+        .always
+    else
+        return false;
+    return true;
+}
+fn applyPreStop(w: *spawner.Worker, v: []const u8) bool {
+    spawner.setPreStop(w, v) catch return false;
+    return true;
+}
+fn applyHealth(w: *spawner.Worker, v: []const u8) bool {
+    spawner.setHealth(w, v) catch return false;
+    return true;
 }
 
 fn findWorker(workers: []spawner.Worker, name: []const u8) ?*spawner.Worker {

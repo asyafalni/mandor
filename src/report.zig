@@ -42,8 +42,23 @@ pub fn serialize(buf: []u8, workers: []const spawner.Worker, now_ms: u64) ?[]con
             .signaled => |s| s,
             else => 0,
         };
-        if (!appendf(buf, p, ",\"state\":\"{s}\",\"code\":{d},\"pid\":{d},\"restarts\":{d},\"stats\":[", .{
-            state, code, w.pid, w.restarts,
+        // note: distinct lifecycle labels the state string can't express
+        const note: []const u8 = if (w.recycling)
+            "recycling"
+        else if (w.done and w.fail_streak > 0)
+            "gave-up"
+        else
+            "";
+        const health: []const u8 = if (!w.has_health)
+            ""
+        else if (w.health_fails > 0)
+            "failing"
+        else if (w.health_ever_ok)
+            "ok"
+        else
+            "pending";
+        if (!appendf(buf, p, ",\"state\":\"{s}\",\"note\":\"{s}\",\"health\":\"{s}\",\"code\":{d},\"pid\":{d},\"restarts\":{d},\"stats\":[", .{
+            state, note, health, code, w.pid, w.restarts,
         })) return null;
         for (0..w.stats.len) |si| {
             const s = w.stats.at(si);
@@ -92,9 +107,9 @@ pub fn scanStr(chunk: []const u8, comptime key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Render the human report straight from the state JSON. Returns null if the
-/// text is not a v1 state file.
-pub fn formatHuman(buf: []u8, text: []const u8, now_ms: u64) ?[]const u8 {
+/// Render the human report straight from the state JSON. `filter` (worker
+/// name or pid) limits the rows. Returns null on a non-v1 state file.
+pub fn formatHuman(buf: []u8, text: []const u8, now_ms: u64, filter: ?[]const u8) ?[]const u8 {
     if (scanU64(text, "v") != state_version) return null;
     const ts = scanU64(text, "ts_ms") orelse return null;
 
@@ -108,8 +123,8 @@ pub fn formatHuman(buf: []u8, text: []const u8, now_ms: u64) ?[]const u8 {
     }
     const age_s = (now_ms -| ts) / 1000;
     _ = appendf(buf, p, "mandor report — {d} worker(s), state from {d}s ago\n\n", .{ count, age_s });
-    _ = appendf(buf, p, "{s:<16} {s:<12} {s:>6} {s:>8} {s:>6} {s:>10} {s:>5} {s:>7}\n", .{
-        "NAME", "STATE", "PID", "RESTARTS", "CPU%", "RSS", "FDS", "THREADS",
+    _ = appendf(buf, p, "{s:<16} {s:<14} {s:<8} {s:>6} {s:>8} {s:>6} {s:>10} {s:>5} {s:>7}\n", .{
+        "NAME", "STATE", "HEALTH", "PID", "RESTARTS", "CPU%", "RSS", "FDS", "THREADS",
     });
 
     var start = std.mem.indexOf(u8, text, worker_pat) orelse return buf[0..pos];
@@ -119,12 +134,25 @@ pub fn formatHuman(buf: []u8, text: []const u8, now_ms: u64) ?[]const u8 {
 
         const name = scanStr(chunk, "name") orelse "?";
         const state = scanStr(chunk, "state") orelse "?";
+        const note = scanStr(chunk, "note") orelse "";
+        const health = scanStr(chunk, "health") orelse "";
         const code = scanU64(chunk, "code") orelse 0;
         const pid = scanU64(chunk, "pid") orelse 0;
         const restarts = scanU64(chunk, "restarts") orelse 0;
 
+        if (filter) |f| {
+            var pid_txt_f: [12]u8 = undefined;
+            const pid_s = std.fmt.bufPrint(&pid_txt_f, "{d}", .{pid}) catch "";
+            if (!std.mem.eql(u8, name, f) and !std.mem.eql(u8, pid_s, f)) {
+                start = next orelse break;
+                continue;
+            }
+        }
+
         var state_txt_buf: [24]u8 = undefined;
-        const state_txt = if (std.mem.eql(u8, state, "exited") or
+        const state_txt = if (note.len > 0)
+            note // "recycling" / "gave-up" beat the generic state word
+        else if (std.mem.eql(u8, state, "exited") or
             std.mem.eql(u8, state, "signaled"))
             std.fmt.bufPrint(&state_txt_buf, "{s}({d})", .{ state, code }) catch state
         else
@@ -150,12 +178,12 @@ pub fn formatHuman(buf: []u8, text: []const u8, now_ms: u64) ?[]const u8 {
             const rss_txt = std.fmt.bufPrint(&rss_buf, "{d}.{d}MB", .{
                 rss_kb / 1024, (rss_kb % 1024) * 10 / 1024,
             }) catch "?";
-            _ = appendf(buf, p, "{s:<16} {s:<12} {s:>6} {d:>8} {d:>6} {s:>10} {d:>5} {d:>7}\n", .{
-                name, state_txt, pid_txt, restarts, cpu, rss_txt, fds, threads,
+            _ = appendf(buf, p, "{s:<16} {s:<14} {s:<8} {s:>6} {d:>8} {d:>6} {s:>10} {d:>5} {d:>7}\n", .{
+                name, state_txt, health, pid_txt, restarts, cpu, rss_txt, fds, threads,
             });
         } else {
-            _ = appendf(buf, p, "{s:<16} {s:<12} {s:>6} {d:>8} {s:>6} {s:>10} {s:>5} {s:>7}\n", .{
-                name, state_txt, pid_txt, restarts, "-", "-", "-", "-",
+            _ = appendf(buf, p, "{s:<16} {s:<14} {s:<8} {s:>6} {d:>8} {s:>6} {s:>10} {s:>5} {s:>7}\n", .{
+                name, state_txt, health, pid_txt, restarts, "-", "-", "-", "-",
             });
         }
         start = next orelse break;
@@ -251,10 +279,10 @@ test "serialize golden output" {
     const json = serialize(&buf, &workers, 5000).?;
     const expected =
         "{\"v\":1,\"ts_ms\":5000,\"workers\":[" ++
-        "{\"name\":\"api\",\"cmd\":\"./api --port 8080\",\"state\":\"running\",\"code\":0," ++
+        "{\"name\":\"api\",\"cmd\":\"./api --port 8080\",\"state\":\"running\",\"note\":\"\",\"health\":\"\",\"code\":0," ++
         "\"pid\":42,\"restarts\":3,\"stats\":[" ++
         "{\"t_ms\":1000,\"rss_kb\":2048,\"cpu_pct\":97,\"fds\":12,\"threads\":8}]}," ++
-        "{\"name\":\"worker\",\"cmd\":\"./worker \\\"x\\\"\",\"state\":\"exited\",\"code\":1," ++
+        "{\"name\":\"worker\",\"cmd\":\"./worker \\\"x\\\"\",\"state\":\"exited\",\"note\":\"\",\"health\":\"\",\"code\":1," ++
         "\"pid\":0,\"restarts\":0,\"stats\":[]}]}";
     try std.testing.expectEqualStrings(expected, json);
 }
@@ -280,7 +308,7 @@ test "serialize + human format round trip" {
     const json = serialize(&jbuf, &workers, 5000).?;
 
     var hbuf: [4096]u8 = undefined;
-    const human = formatHuman(&hbuf, json, 8000).?;
+    const human = formatHuman(&hbuf, json, 8000, null).?;
     try std.testing.expect(std.mem.indexOf(u8, human, "2 worker(s)") != null);
     try std.testing.expect(std.mem.indexOf(u8, human, "state from 3s ago") != null);
     try std.testing.expect(std.mem.indexOf(u8, human, "api") != null);
@@ -289,5 +317,9 @@ test "serialize + human format round trip" {
     try std.testing.expect(std.mem.indexOf(u8, human, "97") != null);
     try std.testing.expect(std.mem.indexOf(u8, human, "exited(1)") != null);
 
-    try std.testing.expectEqual(@as(?[]const u8, null), formatHuman(&hbuf, "{\"v\":99}", 0));
+    try std.testing.expectEqual(@as(?[]const u8, null), formatHuman(&hbuf, "{\"v\":99}", 0, null));
+    // filter: only the named worker's row remains
+    const filtered = formatHuman(&hbuf, json, 8000, "api").?;
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\nworker ") == null);
 }

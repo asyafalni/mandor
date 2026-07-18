@@ -204,8 +204,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             (file_cfg.state_dir orelse cli.default_state_dir));
 
     if (cfg.mode == .report) {
-        if (cfg.incidents) return runIncidentList(state_dir);
-        return runReport(state_dir, cfg.json);
+        if (cfg.incidents) return runIncidentList(state_dir, cfg.report_filter, cfg.since_ms);
+        return runReport(state_dir, cfg.json, cfg.report_filter);
     }
 
     const supervisor = @import("supervisor.zig");
@@ -218,10 +218,12 @@ var incident_entries: [256]@import("spool.zig").DirEntry = undefined;
 
 /// `mandor report --incidents` — recall the spooled history (survives
 /// restarts when the state dir is a mounted volume).
-fn runIncidentList(state_dir: []const u8) u8 {
+fn runIncidentList(state_dir: []const u8, filter: ?[]const u8, since_ms: ?u64) u8 {
     const spool = @import("spool.zig");
     const report = @import("report.zig");
+    const supervisor = @import("supervisor.zig");
     const linux = std.os.linux;
+    const cutoff_ms: u64 = if (since_ms) |s| supervisor.wallMs() -| s else 0;
     const n = spool.listIncidents(state_dir, &incident_entries);
     if (n == 0) {
         logmod.print("[mandor] no incidents in {s}/incidents\n", .{state_dir});
@@ -232,6 +234,7 @@ fn runIncidentList(state_dir: []const u8) u8 {
     _ = jb.appendf(&report_out_buf, &out_pos, "{d} incident(s) in {s}/incidents (oldest first)\n\n", .{ n, state_dir });
     _ = jb.appendf(&report_out_buf, &out_pos, "{s:<21} {s:<14} {s:<14} {s}\n", .{ "TIME", "WORKER", "CAUSE", "VERDICT" });
     for (incident_entries[0..n]) |*e| {
+        if (e.key < cutoff_ms) continue; // filename prefix = epoch ms
         var path_buf: [640]u8 = undefined;
         const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
             state_dir, e.name[0..e.name_len],
@@ -243,6 +246,10 @@ fn runIncidentList(state_dir: []const u8) u8 {
         _ = linux.close(fd);
         if (std.posix.errno(got) != .SUCCESS) continue;
         const text = report_read_buf[0..got];
+        if (filter) |f| {
+            const bname = report.scanStr(text, "name") orelse "";
+            if (!std.mem.eql(u8, bname, f)) continue;
+        }
         _ = jb.appendf(&report_out_buf, &out_pos, "{s:<21} {s:<14} {s:<14} {s}\n", .{
             report.scanStr(text, "ts") orelse "?",
             report.scanStr(text, "name") orelse "?",
@@ -270,7 +277,7 @@ fn readSmallFile(path: []const u8, buf: []u8) ?[]const u8 {
 var report_read_buf: [256 * 1024]u8 = undefined;
 var report_out_buf: [64 * 1024]u8 = undefined;
 
-fn runReport(state_dir: []const u8, json: bool) u8 {
+fn runReport(state_dir: []const u8, json: bool, filter: ?[]const u8) u8 {
     const report = @import("report.zig");
     const supervisor = @import("supervisor.zig");
     const text = report.readState(state_dir, &report_read_buf) catch {
@@ -281,7 +288,7 @@ fn runReport(state_dir: []const u8, json: bool) u8 {
         writeOut(text);
         return 0;
     }
-    const human = report.formatHuman(&report_out_buf, text, supervisor.nowMs()) orelse {
+    const human = report.formatHuman(&report_out_buf, text, supervisor.nowMs(), filter) orelse {
         logmod.print("[mandor] state file is corrupt or from an incompatible version\n", .{});
         return 1;
     };
@@ -305,6 +312,7 @@ test {
     _ = @import("parsers/python.zig");
     _ = @import("parsers/node.zig");
     _ = @import("parsers/java.zig");
+    _ = @import("parsers/zigp.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

@@ -20,6 +20,10 @@ pub const Config = struct {
     version: bool = false,
     json: bool = false,
     incidents: bool = false,
+    /// report mode: limit rows to a worker name or pid.
+    report_filter: ?[]const u8 = null,
+    /// report --incidents: only bundles newer than now - since.
+    since_ms: ?u64 = null,
     /// null = not given on the CLI; caller resolves env/config/default.
     state_dir: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
@@ -198,6 +202,10 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
             } else if (std.mem.eql(u8, arg, "--incidents")) {
                 if (cfg.mode != .report) return error.UnknownFlag;
                 cfg.incidents = true;
+            } else if (std.mem.startsWith(u8, arg, "--since=")) {
+                if (cfg.mode != .report) return error.UnknownFlag;
+                cfg.since_ms = parseDuration(arg["--since=".len..]) orelse
+                    return error.BadValue;
             } else {
                 return error.UnknownFlag;
             }
@@ -208,7 +216,15 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
         n += 1;
     }
     cfg.commands = cmd_storage[0..n];
-    if (cfg.mode == .report and n != 0) return error.BadValue; // report takes no commands
+    if (cfg.mode == .report) {
+        // report takes at most one positional: a worker name or pid filter
+        if (n > 1) return error.BadValue;
+        if (n == 1) {
+            cfg.report_filter = cmd_storage[0];
+            cfg.commands = cmd_storage[0..0];
+        }
+        return cfg;
+    }
     // Zero commands is legal here: a config file may provide the workers.
     return cfg;
 }
@@ -225,6 +241,9 @@ pub fn parseDuration(s: []const u8) ?u64 {
         unit_len = 1;
     } else if (std.mem.endsWith(u8, s, "m")) {
         mult = 60_000;
+        unit_len = 1;
+    } else if (std.mem.endsWith(u8, s, "h")) {
+        mult = 3_600_000;
         unit_len = 1;
     } else return null;
     const digits = s[0 .. s.len - unit_len];
@@ -415,7 +434,10 @@ test "parse report subcommand" {
     try expectEqual(Mode.report, cfg.mode);
     try expect(cfg.json);
     try expectEqualStrings("/tmp/x", cfg.state_dir.?);
-    try expectError(error.BadValue, parse(&.{ "report", "./cmd" }, &storage));
+    const cf = try parse(&.{ "report", "api", "--since=1h" }, &storage);
+    try expectEqualStrings("api", cf.report_filter.?);
+    try expectEqual(@as(u64, 3_600_000), cf.since_ms.?);
+    try expectError(error.BadValue, parse(&.{ "report", "a", "b" }, &storage));
     // --json is report-only
     try expectError(error.UnknownFlag, parse(&.{ "--json", "./cmd" }, &storage));
 }

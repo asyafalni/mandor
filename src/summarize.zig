@@ -161,6 +161,7 @@ const go = @import("parsers/go.zig");
 const rust = @import("parsers/rust.zig");
 const python = @import("parsers/python.zig");
 const node = @import("parsers/node.zig");
+const zigp = @import("parsers/zigp.zig");
 const java = @import("parsers/java.zig");
 
 /// Try each language parser over the log tail; most-distinctive markers
@@ -169,6 +170,7 @@ pub fn extractTrace(lines: []const LogLine, st: *TraceStorage) TraceInfo {
     if (go.detect(lines, st)) |t| return t;
     if (rust.detect(lines, st)) |t| return t;
     if (python.detect(lines, st)) |t| return t;
+    if (zigp.detect(lines, st)) |t| return t;
     if (java.detect(lines, st)) |t| return t;
     if (node.detect(lines, st)) |t| return t;
     return .{};

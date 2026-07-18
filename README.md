@@ -227,9 +227,9 @@ unchanged — CI runs the full integration harness on all three distro bases.
 
 ## Status
 
-Actively developed; current release line **v0.11.x**. Version history lives
-in [CHANGELOG.md](CHANGELOG.md); planned and researched-but-parked work in
-[docs/ROADMAP.md](docs/ROADMAP.md).
+Actively developed. Version history: [CHANGELOG.md](CHANGELOG.md) · every
+config key: [docs/CONFIG.md](docs/CONFIG.md) · planned and
+researched-but-parked work: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Sister project: photon
 

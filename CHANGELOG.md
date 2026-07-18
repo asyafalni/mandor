@@ -3,6 +3,19 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [0.14.0] - 2026-07-18
+### Added
+- Zig panic-trace parser (dogfood) — six languages now: Go, Rust, Python,
+  Zig, Java, Node.
+- `mandor report [NAME|PID]` row filtering; `report --incidents [NAME]
+  [--since=DUR]` history filtering; `h` duration unit.
+- HEALTH column and distinct `recycling` / `gave-up` labels in `report`.
+- `docs/CONFIG.md` — complete configuration reference.
+- CI: capture perf-regression gate; aarch64 unit tests under qemu.
+### Changed
+- Setup code DRY: one table drives all per-worker settings (bad values now
+  consistently fail startup).
+
 ## [0.13.0] - 2026-07-18
 ### Added
 - `restart_dependents = true` — OTP `rest_for_one`: a dependency's restart

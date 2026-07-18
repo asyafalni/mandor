@@ -28,6 +28,22 @@ jobs:
           zig build
           bash test/harness/run_tests.sh
 
+      - name: Capture perf gate (nanozlog batching must not regress)
+        run: |
+          start=$(date +%s%N)
+          ./zig-out/bin/mandor "sh -c 'seq 200000'" > /dev/null 2>&1
+          took_ms=$(( ($(date +%s%N) - start) / 1000000 ))
+          echo "200k lines in ${took_ms}ms"
+          if [ "$took_ms" -gt 2000 ]; then
+            echo "::error::capture perf regression: ${took_ms}ms > 2000ms budget"
+            exit 1
+          fi
+
+      - name: aarch64 unit tests under qemu
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static binfmt-support
+          zig build test -Dtarget=aarch64-linux-musl -fqemu
+
       - name: Release builds + size gate (< 500 KB)
         run: |
           zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -p zig-out/x64
