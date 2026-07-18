@@ -3,6 +3,16 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [0.13.0] - 2026-07-18
+### Added
+- `restart_dependents = true` — OTP `rest_for_one`: a dependency's restart
+  recycles its `start_after` dependents (planned, never counted as failure).
+- `pre_stop = ["name=CMD"]` drain hooks: on graceful shutdown the hook runs
+  first and TERM follows its completion; stop-grace KILLs hung hooks.
+### Removed
+- `replicas` scaling rejected permanently: replication belongs outside the
+  binary (scripts/orchestrator).
+
 ## [0.12.0] - 2026-07-18
 ### Added
 - Node.js and JVM stack-trace parsers: structured `file:line` frames with
