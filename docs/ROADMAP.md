@@ -104,16 +104,50 @@ core-dump, JSON logging). Only extensions of existing subsystems survived.
 
 | # | Feature | Cx | Value | Notes |
 |---|---------|----|-------|-------|
-| 35 | PSI stall sampling (cgroup v2 pressure) → `stall:*` detector cause | S | ● ● ● ○ | Catches CPU-throttle / I/O-stall (blind spot today); earlier than RSS slope. Bundle schema → v6 |
-| 36 | `no_new_privs` + `cap_drop` at exec | S | ● ● ● ○ | Closes the setuid re-escalation hole after uid drop; per-worker cap bounding-set, no libcap |
-| 37 | JSON supervisor-event log (`--log-format=json`) | S | ● ● ○ ○ | mandor's own events for Loki/Datadog; supervisor events only, never worker stdout |
-| 38 | `RLIMIT_CORE` in bundle | XS | ● ○ ○ ○ | `core_dumped` already shipped (v0.5); only the size-limit detail is new — marginal |
+| 35 ✅ | PSI stall sampling (cgroup v2 pressure) → `stall:*` detector cause | S | ● ● ● ○ | SHIPPED v0.16 — psi_mem_pct/psi_cpu_pct, PSI in bundle stats (schema v6) |
+| 36 ✅ | `no_new_privs` + `cap_drop` at exec | S | ● ● ● ○ | SHIPPED v0.16 — per-worker cap bounding-set (names or "all"), no libcap |
+| 37 | JSON supervisor-event log | S | ● ● ○ ○ | Folded into existing paths: offline = plain `[mandor]` stdout lines; online = photon. No separate sink |
+| 38 ✅ | `RLIMIT_CORE` in bundle | XS | ● ○ ○ ○ | SHIPPED v0.16 (`limits.core`) |
+
+## Tier 7 — parked idea (user, 2026-07-18)
+
+| # | Feature | Cx | Value | Notes |
+|---|---------|----|-------|-------|
+| 39 | Cost / right-sizing report (`mandor report --cost`) | M | ● ● ● ○ | PARKED — on-philosophy: "the foreman tells you what each worker costs." Design below |
+
+### #39 design — resource-cost profiling without touching worker code
+
+**The core problem the user named:** distinguishing idle / regular / peak
+resource cost. Answer — mandor can't know app-semantic "busy", but it can
+*infer state from the CPU signal it already samples*, with zero cooperation:
+
+- **State classifier:** a sample with `cpu_pct < idle_threshold` (≈5%) is an
+  *idle* sample; otherwise *active*. Pure /proc data, no app knowledge.
+- **Per-state stats:** `idle_rss` = median RSS over idle samples (the memory
+  floor); `regular_rss` = median RSS over active samples (steady-state);
+  `peak_rss` = max RSS overall (the sizing ceiling). Same split for CPU.
+- **Long horizon without heavy storage:** the 2-min sampler ring is too short
+  for cost profiling. Keep per-worker fixed-size aggregates instead —
+  **log-scale RSS histogram + linear CPU histogram** (a few hundred bytes
+  each, zero alloc, O(1) update per 5s tick) → approximate percentiles.
+  Persist to the state dir (like incident history) so profiles survive
+  restarts. Fits the fixed-buffer / zero-alloc DNA exactly.
+- **Cost proxies = the real billing units:** cumulative **CPU-core-seconds**
+  (integral of cpu_pct over uptime) and **RSS-byte-seconds / GB-hours** (mean
+  RSS × uptime) — what clouds actually charge for. Plus **duty cycle**
+  (% active samples) to flag oversized/mostly-idle workers.
+
+**Presentation.** Human: `mandor report --cost` → per-worker table (idle /
+typical / peak RSS+CPU, GB-hours, core-seconds, duty%) with a one-line
+**sizing suggestion** ("api: set memory 900MB [peak 812MB ×1.1], CPU request
+0.3 / limit 0.9 cores, 78% duty"). LLM: a JSON cost profile with the
+percentiles + suggestion so the premium agent can emit right-sizing PRs
+(k8s `resources:` block, compose limits). Sizing rule of thumb: memory limit
+= peak × margin (OOM-safety); CPU request = p50; CPU limit = p95.
 
 ## Backlog status
 
-Four research rounds complete; the well is nearly dry. The two Tier-6 picks
-(35, 36) survive only because they deepen existing strengths (forensic
-detection, security drop) — not net-new subsystems. Everything else across
-four rounds is shipped or rejected-with-reason. Remaining non-feature work:
-distribution (aports/apt/AUR, announcement), v1.0 fuzz-hardening, and the
-premium sidecar (separate repo).
+Four research rounds complete; all surfaced features shipped or
+rejected-with-reason. One user-originated idea is parked (#39 cost report,
+Tier 7). Remaining non-feature work: distribution (aports/apt/AUR,
+announcement), v1.0 fuzz-hardening, and the premium sidecar (separate repo).

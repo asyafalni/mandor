@@ -25,6 +25,8 @@ basename of the command's first token (duplicates get `-2`, `-3`…).
 | `ready_fd = 5` | `--ready-fd=` | off | s6-style readiness: workers write a newline to this fd |
 | `restart_dependents = true` | — | `false` | OTP `rest_for_one`: a dependency's restart recycles its dependents |
 | `env_file = ".env"` | — | off | KEY=VAL file loaded into every worker's environment |
+| `psi_mem_pct = 80` | `--psi-mem=` | off | Incident when container memory pressure (PSI some avg60) sustains above this % |
+| `psi_cpu_pct = 90` | `--psi-cpu=` | off | Incident when container CPU pressure sustains above this % |
 
 ## Per-worker keys (arrays of `"name=value"`)
 
@@ -37,6 +39,7 @@ basename of the command's first token (duplicates get `-2`, `-3`…).
 | `env` | `["api=PORT=8080"]` | Extra environment (repeatable per worker) |
 | `cwd` | `["api=/srv/app"]` | Working directory |
 | `user` | `["api=1000:1000"]` | Privilege drop before exec (numeric uid:gid; fail-closed, exit 126) |
+| `cap_drop` | `["api=NET_RAW,SYS_ADMIN"]` or `["api=all"]` | Drop Linux capabilities from the bounding set; sets `no_new_privs` when a uid is also dropped |
 | `oom_score_adj` | `["cache=500"]` | Steer the kernel OOM killer (-1000..1000) |
 | `nice` | `["batch=10"]` | Scheduling niceness |
 | `max_rss_mb` | `["api=768"]` | Recycle (graceful planned restart) beyond this RSS |
