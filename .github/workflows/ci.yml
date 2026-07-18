@@ -95,18 +95,11 @@ jobs:
           path: zig-out/bin
 
       - name: Run harness
-        id: harness
         run: |
           chmod +x zig-out/bin/mandor
-          bash -x test/harness/run_tests.sh > /tmp/harness.log 2>&1
-          rc=$?
-          echo "harness exit=$rc"
-          tail -40 /tmp/harness.log
-          exit "$rc"
-
-      - name: Upload harness log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: harness-log-${{ strategy.job-index }}
-          path: /tmp/harness.log
+          bash test/harness/run_tests.sh 2>&1 | tee /tmp/harness.log || {
+            grep -E "FAIL|skip" /tmp/harness.log | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+            exit 1
+          }
