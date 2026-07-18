@@ -3,6 +3,17 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [0.12.0] - 2026-07-18
+### Added
+- Node.js and JVM stack-trace parsers: structured `file:line` frames with
+  `in_app` heuristics (`node:`/`node_modules`, `java.`/`jdk.`/`kotlin.`
+  filtered), first-class exception type/message, Caused-by chains in raw.
+- Relay bearer-token auth: set `PHOTON_TOKEN` and `mandor relay` sends
+  `Authorization: Bearer …` (env-inherited, never on the cmdline).
+### Docs
+- photon-side contribution spec (`docs/photon-contrib/`): exact OTLP/JSON
+  ingest change for photon's `/v1/logs`, written from code reconnaissance.
+
 ## [0.11.1] - 2026-07-17
 ### Changed
 - nanozlog-inspired batched capture: one `writev` (and one clock read) per
