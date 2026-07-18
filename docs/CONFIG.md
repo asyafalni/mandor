@@ -61,6 +61,10 @@ give-up/essential/oneshot worker's code when those trigger, honoring
 - `mandor report --incidents [NAME] [--since=DUR]` — crash history from the
   spool (kept to the newest 200 bundles), numbered oldest-first.
 - `mandor report --incident=N` — dump bundle N as raw JSON (pipe to `jq`).
+- `mandor report --cost [--json]` — per-worker resource cost (idle/typical/peak
+  RSS+CPU, GB-hours, core-seconds, duty %) with right-sizing suggestions.
+  Profiling is automatic and zero-config; the profile persists in
+  `<state-dir>/cost.json` and accumulates across worker restarts.
 - `mandor validate [--config=PATH]` — apply the full config to the worker
   table without spawning anything; exit 0 = sound, non-zero on bad values,
   cycles, or unknown worker references (typo detection).

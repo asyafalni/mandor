@@ -33,6 +33,7 @@ const usage_text =
     \\  mandor [flags] [--] "CMD" ["CMD" ...]     supervise workers
     \\  mandor report [NAME|PID] [--json]         live worker status
     \\  mandor report --incidents [NAME]          crash history (--incident=N dumps one)
+    \\  mandor report --cost                      per-worker resource cost + right-sizing
     \\  mandor validate [--config=PATH]           check config without running
     \\  mandor --help | --version
     \\
@@ -215,6 +216,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             (file_cfg.state_dir orelse cli.default_state_dir));
 
     if (cfg.mode == .report) {
+        if (cfg.cost) return runCostReport(state_dir, cfg.json);
         if (cfg.incidents) return runIncidentList(state_dir, cfg.report_filter, cfg.since_ms, cfg.incident_index);
         return runReport(state_dir, cfg.json, cfg.report_filter);
     }
@@ -306,6 +308,24 @@ fn readSmallFile(path: []const u8, buf: []u8) ?[]const u8 {
 var report_read_buf: [256 * 1024]u8 = undefined;
 var report_out_buf: [64 * 1024]u8 = undefined;
 
+var cost_out_buf: [64 * 1024]u8 = undefined;
+
+/// `mandor report --cost` — per-worker resource cost + right-sizing. `--json`
+/// passes the raw cost.json (for the LLM/premium agent) untouched.
+fn runCostReport(state_dir: []const u8, json: bool) u8 {
+    const costmod = @import("cost.zig");
+    const text = costmod.readState(state_dir) orelse {
+        logmod.print("[mandor] no cost data at {s}/cost.json yet\n", .{state_dir});
+        return 1;
+    };
+    if (json) {
+        writeOut(text);
+        return 0;
+    }
+    writeOut(costmod.formatHuman(&cost_out_buf, text));
+    return 0;
+}
+
 fn runReport(state_dir: []const u8, json: bool, filter: ?[]const u8) u8 {
     const report = @import("report.zig");
     const supervisor = @import("supervisor.zig");
@@ -343,6 +363,7 @@ test {
     _ = @import("parsers/java.zig");
     _ = @import("parsers/zigp.zig");
     _ = @import("caps.zig");
+    _ = @import("cost.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

@@ -16,6 +16,16 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
 - Setup code DRY: one table drives all per-worker settings (bad values now
   consistently fail startup).
 
+## [0.17.0] - 2026-07-18
+### Added
+- `mandor report --cost` — per-worker resource-cost profiling: idle / typical
+  / peak RSS and CPU (idle-vs-active inferred from the CPU signal, zero worker
+  cooperation), GB-hours, CPU-core-seconds, duty cycle, and a right-sizing
+  suggestion (memory limit, CPU request/limit). `--json` for the LLM/premium
+  agent. Profiling is automatic; the profile persists in
+  `<state-dir>/cost.json` (fixed-size histograms, no allocation) and
+  accumulates across worker restarts.
+
 ## [0.16.0] - 2026-07-18
 ### Added
 - PSI stall detection: samples cgroup v2 memory/cpu/io pressure once per

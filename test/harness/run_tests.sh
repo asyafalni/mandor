@@ -520,6 +520,27 @@ if [ -n "$f" ] && grep -q '"v":6' "$f" && grep -q '"psi_mem"' "$f" && grep -q '"
 else bad "psi/core in bundle" "$(head -c 200 "$f" 2>/dev/null)"; fi
 unset MANDOR_STATE_DIR
 
+# 46. cost report: a worker sampled over time yields a cost profile.
+# cost.json flushes on shutdown (or the 30s tick), so query after graceful stop.
+export MANDOR_STATE_DIR="$TMP/state46"
+"$MANDOR" "sh -c 'sleep 30'" >/dev/null 2>&1 &
+mpid=$!
+sleep 7    # >1 sample tick (5s) so the profile has a sample
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+"$MANDOR" report --cost >"$TMP/46" 2>&1; rc=$?
+if [ $rc -eq 0 ] && grep -q "^sh " "$TMP/46" && grep -q "right-sizing suggestions" "$TMP/46" \
+   && grep -q '"core_ms"' "$TMP/state46/cost.json"; then
+  ok "cost report renders profile + suggestions"
+else bad "cost report" "rc=$rc: $(head -4 "$TMP/46") | json=$(head -c 80 "$TMP/state46/cost.json" 2>/dev/null)"; fi
+
+# 47. cost profile accumulates across supervisor restarts (idle sleeper)
+"$MANDOR" "sh -c 'sleep 30'" >/dev/null 2>&1 &
+mpid=$!; sleep 7; kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+n2=$("$MANDOR" report --cost --json 2>/dev/null | grep -o '"idle_n":[0-9]*' | head -1 | grep -o '[0-9]*$')
+if [ -n "$n2" ] && [ "$n2" -ge 2 ]; then ok "cost profile persists across restarts (idle_n=$n2)"
+else bad "cost persistence" "idle_n=$n2"; fi
+unset MANDOR_STATE_DIR
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

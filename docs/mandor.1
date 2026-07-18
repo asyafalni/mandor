@@ -11,6 +11,9 @@ mandor \- the foreman for your containers: a tiny PID-1 process supervisor
 .B mandor report --incidents
 [\fINAME\fR] [\fB--since=\fIDUR\fR] [\fB--incident=\fIN\fR]
 .br
+.B mandor report --cost
+[\fB--json\fR]
+.br
 .B mandor validate
 [\fB--config=\fIPATH\fR]
 .br
@@ -68,6 +71,9 @@ Live worker status (read by \fBmandor report\fR).
 .TP
 .I <state-dir>/incidents/*.json
 Incident bundles (newest 200 retained).
+.TP
+.I <state-dir>/cost.json
+Per-worker resource-cost profiles (see \fBmandor report --cost\fR).
 .TP
 .I /dev/termination-log
 When present (Kubernetes), receives the latest incident verdict.

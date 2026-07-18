@@ -20,6 +20,7 @@ pub const Config = struct {
     version: bool = false,
     json: bool = false,
     incidents: bool = false,
+    cost: bool = false,
     /// report mode: limit rows to a worker name or pid.
     report_filter: ?[]const u8 = null,
     /// report --incidents: only bundles newer than now - since.
@@ -216,6 +217,9 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
             } else if (std.mem.eql(u8, arg, "--json")) {
                 if (cfg.mode != .report) return error.UnknownFlag;
                 cfg.json = true;
+            } else if (std.mem.eql(u8, arg, "--cost")) {
+                if (cfg.mode != .report) return error.UnknownFlag;
+                cfg.cost = true;
             } else if (std.mem.eql(u8, arg, "--incidents")) {
                 if (cfg.mode != .report) return error.UnknownFlag;
                 cfg.incidents = true;

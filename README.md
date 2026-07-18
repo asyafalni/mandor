@@ -38,6 +38,7 @@ $ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
 | Log capture with per-worker prefix | ✅ | ✅ | ✅ |
 | CPU / RSS / fd tracking | ✅ | ❌ | ❌ |
 | Crash summaries ("restart loop", "leak suspect") | ✅ | ❌ | ❌ |
+| Per-worker cost + right-sizing report | ✅ | ❌ | ❌ |
 | Size | **~210 KB** | ~50 KB | MBs + runtime |
 | Network access required | **never** | never | varies |
 
@@ -87,8 +88,9 @@ mandor "./api --port 8080" "./worker"
 mandor --restart=on-failure --backoff-max=30s -- "./api" "./worker"
 
 # what happened while I was away?
-mandor report            # human summary
-mandor report --json     # machine-readable
+mandor report            # live worker status
+mandor report --incidents  # crash history with diagnosis verdicts
+mandor report --cost     # per-worker resource cost + right-sizing suggestions
 ```
 
 ### Flags

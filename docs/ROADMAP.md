@@ -113,7 +113,7 @@ core-dump, JSON logging). Only extensions of existing subsystems survived.
 
 | # | Feature | Cx | Value | Notes |
 |---|---------|----|-------|-------|
-| 39 | Cost / right-sizing report (`mandor report --cost`) | M | ● ● ● ○ | PARKED — on-philosophy: "the foreman tells you what each worker costs." Design below |
+| 39 ✅ | Cost / right-sizing report (`mandor report --cost`) | M | ● ● ● ○ | SHIPPED v0.17 — CPU-signal state classifier, fixed histograms persisted to cost.json, GB-hours + core-seconds, right-sizing suggestions + JSON. Design below |
 
 ### #39 design — resource-cost profiling without touching worker code
 
