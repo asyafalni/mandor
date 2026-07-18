@@ -300,6 +300,8 @@ test {
     _ = @import("parsers/go.zig");
     _ = @import("parsers/rust.zig");
     _ = @import("parsers/python.zig");
+    _ = @import("parsers/node.zig");
+    _ = @import("parsers/java.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

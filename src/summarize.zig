@@ -160,13 +160,17 @@ pub fn Compactor(comptime cap: usize, comptime max_text: usize) type {
 const go = @import("parsers/go.zig");
 const rust = @import("parsers/rust.zig");
 const python = @import("parsers/python.zig");
+const node = @import("parsers/node.zig");
+const java = @import("parsers/java.zig");
 
-/// Try each language parser over the log tail; go/rust first (structured
-/// stderr), python third, per CLAUDE.md build order.
+/// Try each language parser over the log tail; most-distinctive markers
+/// first so cheaper checks short-circuit the common cases.
 pub fn extractTrace(lines: []const LogLine, st: *TraceStorage) TraceInfo {
     if (go.detect(lines, st)) |t| return t;
     if (rust.detect(lines, st)) |t| return t;
     if (python.detect(lines, st)) |t| return t;
+    if (java.detect(lines, st)) |t| return t;
+    if (node.detect(lines, st)) |t| return t;
     return .{};
 }
 
