@@ -167,6 +167,9 @@ cwd = ["api=/srv/app"]         # per-worker working directory
 user = ["api=1000:1000"]       # drop root before exec (numeric uid:gid)
 essential = ["api"]            # api exiting stops everything (leader)
 env_file = ".env"              # KEY=VAL lines for all workers
+max_rss_mb = ["api=768"]       # recycle worker beyond this RSS (planned, not a failure)
+max_lifetime = ["api=12h"]     # periodic recycle as a leak crutch
+restart = ["cron=never"]       # per-worker override of the global policy
 on_incident = "/notify"        # exec'd with each incident bundle path
 photon = "127.0.0.1:4318"      # auto-forward incidents to photon (OTLP)
 ```
@@ -244,7 +247,14 @@ unchanged — CI runs the full integration harness on all three distro bases.
 - [x] **v0.8** — max-restarts give-up, on-incident hook, health start-period,
       oneshot init tasks, per-worker env/cwd
 - [x] **v0.9** — per-worker privilege drop (`user`), OOM-killer steering
-      (`oom_score_adj`/`nice`), Alpine APKBUILD, `photon-relay` bridge shim
+      (`oom_score_adj`/`nice`), Alpine APKBUILD, photon auto-forward
+      (`photon = "ip:port"` — one key, offline otherwise)
+- [x] **v0.10** — k8s termination-log death rattle, recycle thresholds
+      (`max_rss_mb`/`max_lifetime`), per-worker restart overrides; size diet:
+      **487 KB → ~215 KB** via raw panic handler
+- [x] **v0.11** — TTY color prefixes, `env_file`, `essential` leader workers,
+      no-orphan hardening (PDEATHSIG + group sweep), nanozlog-inspired
+      batched capture (one writev per chunk — 6× less kernel time)
 
 Full prioritized list with complexity/value ranking: [docs/ROADMAP.md](docs/ROADMAP.md).
 
