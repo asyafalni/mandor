@@ -3,6 +3,16 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [0.18.0] - 2026-07-19
+### Changed
+- Faster log capture (nanozlog-inspired hot path). Complete lines that arrive
+  contiguous in one read now go straight from the read buffer to the ring and
+  the batched `writev` — the intermediate line-assembly copy is skipped for
+  the common case (only lines that straddle a read boundary are staged). The
+  pipe read buffer is sized to a pipe's 64 KB capacity, so a saturated pipe
+  drains in one `read()` instead of ~16 under log spam. No new config, no
+  behavior change; fewer syscalls and one less copy per line.
+
 ## [0.14.0] - 2026-07-18
 ### Added
 - Zig panic-trace parser (dogfood) — six languages now: Go, Rust, Python,

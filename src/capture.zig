@@ -27,7 +27,17 @@ pub const Assembler = struct {
         var rest = chunk;
         while (rest.len > 0) {
             if (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
-                self.append(base_flags, rest[0..nl], true, ctx, sink);
+                // Fast path: a complete line already contiguous in the read
+                // chunk with nothing staged (self.len==0 ⇒ continued==false).
+                // Emit straight from the chunk — skips the staging copy for
+                // the common case where lines don't straddle a read boundary.
+                if (self.len == 0 and nl <= max_line) {
+                    var line = rest[0..nl];
+                    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+                    sink(ctx, line, base_flags);
+                } else {
+                    self.append(base_flags, rest[0..nl], true, ctx, sink);
+                }
                 rest = rest[nl + 1 ..];
             } else {
                 self.append(base_flags, rest, false, ctx, sink);
@@ -151,6 +161,19 @@ test "crlf stripped, empty lines kept, base flags pass through" {
     try std.testing.expectEqualStrings("b", s.line(1));
     try std.testing.expectEqualStrings("", s.line(2));
     try std.testing.expectEqual(ring.flag_stderr, s.flags[0]);
+}
+
+test "fast path: contiguous complete lines, then a straddling partial" {
+    var a: Assembler = .{};
+    var s: TestSink = .{};
+    // Two whole lines in one chunk (fast path), then a partial that must
+    // fall back to staging and join across the next feed.
+    a.feed(0, "one\rtwo\ntail", &s, TestSink.sink);
+    a.feed(0, "-end\n", &s, TestSink.sink);
+    try std.testing.expectEqual(@as(usize, 2), s.n);
+    try std.testing.expectEqualStrings("one\rtwo", s.line(0)); // \r only stripped at line end
+    try std.testing.expectEqualStrings("tail-end", s.line(1));
+    try std.testing.expectEqual(@as(u8, 0), s.flags[0]);
 }
 
 test "oversized line splits with continuation flag" {

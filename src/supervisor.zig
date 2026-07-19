@@ -790,6 +790,12 @@ var echo_used: usize = 0;
 var echo_iov: [128]posix.iovec_const = undefined;
 var echo_iov_n: usize = 0;
 
+// Shared read buffer sized to a pipe's default capacity (64 KB) so a full
+// pipe drains in one read() under log spam instead of ~16. BSS, not stack —
+// single-threaded and fully consumed before the next read, so one buffer
+// serves every worker/pipe. read()'s return value bounds valid bytes.
+var read_buf: [64 * 1024]u8 = undefined;
+
 fn flushEcho(ctx: *EchoCtx) void {
     if (echo_iov_n == 0) return;
     const fd: usize = if (ctx.err) 2 else 1;
@@ -837,9 +843,8 @@ fn readPipe(w: *spawner.Worker, is_err: bool) void {
     const base_flags: u8 = if (is_err) ring.flag_stderr else 0;
     var ctx: EchoCtx = .{ .w = w, .err = is_err, .t_ms = wallMs() };
     defer flushEcho(&ctx); // one writev per drained pipe
-    var chunk: [4096]u8 = undefined;
     while (true) {
-        const rc = linux.read(fd, &chunk, chunk.len);
+        const rc = linux.read(fd, &read_buf, read_buf.len);
         switch (posix.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
@@ -850,7 +855,7 @@ fn readPipe(w: *spawner.Worker, is_err: bool) void {
             if (is_err) capture.closeFd(&w.err_r) else capture.closeFd(&w.out_r);
             return;
         }
-        asm_ptr.feed(base_flags, chunk[0..rc], &ctx, echoLine);
+        asm_ptr.feed(base_flags, read_buf[0..rc], &ctx, echoLine);
     }
 }
 

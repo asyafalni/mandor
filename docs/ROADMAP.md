@@ -76,7 +76,7 @@ Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
 | 31 ✅ | `essential` worker (leader exits ⇒ all stop, code propagates) | XS | ● ● ○ ○ | SHIPPED 2026-07-17 |
 | 32 ✅ | `pre_stop` drain hook | S | ● ● ○ ○ | SHIPPED 2026-07-18 (hook completes → TERM follows; stop-grace KILLs hung hooks) |
 | 33 ✅ | TTY color prefixes + `env_file` loading | XS | ● ○ ○ ○ | SHIPPED 2026-07-17 |
-| 34 ✅ | Ultra-low-latency capture path, nanozlog-inspired (https://github.com/wyzdwdz/nanozlog) | M | ● ● ○ ○ | User-parked 2026-07-17 — make logging MORE EFFICIENT: study nanozlog's lock-free SPSC/deferred-IO/zero-alloc techniques for the read→assemble→ring→echo hot path (batched writev echo, fewer wallMs calls, single-copy framing). Compared vs logly.zig 2026-07-17: nanozlog wins decisively (6.8 ns/msg ~147M msg/s lock-free SPSC vs logly's 8.5 µs simple path; logly is a feature-rich app logger — wrong shape for a PID-1 hot path). Reference stays nanozlog. |
+| 34 ✅ | Ultra-low-latency capture path, nanozlog-inspired (https://github.com/wyzdwdz/nanozlog) | M | ● ● ○ ○ | SHIPPED v0.18 — all three levers landed: batched `writev` echo (one syscall per drained pipe), one `wallMs()` per drain (not per line), single-copy framing (complete contiguous lines skip the assembler staging copy — only boundary-straddling lines stage). Read buffer sized to the pipe's 64 KB capacity so a saturated pipe drains in one `read()`. Zero new config, no size cost (BSS buffer). Compared vs logly.zig 2026-07-17: nanozlog wins decisively (6.8 ns/msg ~147M msg/s lock-free SPSC vs logly's 8.5 µs simple path; logly is a feature-rich app logger — wrong shape for a PID-1 hot path). Reference stays nanozlog. |
 
 ## Explicitly rejected (research-backed)
 
@@ -148,6 +148,7 @@ percentiles + suggestion so the premium agent can emit right-sizing PRs
 ## Backlog status
 
 Four research rounds complete; all surfaced features shipped or
-rejected-with-reason. One user-originated idea is parked (#39 cost report,
-Tier 7). Remaining non-feature work: distribution (aports/apt/AUR,
+rejected-with-reason, including the last parked code item (#34 fast capture,
+v0.18) and the user-originated #39 cost report (v0.17). No feature backlog
+remains. Remaining non-feature work: distribution (aports/apt/AUR,
 announcement), v1.0 fuzz-hardening, and the premium sidecar (separate repo).
