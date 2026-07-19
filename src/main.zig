@@ -280,13 +280,21 @@ fn runIncidentList(state_dir: []const u8, filter: ?[]const u8, since_ms: ?u64, i
             const bname = report.scanStr(text, "name") orelse "";
             if (!std.mem.eql(u8, bname, f)) continue;
         }
-        _ = jb.appendf(&report_out_buf, &out_pos, "{d:>3} {s:<21} {s:<14} {s:<14} {s}\n", .{
+        _ = jb.appendf(&report_out_buf, &out_pos, "{d:>3} {s:<21} {s:<14} {s:<14} {s}", .{
             idx,
             report.scanStr(text, "ts") orelse "?",
             report.scanStr(text, "name") orelse "?",
             report.scanStr(text, "cause_str") orelse "?",
             report.scanStr(text, "verdict") orelse "?",
         });
+        // Release correlation: flag a crash that survived a code change.
+        if (std.mem.indexOf(u8, text, "\"regressed\":true") != null) {
+            _ = jb.appendf(&report_out_buf, &out_pos, "  [REGRESSED {s}->{s}]", .{
+                report.scanStr(text, "first_build") orelse "?",
+                report.scanStr(text, "last_build") orelse "?",
+            });
+        }
+        _ = jb.appendf(&report_out_buf, &out_pos, "\n", .{});
     }
     writeOut(report_out_buf[0..out_pos]);
     return 0;

@@ -75,3 +75,11 @@ give-up/essential/oneshot worker's code when those trigger, honoring
 `MANDOR_RELEASE` / `GIT_SHA` (release id in bundles), `MANDOR_STATE_DIR`,
 `PHOTON_TOKEN` (relay bearer auth). `/dev/termination-log`, when present
 (Kubernetes), receives the latest incident verdict automatically.
+
+Set `MANDOR_RELEASE` (or `GIT_SHA`) at build time to unlock **release
+correlation**: mandor remembers which builds each crash signature appeared on,
+so `mandor report --incidents` flags a crash that survived a code change as
+`[REGRESSED v1.0.0->v1.0.1]` and the bundle's `history` object carries
+`builds` / `first_build` / `last_build` / `regressed`. It answers "did the
+last fix hold?". Without a release wired the feature is simply absent — no
+configuration, no behavior change.

@@ -145,6 +145,24 @@ percentiles + suggestion so the premium agent can emit right-sizing PRs
 (k8s `resources:` block, compose limits). Sizing rule of thumb: memory limit
 = peak × margin (OOM-safety); CPU request = p50; CPU limit = p95.
 
+## Tier 8 — foreman↔owner reporting (user, 2026-07-19)
+
+From the "mandor as site foreman" lens: the *downward* channel (supervising
+workers) is near-complete, so the remaining value is in the *upward* channel —
+what the foreman reports back to the developer/owner (human **or** AI agent).
+mandor already speaks in point-events (bundles) and present-tense snapshots
+(`report`); these add the two tenses it was missing.
+
+| # | Feature | Cx | Value | Notes |
+|---|---------|----|-------|-------|
+| 40 ✅ | Release-aware incident correlation ("did the fix work?") | S | ● ● ● ● | SHIPPED v0.19 — signature history now tracks builds; `regressed` when a crash survives a code change. `report --incidents` shows `[REGRESSED a→b]`; bundle `history.{builds,first_build,last_build,regressed}`. Closes the AI-fix loop's feedback edge. Reuses signature index + `MANDOR_RELEASE`/`GIT_SHA`; zero config |
+| 41 | Shift report / run digest at shutdown | S | ● ● ● ○ | One consolidated summary of the whole container life (restarts, incidents, worst signature, cost) written at shutdown for post-mortem by human or AI. Reuses existing counters; complements #40 (digest = this shift; #40 = the trend across shifts) |
+
+**Rejected here (aligned-looking but off-identity):** runtime per-worker control
+(`ctl restart`) — needs a control socket (attack surface + size) and fights
+immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
+(config change = new image). Both already on the rejected list.
+
 ## Backlog status
 
 Four research rounds complete; all surfaced features shipped or

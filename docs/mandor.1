@@ -60,7 +60,12 @@ those mechanisms trigger; 2 for a configuration or startup error.
 State and incident spool directory (default: /var/lib/mandor).
 .TP
 .B MANDOR_RELEASE ", " GIT_SHA
-Release identifier recorded in incident bundles.
+Release identifier recorded in incident bundles. When set, enables release
+correlation: a crash that recurs after a code change is flagged
+.B [REGRESSED]
+in
+.B mandor report --incidents
+so you can tell whether the last fix held.
 .TP
 .B PHOTON_TOKEN
 Bearer token for photon OTLP forwarding.

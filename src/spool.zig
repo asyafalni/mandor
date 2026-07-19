@@ -8,7 +8,7 @@ const sampler = @import("sampler.zig");
 const ring = @import("ring.zig");
 const summarize = @import("summarize.zig");
 
-pub const bundle_version = 6;
+pub const bundle_version = 7;
 
 // ------------------------------------------------------- wall clock
 
@@ -117,13 +117,19 @@ pub const BundleInput = struct {
     history_sig: u64 = 0,
     history_first_epoch: i64 = 0,
     history_count: u32 = 1,
+    /// Distinct builds the signature has recurred across (0 = no release
+    /// wired). `regressed` (builds >= 2) means the crash survived a code
+    /// change — the AI-fix loop's "your last fix did not hold" signal.
+    history_builds: u32 = 0,
+    history_first_build: []const u8 = "",
+    history_last_build: []const u8 = "",
     verdict: []const u8,
 };
 
 const max_env_vars = 32;
 
-/// Serialize a schema-v2 bundle. Returns null if buf is too small (never
-/// panics). See docs/superpowers/plans/2026-07-17-v0.5-forensics.md.
+/// Serialize a bundle at the current `bundle_version`. Returns null if buf
+/// is too small (never panics); the golden test locks the exact byte output.
 pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
     var pos: usize = 0;
     const p = &pos;
@@ -244,9 +250,14 @@ pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
         })) return null;
     }
     var hf_buf: [20]u8 = undefined;
-    if (!jb.appendf(buf, p, "],\"history\":{{\"signature\":\"{x:0>16}\",\"first_seen\":\"{s}\",\"count\":{d}}}", .{
+    if (!jb.appendf(buf, p, "],\"history\":{{\"signature\":\"{x:0>16}\",\"first_seen\":\"{s}\",\"count\":{d},\"builds\":{d},\"regressed\":{},\"first_build\":", .{
         in.history_sig, iso8601(&hf_buf, in.history_first_epoch), in.history_count,
+        in.history_builds, in.history_builds >= 2,
     })) return null;
+    if (!jb.appendJsonString(buf, p, in.history_first_build)) return null;
+    if (!jb.appendf(buf, p, ",\"last_build\":", .{})) return null;
+    if (!jb.appendJsonString(buf, p, in.history_last_build)) return null;
+    if (!jb.appendf(buf, p, "}}", .{})) return null;
     if (!jb.appendf(buf, p, ",\"verdict\":", .{})) return null;
     if (!jb.appendJsonString(buf, p, in.verdict)) return null;
     if (!jb.appendf(buf, p, "}}", .{})) return null;
@@ -402,7 +413,7 @@ test "envRedacted heuristics" {
     try std.testing.expect(!envRedacted("GOMAXPROCS"));
 }
 
-test "bundle golden output locks schema v6" {
+test "bundle golden output locks schema v7" {
     const frames = [_]summarize.Frame{
         .{ .function = "main.crash", .file = "main.go", .line = 10, .in_app = true },
         .{ .function = "runtime.gopanic", .file = "/usr/local/go/src/runtime/panic.go", .line = 770, .in_app = false },
@@ -459,10 +470,13 @@ test "bundle golden output locks schema v6" {
         .history_sig = 0xdeadbeef12345678,
         .history_first_epoch = 1_784_242_023,
         .history_count = 5,
+        .history_builds = 2,
+        .history_first_build = "api@1.4.1",
+        .history_last_build = "api@1.4.2",
         .verdict = "go panic in main.crash",
     }).?;
     const expected =
-        "{\"v\":6,\"ts\":\"2026-07-17T22:47:03Z\"," ++
+        "{\"v\":7,\"ts\":\"2026-07-17T22:47:03Z\"," ++
         "\"process\":{\"name\":\"api\",\"cmd\":\"./api --port 8080\",\"pid\":42,\"restarts\":3," ++
         "\"cwd\":\"/app\",\"exe\":\"/app/api\",\"spawned_at\":\"2026-07-17T22:46:16Z\",\"uptime_s\":47," ++
         "\"ready\":true,\"build\":{\"release\":\"api@1.4.2\",\"elf_build_id\":\"a1b2c3d4\"}," ++
@@ -483,7 +497,8 @@ test "bundle golden output locks schema v6" {
         "\"logs_dropped\":3," ++
         "\"stats_timeline\":[{\"t\":\"-60s\",\"rss_mb\":812,\"cpu_pct\":97,\"psi_mem\":42,\"psi_cpu\":12,\"psi_io\":0}]," ++
         "\"siblings\":[{\"name\":\"worker\",\"state\":\"running\",\"uptime_s\":3600,\"restarts\":0}]," ++
-        "\"history\":{\"signature\":\"deadbeef12345678\",\"first_seen\":\"2026-07-16T22:47:03Z\",\"count\":5}," ++
+        "\"history\":{\"signature\":\"deadbeef12345678\",\"first_seen\":\"2026-07-16T22:47:03Z\",\"count\":5," ++
+        "\"builds\":2,\"regressed\":true,\"first_build\":\"api@1.4.1\",\"last_build\":\"api@1.4.2\"}," ++
         "\"verdict\":\"go panic in main.crash\"}";
     try std.testing.expectEqualStrings(expected, json);
 }

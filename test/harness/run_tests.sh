@@ -102,7 +102,7 @@ export MANDOR_STATE_DIR="$TMP/state2"
 timeout 10 "$MANDOR" "sh $TMP/crash_go.sh" >"$TMP/11" 2>&1
 c=$?
 f=$(ls "$TMP/state2/incidents/"*.json 2>/dev/null | head -1)
-if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":6' "$f" \
+if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":7' "$f" \
    && grep -q '"kind":"exit"' "$f" && grep -q '"exit_code":2' "$f" \
    && grep -q '"cause_str":"exit:2"' "$f" \
    && grep -q '"lang":"go"' "$f" \
@@ -110,9 +110,9 @@ if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":6' "$f" \
    && grep -q '"type":"runtime error"' "$f" \
    && grep -q '"exe":"[^"]*/sh"' "$f" \
    && grep -q 'go panic in main.crash' "$f"; then
-  ok "incident bundle v6: structured frames + exception + verdict"
+  ok "incident bundle v7: structured frames + exception + verdict"
 else
-  bad "incident bundle v6" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
+  bad "incident bundle v7" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
 fi
 unset MANDOR_STATE_DIR
 
@@ -243,6 +243,18 @@ newest=$(ls "$TMP/state20/incidents/"*.json | sort | tail -1)
 if grep -q '"count":2' "$newest"; then ok "recurrence count survives supervisor restarts"
 else bad "recurrence count persistence" "$(grep -o "\"history\":[^}]*}" "$newest")"; fi
 unset MANDOR_STATE_DIR
+
+# 20c. release correlation: the same crash across two builds is a regression
+export MANDOR_STATE_DIR="$TMP/state20c"
+MANDOR_RELEASE=v1.0.0 timeout 10 "$MANDOR" "sh -c 'exit 4'" >/dev/null 2>&1
+MANDOR_RELEASE=v1.0.1 timeout 10 "$MANDOR" "sh -c 'exit 4'" >/dev/null 2>&1
+newest=$(ls "$TMP/state20c/incidents/"*.json | sort | tail -1)
+"$MANDOR" report --incidents >"$TMP/20c" 2>&1
+if grep -q '"regressed":true' "$newest" && grep -q '"first_build":"v1.0.0"' "$newest" \
+   && grep -q '"last_build":"v1.0.1"' "$newest" && grep -q 'REGRESSED v1.0.0->v1.0.1' "$TMP/20c"; then
+  ok "release correlation flags regression across builds"
+else bad "release correlation" "bundle=$(grep -o "\"history\":[^}]*}" "$newest") report=$(grep -o 'REGRESSED[^]]*' "$TMP/20c")"; fi
+unset MANDOR_STATE_DIR MANDOR_RELEASE
 
 # 21. start_after defers the dependent until the dependency is up
 cat > "$TMP/order.toml" <<'TOML'
@@ -510,13 +522,13 @@ else
   echo "skip cap_drop/no_new_privs (not root)"
 fi
 
-# 45. PSI fields present in the incident bundle stats timeline (schema v6).
+# 45. PSI fields present in the incident bundle stats timeline (schema v7).
 # Worker lives past the first 5s sample so stats_timeline is populated.
 export MANDOR_STATE_DIR="$TMP/state45"
 timeout 12 "$MANDOR" "sh -c 'sleep 6; exit 3'" >/dev/null 2>&1
 f=$(ls "$TMP/state45/incidents/"*.json 2>/dev/null | head -1)
-if [ -n "$f" ] && grep -q '"v":6' "$f" && grep -q '"psi_mem"' "$f" && grep -q '"core":' "$f"; then
-  ok "bundle v6 carries psi_mem + limits.core"
+if [ -n "$f" ] && grep -q '"v":7' "$f" && grep -q '"psi_mem"' "$f" && grep -q '"core":' "$f"; then
+  ok "bundle v7 carries psi_mem + limits.core"
 else bad "psi/core in bundle" "$(head -c 200 "$f" 2>/dev/null)"; fi
 unset MANDOR_STATE_DIR
 

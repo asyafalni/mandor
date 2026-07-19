@@ -39,7 +39,8 @@ $ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
 | CPU / RSS / fd tracking | ✅ | ❌ | ❌ |
 | Crash summaries ("restart loop", "leak suspect") | ✅ | ❌ | ❌ |
 | Per-worker cost + right-sizing report | ✅ | ❌ | ❌ |
-| Size | **~210 KB** | ~50 KB | MBs + runtime |
+| Release correlation ("did the fix hold?") | ✅ | ❌ | ❌ |
+| Size | **~260 KB** | ~50 KB | MBs + runtime |
 | Network access required | **never** | never | varies |
 
 The `mandor` binary is fully offline and self-contained: no accounts, no
@@ -138,15 +139,18 @@ PersistentVolumeClaim survives rescheduling. Then recall history any time:
 
 ```console
 $ mandor report --incidents
-2 incident(s) in /var/lib/mandor/incidents (oldest first)
+3 incident(s) in /var/lib/mandor/incidents (oldest first)
 
-TIME                  WORKER   CAUSE           VERDICT
-2026-07-17T13:31:37Z  api      exit:3          exit:3 after 0s uptime
-2026-07-17T13:31:38Z  worker   signal:SIGSEGV  go panic in main.crash (main.go:10)
+  # TIME                  WORKER   CAUSE           VERDICT
+  1 2026-07-17T13:31:37Z  api      exit:3          exit:3 after 0s uptime
+  2 2026-07-17T13:31:38Z  worker   signal:SIGSEGV  go panic in main.crash (main.go:10)
+  3 2026-07-18T09:02:11Z  worker   signal:SIGSEGV  go panic in main.crash  [REGRESSED v1.0.0->v1.0.1]
 ```
 
-The spool keeps the newest 200 incidents and prunes older ones, so a
-persistent volume never fills up.
+Set `MANDOR_RELEASE` (or `GIT_SHA`) at build time and mandor tracks which
+builds each crash appeared on — a crash that survives a code change is flagged
+`[REGRESSED …]`, answering "did the last fix hold?". The spool keeps the newest
+200 incidents and prunes older ones, so a persistent volume never fills up.
 
 ### Configuration file (optional)
 

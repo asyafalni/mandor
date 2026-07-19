@@ -260,11 +260,11 @@ pub fn onDeath(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Wor
     if (!w.det.shouldEmit(sig_hash, now_ms)) return;
 
     total += 1;
-    const hist = history.record(sig_hash, epochNow());
+    const hist = history.record(sig_hash, epochNow(), snap_release);
     history.save(state_dir);
     const uptime_s = (now_ms -| w.last_start_ms) / 1000;
     const stats = collectStats(w);
-    writeBundle(state_dir, .{
+    var in: spool.BundleInput = .{
         .ts_epoch = epochNow(),
         .name = w.nameSlice(),
         .cmd = w.cmd,
@@ -289,19 +289,31 @@ pub fn onDeath(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Wor
         .stats = stats,
         .now_ms = now_ms,
         .siblings = collectSiblings(workers, w, now_ms),
-        .history_sig = hist.sig,
-        .history_first_epoch = hist.first_seen,
-        .history_count = hist.count,
         .verdict = summarize.diagnose(&verdict_buf, cause_str, trace, tail, stats, uptime_s, killed_by_sigkill),
-    });
+    };
+    setHistory(&in, &hist);
+    writeBundle(state_dir, in);
 }
 
 /// Non-death incidents dedupe/recur on (kind, worker) alone.
 fn recordKindHistory(state_dir: []const u8, kind: []const u8, w: *const spawner.Worker) history.Entry {
     const sig = summarize.signature(kind, w.nameSlice(), "");
-    const e = history.record(sig, epochNow());
+    const e = history.record(sig, epochNow(), snap_release);
     history.save(state_dir);
     return e;
+}
+
+/// Copy the persistent recurrence fields from a history entry into a bundle.
+/// One place so every non-death incident kind reports builds consistently.
+/// `e` is borrowed (not copied) so the build slices stay valid until the
+/// caller serializes the bundle — the caller must keep the entry alive.
+fn setHistory(in: *spool.BundleInput, e: *const history.Entry) void {
+    in.history_sig = e.sig;
+    in.history_first_epoch = e.first_seen;
+    in.history_count = e.count;
+    in.history_builds = e.builds;
+    in.history_first_build = e.firstBuild();
+    in.history_last_build = e.lastBuild();
 }
 
 /// Common v2 plumbing for the non-death incident kinds.
@@ -351,9 +363,7 @@ pub fn onRestartLoop(state_dir: []const u8, workers: []spawner.Worker, w: *spawn
     };
     var in = commonInput(workers, w, now_ms, "restart-loop", 0);
     const hist = recordKindHistory(state_dir, "restart-loop", w);
-    in.history_sig = hist.sig;
-    in.history_first_epoch = hist.first_seen;
-    in.history_count = hist.count;
+    setHistory(&in, &hist);
     in.trace = summarize.extractTrace(tail, &trace_storage);
     in.logs_tail = collectCompact(w);
     in.logs_dropped = compactor.dropped;
@@ -369,9 +379,7 @@ pub fn onUnhealthy(state_dir: []const u8, workers: []spawner.Worker, w: *spawner
     const tail = collectTail(w);
     var in = commonInput(workers, w, now_ms, "unhealthy", w.pid);
     const hist = recordKindHistory(state_dir, "unhealthy", w);
-    in.history_sig = hist.sig;
-    in.history_first_epoch = hist.first_seen;
-    in.history_count = hist.count;
+    setHistory(&in, &hist);
     in.trace = summarize.extractTrace(tail, &trace_storage);
     in.logs_tail = collectCompact(w);
     in.logs_dropped = compactor.dropped;
@@ -385,9 +393,7 @@ pub fn onLeak(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Work
     total += 1;
     var in = commonInput(workers, w, now_ms, "leak-suspect", w.pid);
     const hist = recordKindHistory(state_dir, "leak-suspect", w);
-    in.history_sig = hist.sig;
-    in.history_first_epoch = hist.first_seen;
-    in.history_count = hist.count;
+    setHistory(&in, &hist);
     in.logs_tail = collectCompact(w);
     in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);
@@ -414,9 +420,7 @@ pub fn onStall(state_dir: []const u8, workers: []spawner.Worker, kind: detector.
     const cause_str: []const u8 = if (kind == .memory) "stall:memory" else "stall:cpu";
     var in = commonInput(workers, w, now_ms, cause_str, w.pid);
     const hist = recordKindHistory(state_dir, cause_str, w);
-    in.history_sig = hist.sig;
-    in.history_first_epoch = hist.first_seen;
-    in.history_count = hist.count;
+    setHistory(&in, &hist);
     in.logs_tail = collectCompact(w);
     in.logs_dropped = compactor.dropped;
     in.stats = collectStats(w);

@@ -38,11 +38,14 @@ own future file/stdout receiver) forwards it. No mandor change required;
 
 ### 3. Incidents — the real story; needs one v0.8 feature
 
-The incident bundle (schema v5, versioned contract in `src/spool.zig`) is a
+The incident bundle (schema v7, versioned contract in `src/spool.zig`) is a
 ready-made OTEL *event*: structured cause, exception type/message, stack
 frames with `file:line`/`in_app` (Sentry vocabulary), deduplicated log tail,
-stats timeline, release/build-id, recurrence history. The delivery mechanism
-is ROADMAP #19, the **on-incident hook**:
+stats timeline, release/build-id, and recurrence history — now including
+release correlation (`history.builds` / `first_build` / `last_build` /
+`regressed`) so photon can group incidents by build and highlight crashes
+that survived a deploy. The delivery mechanism is ROADMAP #19, the
+**on-incident hook**:
 
 ```toml
 photon = "127.0.0.1:4318"   # that's the whole integration

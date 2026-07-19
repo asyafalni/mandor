@@ -3,6 +3,21 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [0.19.0] - 2026-07-19
+### Added
+- Release-aware incident correlation — "did your fix work?". Each crash
+  signature now remembers which builds it appeared on; when the same crash
+  recurs after a code change, mandor flags it a regression. Bundles gain
+  `history.builds` / `first_build` / `last_build` / `regressed`, and
+  `report --incidents` marks it inline (`[REGRESSED v1.0.0->v1.0.1]`). This
+  is the feedback edge of the incident → AI-fix → redeploy loop: mandor now
+  tells the developer (or the premium agent) whether the last fix held. Uses
+  the `MANDOR_RELEASE`/`GIT_SHA` passthrough already captured; with no
+  release wired it degrades silently (zero config).
+### Changed
+- Incident bundle schema v6 → v7 (added the `history` build fields).
+  `history.json` → v2 (build correlation persisted; v1 files still load).
+
 ## [0.18.0] - 2026-07-19
 ### Changed
 - Faster log capture (nanozlog-inspired hot path). Complete lines that arrive
