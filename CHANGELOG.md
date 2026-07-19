@@ -13,19 +13,6 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
   drains in one `read()` instead of ~16 under log spam. No new config, no
   behavior change; fewer syscalls and one less copy per line.
 
-## [0.14.0] - 2026-07-18
-### Added
-- Zig panic-trace parser (dogfood) — six languages now: Go, Rust, Python,
-  Zig, Java, Node.
-- `mandor report [NAME|PID]` row filtering; `report --incidents [NAME]
-  [--since=DUR]` history filtering; `h` duration unit.
-- HEALTH column and distinct `recycling` / `gave-up` labels in `report`.
-- `docs/CONFIG.md` — complete configuration reference.
-- CI: capture perf-regression gate; aarch64 unit tests under qemu.
-### Changed
-- Setup code DRY: one table drives all per-worker settings (bad values now
-  consistently fail startup).
-
 ## [0.17.0] - 2026-07-18
 ### Added
 - `mandor report --cost` — per-worker resource-cost profiling: idle / typical
@@ -65,6 +52,19 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
   can never drift.
 
 ## [0.14.0] - 2026-07-18
+### Added
+- Zig panic-trace parser (dogfood) — six languages now: Go, Rust, Python,
+  Zig, Java, Node.
+- `mandor report [NAME|PID]` row filtering; `report --incidents [NAME]
+  [--since=DUR]` history filtering; `h` duration unit.
+- HEALTH column and distinct `recycling` / `gave-up` labels in `report`.
+- `docs/CONFIG.md` — complete configuration reference.
+- CI: capture perf-regression gate; aarch64 unit tests under qemu.
+### Changed
+- Setup code DRY: one table drives all per-worker settings (bad values now
+  consistently fail startup).
+
+## [0.13.0] - 2026-07-18
 ### Added
 - `restart_dependents = true` — OTP `rest_for_one`: a dependency's restart
   recycles its `start_after` dependents (planned, never counted as failure).
