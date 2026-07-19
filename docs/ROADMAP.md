@@ -156,7 +156,7 @@ mandor already speaks in point-events (bundles) and present-tense snapshots
 | # | Feature | Cx | Value | Notes |
 |---|---------|----|-------|-------|
 | 40 ✅ | Release-aware incident correlation ("did the fix work?") | S | ● ● ● ● | SHIPPED v0.19 — signature history now tracks builds; `regressed` when a crash survives a code change. `report --incidents` shows `[REGRESSED a→b]`; bundle `history.{builds,first_build,last_build,regressed}`. Closes the AI-fix loop's feedback edge. Reuses signature index + `MANDOR_RELEASE`/`GIT_SHA`; zero config |
-| 41 | Shift report / run digest at shutdown | S | ● ● ● ○ | One consolidated summary of the whole container life (restarts, incidents, worst signature, cost) written at shutdown for post-mortem by human or AI. Reuses existing counters; complements #40 (digest = this shift; #40 = the trend across shifts) |
+| 41 ✅ | Shift report / run digest at shutdown | S | ● ● ● ○ | SHIPPED v0.20 — at shutdown prints one `[mandor] shift report` block to stdout: workers, run duration, total restarts + incidents, then per worker exit code / restarts / peak RSS / GB-hours. Post-mortem for human or AI without scraping the spool. Reuses worker table + cost profiles; zero config. Complements #40 (digest = this shift; #40 = the trend across shifts) |
 
 **Rejected here (aligned-looking but off-identity):** runtime per-worker control
 (`ctl restart`) — needs a control socket (attack surface + size) and fights
@@ -167,6 +167,8 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 
 Four research rounds complete; all surfaced features shipped or
 rejected-with-reason, including the last parked code item (#34 fast capture,
-v0.18) and the user-originated #39 cost report (v0.17). No feature backlog
-remains. Remaining non-feature work: distribution (aports/apt/AUR,
-announcement), v1.0 fuzz-hardening, and the premium sidecar (separate repo).
+v0.18), the user-originated #39 cost report (v0.17), and the Tier 8
+foreman↔owner reporting pair (#40 release correlation v0.19, #41 shift report
+v0.20). No feature backlog remains. Remaining non-feature work: distribution
+(aports/apt/AUR, announcement), v1.0 fuzz-hardening, and the premium sidecar
+(separate repo).

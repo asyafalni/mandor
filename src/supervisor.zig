@@ -199,7 +199,8 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
     var shutting_down = false;
     var kill_escalated = false;
     var shutdown_deadline_ms: u64 = 0;
-    var next_sample_ms: u64 = nowMs() + sampler.interval_ms;
+    const run_start_ms = nowMs();
+    var next_sample_ms: u64 = run_start_ms + sampler.interval_ms;
     var sample_tick: u32 = 0;
     var oom_kills: u64 = cgroup.readOomKills() orelse 0;
     var stall_det: detector.StallState = .{};
@@ -557,6 +558,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
 
     report.writeState(state_dir, workers, nowMs());
     cost.save(state_dir);
+    emitDigest(workers, run_start_ms);
 
     var worst: u8 = 0;
     for (workers) |*w| worst = @max(worst, w.final_code);
@@ -738,6 +740,25 @@ fn forwardAll(workers: []spawner.Worker, sig: posix.SIG) void {
         if (w.pid > 0) posix.kill(-w.pid, sig) catch {
             posix.kill(w.pid, sig) catch {};
         };
+    }
+}
+
+/// Shift report: one consolidated summary of the whole run, emitted to
+/// stdout at shutdown. A human (`kubectl logs`) or an AI post-mortem sees
+/// what happened across the container's life without scraping N incident
+/// files. Zero config, always on; reuses the worker table + cost profiles.
+fn emitDigest(workers: []spawner.Worker, run_start_ms: u64) void {
+    const dur_s = (nowMs() -| run_start_ms) / 1000;
+    var total_restarts: u32 = 0;
+    for (workers) |*w| total_restarts += w.restarts;
+    logmod.print("[mandor] shift report — {d} worker(s), {d}s run, {d} restart(s), {d} incident(s)\n", .{
+        workers.len, dur_s, total_restarts, incident.total,
+    });
+    for (workers, 0..) |*w, i| {
+        const s = cost.get(i).summary();
+        logmod.print("[mandor]   {s}: exit {d}, {d} restart(s), peak {d}MB, {d}.{d:0>2} GB-h\n", .{
+            w.nameSlice(), w.final_code, w.restarts, s.peak_rss_mb, s.gb_hours / 100, s.gb_hours % 100,
+        });
     }
 }
 

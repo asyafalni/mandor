@@ -152,6 +152,18 @@ builds each crash appeared on — a crash that survives a code change is flagged
 `[REGRESSED …]`, answering "did the last fix hold?". The spool keeps the newest
 200 incidents and prunes older ones, so a persistent volume never fills up.
 
+### Shift report
+
+When mandor shuts down it prints one summary of the whole run to stdout — so
+`kubectl logs` (or an AI post-mortem) shows what happened over the container's
+life without opening a single incident file. Always on, no configuration:
+
+```console
+[mandor] shift report — 2 worker(s), 3600s run, 3 restart(s), 2 incident(s)
+[mandor]   api: exit 0, 3 restart(s), peak 812MB, 2.10 GB-h
+[mandor]   worker: exit 0, 0 restart(s), peak 96MB, 0.34 GB-h
+```
+
 ### Configuration file (optional)
 
 CLI-only always works — `mandor.toml` just saves typing. CLI flags override

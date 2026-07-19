@@ -3,6 +3,15 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [0.20.0] - 2026-07-19
+### Added
+- Shift report — at shutdown mandor prints one consolidated summary of the
+  whole run to stdout: worker count, run duration, total restarts and
+  incidents, then per worker its exit code, restarts, peak RSS, and GB-hours.
+  A human (`kubectl logs`) or an AI post-mortem sees what happened across the
+  container's whole life without scraping the incident spool. Zero config,
+  always on; reuses the worker table and cost profiles.
+
 ## [0.19.0] - 2026-07-19
 ### Added
 - Release-aware incident correlation — "did your fix work?". Each crash

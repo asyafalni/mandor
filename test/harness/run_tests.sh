@@ -553,6 +553,15 @@ if [ -n "$n2" ] && [ "$n2" -ge 2 ]; then ok "cost profile persists across restar
 else bad "cost persistence" "idle_n=$n2"; fi
 unset MANDOR_STATE_DIR
 
+# 48. shift-report digest is emitted at shutdown (whole-run summary)
+export MANDOR_STATE_DIR="$TMP/state48"
+out=$(timeout 10 "$MANDOR" "sh -c 'exit 0'" "sh -c 'exit 2'" 2>&1)
+if echo "$out" | grep -q "shift report — 2 worker(s)" \
+   && echo "$out" | grep -qE "exit 2, 0 restart\(s\)"; then
+  ok "shift report digest at shutdown"
+else bad "shift report digest" "$(echo "$out" | tail -4)"; fi
+unset MANDOR_STATE_DIR
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]
