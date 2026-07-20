@@ -20,8 +20,11 @@ pub fn parseBuildId(data: []const u8, out: *[64]u8) ?[]const u8 {
 
     var i: usize = 0;
     while (i < phnum) : (i += 1) {
-        const off = phoff + i * phentsize;
-        if (off + 56 > data.len) return null; // header table beyond our prefix
+        // Every offset here is a u64 straight out of an untrusted file, so all
+        // arithmetic saturates: a wrapped offset would index in bounds by
+        // accident, and in ReleaseSafe an overflow panics — fatal for PID 1.
+        const off = phoff +| @as(u64, i) *| phentsize;
+        if (off +| 56 > data.len) return null; // header table beyond our prefix
         const p_type = std.mem.readInt(u32, data[off..][0..4], .little);
         if (p_type != pt_note) continue;
         const p_offset = std.mem.readInt(u64, data[off + 8 ..][0..8], .little);
@@ -33,14 +36,14 @@ pub fn parseBuildId(data: []const u8, out: *[64]u8) ?[]const u8 {
 
 fn parseNotes(data: []const u8, start: u64, size: u64, out: *[64]u8) ?[]const u8 {
     var off = start;
-    const end = @min(start + size, data.len);
-    while (off + 12 <= end) {
+    const end = @min(start +| size, data.len);
+    while (off +| 12 <= end) {
         const namesz = std.mem.readInt(u32, data[@intCast(off)..][0..4], .little);
         const descsz = std.mem.readInt(u32, data[@intCast(off + 4)..][0..4], .little);
         const note_type = std.mem.readInt(u32, data[@intCast(off + 8)..][0..4], .little);
-        const name_off = off + 12;
-        const desc_off = name_off + std.mem.alignForward(u64, namesz, 4);
-        const next = desc_off + std.mem.alignForward(u64, descsz, 4);
+        const name_off = off +| 12;
+        const desc_off = name_off +| std.mem.alignForward(u64, namesz, 4);
+        const next = desc_off +| std.mem.alignForward(u64, descsz, 4);
         if (next > end) return null;
         if (note_type == nt_gnu_build_id and namesz == 4 and
             std.mem.eql(u8, data[@intCast(name_off)..][0..4], "GNU\x00") and
@@ -118,6 +121,34 @@ test "rejects non-ELF and truncated input" {
     makeTestElf(&elf_bytes);
     elf_bytes[5] = 2; // big-endian: unsupported
     try std.testing.expectEqual(@as(?[]const u8, null), parseBuildId(&elf_bytes, &out));
+}
+
+test "hostile phoff does not overflow" {
+    var elf_bytes: [160]u8 = undefined;
+    makeTestElf(&elf_bytes);
+    // A worker binary is untrusted input: e_phoff is a u64 straight from the
+    // file, so phoff + i*phentsize must not wrap.
+    std.mem.writeInt(u64, elf_bytes[32..40], 0xFFFF_FFFF_FFFF_FFF0, .little);
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), parseBuildId(&elf_bytes, &out));
+}
+
+// The worker binary is untrusted input — a malformed ELF must never panic
+// PID 1. The magic and class bytes are forced valid so the fuzzer spends its
+// budget on the offset arithmetic rather than on the first four bytes.
+test "fuzz parseBuildId" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [512]u8 = undefined;
+            @memset(&buf, 0);
+            const n = @max(64, smith.slice(&buf));
+            @memcpy(buf[0..4], "\x7fELF");
+            buf[4] = 2;
+            buf[5] = 1;
+            var out: [64]u8 = undefined;
+            _ = parseBuildId(buf[0..n], &out);
+        }
+    }.one, .{});
 }
 
 test "real /proc/self/exe on linux has parseable shape" {

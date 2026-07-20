@@ -169,6 +169,21 @@ Four research rounds complete; all surfaced features shipped or
 rejected-with-reason, including the last parked code item (#34 fast capture,
 v0.18), the user-originated #39 cost report (v0.17), and the Tier 8
 foreman↔owner reporting pair (#40 release correlation v0.19, #41 shift report
-v0.20). No feature backlog remains. Remaining non-feature work: distribution
-(aports/apt/AUR, announcement), v1.0 fuzz-hardening, and the premium sidecar
+v0.20). No feature backlog remains.
+
+**v1.0 fuzz-hardening: done (v1.0.0).** `src/fuzz.zig` mutation-fuzzes the
+whole untrusted-input surface — the six trace parsers, the worker ELF header,
+`mandor.toml`, `/proc` + cgroup text, and mandor's own state files — seeded
+from real crash output in `test/fixtures/`. It found two integer-overflow
+panics that would each have killed PID 1 (a malformed worker ELF, a corrupt
+pressure file); both are fixed and pinned by regression tests. The harness was
+itself validated by mutation testing: with the fixes reverted it catches both
+bugs on 8 of 8 seeds. Coverage-guided `zig build test --fuzz` is unusable on
+the pinned Zig 0.16.0, so the harness is in-repo and runs under plain
+`zig build test`.
+
+Remaining non-feature work: a CI soak test (assert flat RSS/fd over a long
+run, to make the "zero allocations in steady state" claim measured rather
+than asserted), a benchmark page vs tini/dumb-init/s6/supervisord,
+distribution (aports/apt/AUR, announcement), and the premium sidecar
 (separate repo).

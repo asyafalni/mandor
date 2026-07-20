@@ -1,0 +1,12 @@
+listening
+/app/server.js:10
+  return obj.x;
+             ^
+
+TypeError: Cannot read properties of undefined (reading 'x')
+    at crash (/app/server.js:10:9)
+    at Object.<anonymous> (/app/server.js:14:1)
+    at Module._compile (node:internal/modules/cjs/loader:1358:14)
+    at node:internal/main/run_main_module:23:47
+
+Node.js v20.11.0

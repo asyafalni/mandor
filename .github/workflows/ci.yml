@@ -23,6 +23,20 @@ jobs:
       - name: Unit tests
         run: zig build test
 
+      # The fuzz harness runs inside `zig build test` with a fresh seed each
+      # invocation, so extra seeds buy extra coverage. A failure prints its
+      # seed; replay it with `zig build test --seed 0x...`. Half the seeds run
+      # ReleaseSafe because that is what ships.
+      - name: Parser fuzzing (untrusted-input surface, 12 seeds)
+        run: |
+          for i in $(seq 1 12); do
+            seed=$(printf '0x%08x' $(( (RANDOM << 16) | RANDOM )))
+            mode=""
+            [ $((i % 2)) -eq 0 ] && mode="-Doptimize=ReleaseSafe"
+            echo "--- fuzz seed $seed $mode"
+            zig build test --seed "$seed" $mode
+          done
+
       - name: Integration harness
         run: |
           zig build

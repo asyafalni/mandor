@@ -33,9 +33,11 @@ pub fn parsePsiAvg60(text: []const u8) u16 {
     const at = std.mem.indexOfPos(u8, text, some, pat) orelse return 0;
     var j = at + pat.len;
     // parse a decimal like 12.34 -> 1234 (percent ×100), clamp to u16
+    // Saturating: a corrupt pressure file can carry an arbitrarily long digit
+    // run, and the result is clamped to u16 below regardless.
     var whole: u32 = 0;
     while (j < text.len and text[j] >= '0' and text[j] <= '9') : (j += 1) {
-        whole = whole * 10 + (text[j] - '0');
+        whole = whole *| 10 +| (text[j] - '0');
     }
     var frac: u32 = 0;
     var fdigits: u32 = 0;
@@ -47,7 +49,7 @@ pub fn parsePsiAvg60(text: []const u8) u16 {
         }
     }
     while (fdigits < 2) : (fdigits += 1) frac *= 10;
-    return @intCast(@min(whole * 100 + frac, std.math.maxInt(u16)));
+    return @intCast(@min(whole *| 100 +| frac, std.math.maxInt(u16)));
 }
 
 /// Rolling window of the most recent samples.

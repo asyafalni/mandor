@@ -251,7 +251,7 @@ pub fn serialize(buf: []u8, in: BundleInput) ?[]const u8 {
     }
     var hf_buf: [20]u8 = undefined;
     if (!jb.appendf(buf, p, "],\"history\":{{\"signature\":\"{x:0>16}\",\"first_seen\":\"{s}\",\"count\":{d},\"builds\":{d},\"regressed\":{},\"first_build\":", .{
-        in.history_sig, iso8601(&hf_buf, in.history_first_epoch), in.history_count,
+        in.history_sig,    iso8601(&hf_buf, in.history_first_epoch), in.history_count,
         in.history_builds, in.history_builds >= 2,
     })) return null;
     if (!jb.appendJsonString(buf, p, in.history_first_build)) return null;

@@ -1,0 +1,8 @@
+Started App in 2.3 seconds
+Exception in thread "main" java.lang.NullPointerException: Cannot invoke "String.length()" because "s" is null
+	at com.example.App.crash(App.java:10)
+	at com.example.App.main(App.java:5)
+	at java.base/java.lang.Thread.run(Thread.java:833)
+Caused by: java.lang.IllegalStateException: root cause
+	at com.example.Db.open(Db.java:42)
+	... 3 more

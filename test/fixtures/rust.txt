@@ -1,0 +1,11 @@
+thread pool started
+thread 'main' panicked at src/main.rs:10:5:
+attempt to divide by zero
+stack backtrace:
+   0: rust_begin_unwind
+             at /rustc/abc/library/std/src/panicking.rs:645:5
+   1: core::panicking::panic_fmt
+             at /rustc/abc/library/core/src/panicking.rs:72:14
+   2: playground::divide
+             at ./src/main.rs:10:5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

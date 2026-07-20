@@ -9,7 +9,7 @@
 
 [![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.16.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Static binary](https://img.shields.io/badge/binary-static%2C%20~210KB-success)
+![Static binary](https://img.shields.io/badge/binary-static%2C%20~268KB-success)
 ![No dependencies](https://img.shields.io/badge/dependencies-zero-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
@@ -40,7 +40,7 @@ $ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
 | Crash summaries ("restart loop", "leak suspect") | ✅ | ❌ | ❌ |
 | Per-worker cost + right-sizing report | ✅ | ❌ | ❌ |
 | Release correlation ("did the fix hold?") | ✅ | ❌ | ❌ |
-| Size | **~260 KB** | ~50 KB | MBs + runtime |
+| Size | **~268 KB** | ~50 KB | MBs + runtime |
 | Network access required | **never** | never | varies |
 
 The `mandor` binary is fully offline and self-contained: no accounts, no
@@ -224,6 +224,10 @@ Design rules the code lives by:
 - **Single thread, one poll loop.** Signals arrive via `signalfd`, not async
   handlers.
 - **No dependencies, no regex.** Trace parsing is line-oriented scanning.
+- **Untrusted input is fuzzed.** Worker stderr, the worker's ELF header,
+  config, `/proc` text, and mandor's own state files all run through a
+  mutation-fuzzing harness on every CI build — a parser panic would kill
+  PID 1, so arithmetic on untrusted bytes saturates rather than traps.
 
 ## Building from source
 
@@ -247,7 +251,9 @@ unchanged — CI runs the full integration harness on all three distro bases.
 
 ## Status
 
-Actively developed. Version history: [CHANGELOG.md](CHANGELOG.md) · every
+**1.0** — stable. The incident-bundle schema is a versioned contract, and the
+untrusted-input surface is fuzz-hardened in CI. Version history:
+[CHANGELOG.md](CHANGELOG.md) · every
 config key: [docs/CONFIG.md](docs/CONFIG.md) · planned and
 researched-but-parked work: [docs/ROADMAP.md](docs/ROADMAP.md).
 

@@ -3,6 +3,31 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.0.0] - 2026-07-20
+
+First stable release. The supervision path is now hardened against the inputs
+it cannot trust, which was the last item standing between 0.x and 1.0.
+
+### Added
+- Mutation-fuzzing harness (`src/fuzz.zig`) over every parser that consumes
+  untrusted input: worker stderr through the six trace parsers, the worker's
+  ELF header, `mandor.toml`, `/proc` and cgroup pressure text, and mandor's
+  own state files. Seeded with real crash output in `test/fixtures/`, with a
+  boundary-value dictionary and a structured ELF generator. It runs inside
+  `zig build test` (fresh seed per invocation) and across 12 seeds in CI;
+  failures replay with `zig build test --seed 0x…`.
+### Fixed
+- **Integer overflow parsing a malformed ELF header** (`elf.zig`). mandor
+  reads a worker's ELF at spawn time to extract its build-id; a corrupt,
+  truncated, or hostile binary could wrap the program-header offset
+  arithmetic and panic PID 1 — killing the container. All offsets derived
+  from file bytes now saturate.
+- **Integer overflow parsing cgroup pressure text** (`sampler.parsePsiAvg60`).
+  A long digit run in a corrupt `*.pressure` file overflowed the accumulator;
+  it now saturates and clamps as before.
+- Formatting drift in `spool.zig` that had been failing the CI `zig fmt
+  --check` step since 0.19.0.
+
 ## [0.20.0] - 2026-07-19
 ### Added
 - Shift report — at shutdown mandor prints one consolidated summary of the

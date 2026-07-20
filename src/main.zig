@@ -372,6 +372,7 @@ test {
     _ = @import("parsers/zigp.zig");
     _ = @import("caps.zig");
     _ = @import("cost.zig");
+    _ = @import("fuzz.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

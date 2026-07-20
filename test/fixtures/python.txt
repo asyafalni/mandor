@@ -1,0 +1,8 @@
+starting up
+Traceback (most recent call last):
+  File "/app/main.py", line 14, in <module>
+    main()
+  File "/app/main.py", line 10, in main
+    return 1/0
+            ~^~
+ZeroDivisionError: division by zero

@@ -1,0 +1,9 @@
+info: listening
+thread 190879 panic: integer overflow
+/app/src/main.zig:12:15: 0x10488d1 in add (main)
+    return a + b;
+              ^
+/app/src/main.zig:4:20: 0x1048a2c in main (main)
+    const c = add(a, b);
+                   ^
+/opt/zig/lib/std/start.zig:642:22: 0x1047c9d in std.start.main (main)
