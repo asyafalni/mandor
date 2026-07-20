@@ -57,11 +57,18 @@ const config_seed =
     \\  "./api --port 8080",
     \\  "./worker",
     \\]
-    \\health = ["api=/bin/check"]
-    \\start_after = ["worker=api"]
-    \\env = ["api=PORT=8080"]
-    \\user = ["api=1000:1000"]
-    \\max_rss_mb = ["api=768"]
+    \\
+    \\[worker.api]
+    \\health = "/bin/check"
+    \\env = ["PORT=8080", "LOG=debug"]
+    \\cwd = "/srv"
+    \\user = "1000:1000"
+    \\max_rss_mb = 768
+    \\essential = true
+    \\
+    \\[worker.worker]
+    \\start_after = "api"
+    \\restart = "never"
     \\
 ;
 

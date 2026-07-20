@@ -8,9 +8,12 @@ workers = [
   "./cron-loop",
 ]
 
-# The worker should only start once the API is accepting connections.
-start_after = ["worker=api"]
-
 # Liveness: mandor restarts the API if this probe fails 3× in a row.
-health = ["api=curl -fsS localhost:8080/healthz"]
 restart_on_unhealthy = true
+
+[worker.api]
+health = "curl -fsS localhost:8080/healthz"
+
+[worker.worker]
+# Only start once the API is accepting connections.
+start_after = "api"

@@ -262,7 +262,8 @@ workers = [
   "bash -c 'sleep 2'",
   "sh -c 'echo B-run; sleep 1'",
 ]
-start_after = ["sh=bash"]
+[worker.sh]
+start_after = "bash"
 TOML
 timeout 15 "$MANDOR" --config="$TMP/order.toml" >"$TMP/21" 2>&1
 c=$?
@@ -305,8 +306,9 @@ else bad "start-period grace" "$(grep "health check" "$TMP/24" | head -2)"; fi
 # 25. per-worker env + cwd from TOML
 cat > "$TMP/ec.toml" <<'TOML'
 workers = ["sh -c 'echo got=$FOO at=$PWD'"]
-env = ["sh=FOO=bar"]
-cwd = ["sh=/tmp"]
+[worker.sh]
+env = ["FOO=bar"]
+cwd = "/tmp"
 TOML
 timeout 10 "$MANDOR" --config="$TMP/ec.toml" >"$TMP/25" 2>&1
 if grep -q "got=bar at=/tmp" "$TMP/25"; then ok "per-worker env and cwd applied"
@@ -318,7 +320,8 @@ workers = [
   "sh -c 'echo migrate-done'",
   "sh -c 'echo app-run'",
 ]
-oneshot = ["sh"]
+[worker.sh]
+oneshot = true
 TOML
 timeout 10 "$MANDOR" --config="$TMP/os.toml" >"$TMP/26" 2>&1
 c=$?
@@ -334,7 +337,8 @@ workers = [
   "sh -c 'exit 7'",
   "sleep 30",
 ]
-oneshot = ["sh"]
+[worker.sh]
+oneshot = true
 TOML
 timeout 10 "$MANDOR" --config="$TMP/osf.toml" >"$TMP/27" 2>&1
 c=$?
@@ -346,7 +350,8 @@ else bad "failed oneshot abort" "exit $c: $(head -5 "$TMP/27")"; fi
 if [ "$(id -u)" -eq 0 ]; then
   cat > "$TMP/u.toml" <<'TOML'
 workers = ["sh -c 'id -u; id -g'"]
-user = ["sh=12345:12345"]
+[worker.sh]
+user = "12345:12345"
 TOML
   timeout 10 "$MANDOR" --config="$TMP/u.toml" >"$TMP/28" 2>&1
   if grep -q "^\[sh\] 12345$" "$TMP/28" && [ "$(grep -c '\[sh\] 12345' "$TMP/28")" -eq 2 ]; then
@@ -359,7 +364,8 @@ fi
 # 29. oom_score_adj applied (positive values need no privileges)
 cat > "$TMP/oom.toml" <<'TOML'
 workers = ["sh -c 'cat /proc/self/oom_score_adj'"]
-oom_score_adj = ["sh=500"]
+[worker.sh]
+oom_score_adj = 500
 TOML
 timeout 10 "$MANDOR" --config="$TMP/oom.toml" >"$TMP/29" 2>&1
 if grep -q "^\[sh\] 500$" "$TMP/29"; then ok "oom_score_adj applied to worker"
@@ -383,7 +389,8 @@ else bad "PDEATHSIG" "wpid=$wpid $(kill -0 "$wpid" 2>/dev/null && echo alive)"; 
 # 32. max_lifetime recycles the worker (planned, not a failure)
 cat > "$TMP/rec.toml" <<'TOML'
 workers = ["sleep 30"]
-max_lifetime = ["sleep=1s"]
+[worker.sleep]
+max_lifetime = "1s"
 TOML
 "$MANDOR" --config="$TMP/rec.toml" >"$TMP/32" 2>&1 &
 mpid=$!
@@ -398,7 +405,8 @@ else bad "recycle" "spawns=$n $(grep recycl "$TMP/32" | head -1)"; fi
 cat > "$TMP/ov.toml" <<'TOML'
 restart = "never"
 workers = ["sh -c 'exit 1'"]
-restart = ["sh=always"]
+[worker.sh]
+restart = "always"
 TOML
 "$MANDOR" --config="$TMP/ov.toml" >"$TMP/33" 2>&1 &
 mpid=$!
@@ -436,7 +444,8 @@ workers = [
   "sh -c 'sleep 0.5; exit 0'",
   "sleep 30",
 ]
-essential = ["sh"]
+[worker.sh]
+essential = true
 TOML
 start=$(date +%s)
 timeout 15 "$MANDOR" --config="$TMP/es.toml" >"$TMP/36" 2>&1
@@ -463,7 +472,8 @@ workers = [
   "sh -c 'sleep 1; exit 1'",
   "sleep 30",
 ]
-start_after = ["sleep=sh"]
+[worker.sleep]
+start_after = "sh"
 TOML
 "$MANDOR" --config="$TMP/rd.toml" >"$TMP/38" 2>&1 &
 mpid=$!
@@ -478,8 +488,9 @@ else bad "restart_dependents" "$(grep -E 'restarting|spawned sleep' "$TMP/38" | 
 m="$TMP/drained"
 cat > "$TMP/ps.toml" <<TOML
 workers = ["bash -c 'trap exit TERM; while true; do sleep 1; done'"]
-pre_stop = ["bash=sh -c 'sleep 0.3; touch $m'"]
 expected_exit = "143"
+[worker.bash]
+pre_stop = "sh -c 'sleep 0.3; touch $m'"
 TOML
 "$MANDOR" --config="$TMP/ps.toml" >"$TMP/39" 2>&1 &
 mpid=$!
@@ -512,7 +523,8 @@ unset MANDOR_STATE_DIR
 if [ "$(id -u)" -eq 0 ]; then
   cat > "$TMP/cap.toml" <<'TOML'
 workers = ["sh -c 'cat /proc/self/status | grep NoNewPrivs'"]
-user = ["sh=12345:12345"]
+[worker.sh]
+user = "12345:12345"
 cap_drop = ["sh=all"]
 TOML
   timeout 10 "$MANDOR" --config="$TMP/cap.toml" >"$TMP/44" 2>&1

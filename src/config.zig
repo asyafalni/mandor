@@ -57,9 +57,10 @@ pub const FileConfig = struct {
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, oneshot, user, cap_drop, oom, nice, max_rss, lifetime, restart_override, essential, pre_stop };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, user, cap_drop, oom, nice, max_rss, lifetime, restart_override, pre_stop };
 
-/// name=value array keys share one parse shape; map key -> target + slot.
+/// Per-worker settings all land in `worker -> value` pair arrays; map the
+/// section key to its slot.
 fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSpec, n: *u8 } {
     return switch (target) {
         .health => .{ .arr = &cfg.health, .n = &cfg.health_n },
@@ -88,7 +89,9 @@ pub fn parse(
 ) ParseError!FileConfig {
     var cfg: FileConfig = .{};
     var ncmd: usize = 0;
-    var target: ArrayTarget = .none;
+    var target: ArrayTarget = .none; // open multiline array
+    var array_worker: ?[]const u8 = null; // worker owning that array, if any
+    var cur_worker: ?[]const u8 = null; // active [worker.NAME] section
 
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw_line| {
@@ -103,8 +106,14 @@ pub fn parse(
             const item = std.mem.trim(u8, line, " \t,");
             if (item.len == 0) continue;
             const s = parseString(item) orelse return error.Syntax;
-            try appendItem(&cfg, cmd_storage, &ncmd, target, s);
+            try appendItem(&cfg, cmd_storage, &ncmd, target, array_worker, s);
             if (std.mem.endsWith(u8, line, "]")) target = .none;
+            continue;
+        }
+
+        // [worker.NAME] — every key below it scopes to that worker.
+        if (line[0] == '[') {
+            cur_worker = try sectionWorker(line);
             continue;
         }
 
@@ -112,20 +121,12 @@ pub fn parse(
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
 
-        if (std.mem.eql(u8, key, "restart") and value.len > 0 and value[0] == '[') {
-            // per-worker override form: restart = ["api=always"]
-            var rest = std.mem.trim(u8, value[1..], " \t");
-            const closed = std.mem.endsWith(u8, rest, "]");
-            if (closed) rest = std.mem.trim(u8, rest[0 .. rest.len - 1], " \t");
-            var items = std.mem.splitScalar(u8, rest, ',');
-            while (items.next()) |item_raw| {
-                const item = std.mem.trim(u8, item_raw, " \t");
-                if (item.len == 0) continue;
-                const s = parseString(item) orelse return error.BadValue;
-                try appendItem(&cfg, cmd_storage, &ncmd, .restart_override, s);
-            }
-            if (!closed) target = .restart_override;
-        } else if (std.mem.eql(u8, key, "restart")) {
+        if (cur_worker) |w| {
+            try workerSetting(&cfg, cmd_storage, &ncmd, &target, &array_worker, w, key, value);
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "restart")) {
             const s = parseString(value) orelse return error.BadValue;
             cfg.restart = if (std.mem.eql(u8, s, "never"))
                 .never
@@ -186,7 +187,7 @@ pub fn parse(
                 false
             else
                 return error.BadValue;
-        } else if (arrayKey(key)) |this_target| {
+        } else if (std.mem.eql(u8, key, "workers")) {
             if (value.len == 0 or value[0] != '[') return error.BadValue;
             var rest = std.mem.trim(u8, value[1..], " \t");
             const closed = std.mem.endsWith(u8, rest, "]");
@@ -196,9 +197,9 @@ pub fn parse(
                 const item = std.mem.trim(u8, item_raw, " \t");
                 if (item.len == 0) continue;
                 const s = parseString(item) orelse return error.BadValue;
-                try appendItem(&cfg, cmd_storage, &ncmd, this_target, s);
+                try appendItem(&cfg, cmd_storage, &ncmd, .workers, null, s);
             }
-            if (!closed) target = this_target;
+            if (!closed) target = .workers;
         } else {
             return error.Syntax; // unknown key: fail loudly, configs are small
         }
@@ -208,15 +209,15 @@ pub fn parse(
     return cfg;
 }
 
-fn arrayKey(key: []const u8) ?ArrayTarget {
+/// Keys valid inside a `[worker.NAME]` section.
+fn workerKey(key: []const u8) ?ArrayTarget {
     const map = .{
-        .{ "workers", ArrayTarget.workers },         .{ "health", ArrayTarget.health },
-        .{ "start_after", ArrayTarget.start_after }, .{ "env", ArrayTarget.env },
-        .{ "cwd", ArrayTarget.cwd },                 .{ "oneshot", ArrayTarget.oneshot },
-        .{ "user", ArrayTarget.user },               .{ "cap_drop", ArrayTarget.cap_drop },
-        .{ "oom_score_adj", ArrayTarget.oom },       .{ "nice", ArrayTarget.nice },
-        .{ "max_rss_mb", ArrayTarget.max_rss },      .{ "max_lifetime", ArrayTarget.lifetime },
-        .{ "essential", ArrayTarget.essential },     .{ "pre_stop", ArrayTarget.pre_stop },
+        .{ "health", ArrayTarget.health },            .{ "start_after", ArrayTarget.start_after },
+        .{ "env", ArrayTarget.env },                  .{ "cwd", ArrayTarget.cwd },
+        .{ "user", ArrayTarget.user },                .{ "cap_drop", ArrayTarget.cap_drop },
+        .{ "oom_score_adj", ArrayTarget.oom },        .{ "nice", ArrayTarget.nice },
+        .{ "max_rss_mb", ArrayTarget.max_rss },       .{ "max_lifetime", ArrayTarget.lifetime },
+        .{ "restart", ArrayTarget.restart_override }, .{ "pre_stop", ArrayTarget.pre_stop },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, key, entry[0])) return entry[1];
@@ -224,38 +225,99 @@ fn arrayKey(key: []const u8) ?ArrayTarget {
     return null;
 }
 
+/// `[worker.NAME]` -> NAME. Any other section header is a hard error: configs
+/// are small, so a typo should stop startup rather than be silently ignored.
+fn sectionWorker(line: []const u8) ParseError!?[]const u8 {
+    if (line[line.len - 1] != ']') return error.Syntax;
+    const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
+    const prefix = "worker.";
+    if (!std.mem.startsWith(u8, inner, prefix)) return error.Syntax;
+    const name = std.mem.trim(u8, inner[prefix.len..], " \t");
+    if (name.len == 0) return error.Syntax;
+    return name;
+}
+
+/// A quoted string, or a bare token (integers, `true`/`false`).
+fn scalarValue(v: []const u8) ?[]const u8 {
+    if (v.len == 0) return null;
+    if (v[0] == '"') return parseString(v);
+    return v;
+}
+
+/// Apply one `key = value` inside `[worker.NAME]`.
+fn workerSetting(
+    cfg: *FileConfig,
+    cmd_storage: *[cli.max_workers][]const u8,
+    ncmd: *usize,
+    target: *ArrayTarget,
+    array_worker: *?[]const u8,
+    w: []const u8,
+    key: []const u8,
+    value: []const u8,
+) ParseError!void {
+    // Membership flags: the worker's name joins a list rather than carrying a
+    // value, so `false` is simply the default.
+    const is_essential = std.mem.eql(u8, key, "essential");
+    if (is_essential or std.mem.eql(u8, key, "oneshot")) {
+        if (std.mem.eql(u8, value, "false")) return;
+        if (!std.mem.eql(u8, value, "true")) return error.BadValue;
+        if (is_essential) {
+            if (cfg.essential_n == cfg.essential.len) return error.BadValue;
+            cfg.essential[cfg.essential_n] = w;
+            cfg.essential_n += 1;
+        } else {
+            if (cfg.oneshot_n == cfg.oneshot.len) return error.BadValue;
+            cfg.oneshot[cfg.oneshot_n] = w;
+            cfg.oneshot_n += 1;
+        }
+        return;
+    }
+
+    const tgt = workerKey(key) orelse return error.Syntax;
+
+    // `env` is the one list-valued per-worker key: ["KEY=VALUE", ...].
+    if (value.len > 0 and value[0] == '[') {
+        if (tgt != .env) return error.BadValue;
+        var rest = std.mem.trim(u8, value[1..], " \t");
+        const closed = std.mem.endsWith(u8, rest, "]");
+        if (closed) rest = std.mem.trim(u8, rest[0 .. rest.len - 1], " \t");
+        var items = std.mem.splitScalar(u8, rest, ',');
+        while (items.next()) |item_raw| {
+            const item = std.mem.trim(u8, item_raw, " \t");
+            if (item.len == 0) continue;
+            const s = parseString(item) orelse return error.BadValue;
+            try appendItem(cfg, cmd_storage, ncmd, tgt, w, s);
+        }
+        if (!closed) {
+            target.* = tgt;
+            array_worker.* = w;
+        }
+        return;
+    }
+
+    const s = scalarValue(value) orelse return error.BadValue;
+    try appendItem(cfg, cmd_storage, ncmd, tgt, w, s);
+}
+
 fn appendItem(
     cfg: *FileConfig,
     cmd_storage: *[cli.max_workers][]const u8,
     ncmd: *usize,
     target: ArrayTarget,
+    worker: ?[]const u8,
     s: []const u8,
 ) ParseError!void {
-    switch (target) {
-        .workers => {
-            if (ncmd.* == cli.max_workers) return error.TooManyWorkers;
-            cmd_storage[ncmd.*] = s;
-            ncmd.* += 1;
-        },
-        .oneshot => {
-            if (cfg.oneshot_n == cfg.oneshot.len) return error.BadValue;
-            cfg.oneshot[cfg.oneshot_n] = s;
-            cfg.oneshot_n += 1;
-        },
-        .essential => {
-            if (cfg.essential_n == cfg.essential.len) return error.BadValue;
-            cfg.essential[cfg.essential_n] = s;
-            cfg.essential_n += 1;
-        },
-        else => {
-            const slot = pairSlot(cfg, target) orelse unreachable; // real target
-            const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.BadValue;
-            if (eq == 0 or eq + 1 >= s.len) return error.BadValue;
-            if (slot.n.* == slot.arr.len) return error.BadValue;
-            slot.arr[slot.n.*] = .{ .worker = s[0..eq], .cmd = s[eq + 1 ..] };
-            slot.n.* += 1;
-        },
+    if (target == .workers) {
+        if (ncmd.* == cli.max_workers) return error.TooManyWorkers;
+        cmd_storage[ncmd.*] = s;
+        ncmd.* += 1;
+        return;
     }
+    const slot = pairSlot(cfg, target) orelse return error.Syntax;
+    const w = worker orelse return error.Syntax;
+    if (slot.n.* == slot.arr.len) return error.BadValue;
+    slot.arr[slot.n.*] = .{ .worker = w, .cmd = s };
+    slot.n.* += 1;
 }
 
 fn stripComment(line: []const u8) []const u8 {
@@ -301,7 +363,9 @@ test "health, ready_fd and restart_on_unhealthy keys" {
         \\ready_fd = 5
         \\health_interval = "10s"
         \\restart_on_unhealthy = true
-        \\health = ["api=/bin/check --fast"]
+        \\
+        \\[worker.api]
+        \\health = "/bin/check --fast"
     ;
     const cfg = try parse(text, &storage);
     try t.expectEqual(@as(?u8, 5), cfg.ready_fd);
@@ -312,25 +376,80 @@ test "health, ready_fd and restart_on_unhealthy keys" {
     try t.expectEqualStrings("/bin/check --fast", cfg.health[0].cmd);
 }
 
-test "env, cwd, oneshot keys" {
+test "worker section: env, cwd, oneshot" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    const cfg = try parse(
-        "env = [\"api=PORT=8080\", \"api=DEBUG=1\"]\ncwd = [\"api=/srv\"]\noneshot = [\"migrate\"]",
-        &storage,
-    );
+    const text =
+        \\[worker.api]
+        \\env = ["PORT=8080", "DEBUG=1"]
+        \\cwd = "/srv"
+        \\
+        \\[worker.migrate]
+        \\oneshot = true
+    ;
+    const cfg = try parse(text, &storage);
     try t.expectEqual(@as(u8, 2), cfg.env_pairs_n);
+    try t.expectEqualStrings("api", cfg.env_pairs[0].worker);
     try t.expectEqualStrings("PORT=8080", cfg.env_pairs[0].cmd);
+    try t.expectEqualStrings("DEBUG=1", cfg.env_pairs[1].cmd);
+    try t.expectEqualStrings("api", cfg.cwd_pairs[0].worker);
     try t.expectEqualStrings("/srv", cfg.cwd_pairs[0].cmd);
+    try t.expectEqual(@as(u8, 1), cfg.oneshot_n);
     try t.expectEqualStrings("migrate", cfg.oneshot[0]);
 }
 
-test "start_after key" {
+test "worker section: scalars, bare ints, membership flags" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    const cfg = try parse("start_after = [\"worker=api\", \"cron=worker\"]", &storage);
-    try t.expectEqual(@as(u8, 2), cfg.start_after_n);
-    try t.expectEqualStrings("worker", cfg.start_after[0].worker);
-    try t.expectEqualStrings("api", cfg.start_after[0].cmd);
-    try t.expectError(error.BadValue, parse("start_after = [\"nodeps\"]", &storage));
+    const text =
+        \\[worker.api]
+        \\start_after = "db"
+        \\user = "1000:1000"
+        \\max_rss_mb = 768
+        \\nice = 5
+        \\restart = "never"
+        \\essential = true
+        \\
+        \\[worker.cron]
+        \\essential = false
+    ;
+    const cfg = try parse(text, &storage);
+    try t.expectEqualStrings("api", cfg.start_after[0].worker);
+    try t.expectEqualStrings("db", cfg.start_after[0].cmd);
+    try t.expectEqualStrings("1000:1000", cfg.user_pairs[0].cmd);
+    try t.expectEqualStrings("768", cfg.max_rss_pairs[0].cmd);
+    try t.expectEqualStrings("5", cfg.nice_pairs[0].cmd);
+    try t.expectEqualStrings("never", cfg.restart_pairs[0].cmd);
+    // `false` records nothing, so only api is essential.
+    try t.expectEqual(@as(u8, 1), cfg.essential_n);
+    try t.expectEqualStrings("api", cfg.essential[0]);
+}
+
+test "worker section: multiline env array keeps its worker" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\[worker.api]
+        \\env = [
+        \\  "PORT=8080",
+        \\  "LOG=debug",
+        \\]
+        \\cwd = "/srv"
+    ;
+    const cfg = try parse(text, &storage);
+    try t.expectEqual(@as(u8, 2), cfg.env_pairs_n);
+    try t.expectEqualStrings("api", cfg.env_pairs[1].worker);
+    try t.expectEqualStrings("LOG=debug", cfg.env_pairs[1].cmd);
+    try t.expectEqualStrings("/srv", cfg.cwd_pairs[0].cmd);
+}
+
+test "bad sections and stray per-worker keys are rejected" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // Unknown section, empty name, and a per-worker key outside any section.
+    try t.expectError(error.Syntax, parse("[server.api]\ncwd = \"/srv\"", &storage));
+    try t.expectError(error.Syntax, parse("[worker.]\ncwd = \"/srv\"", &storage));
+    try t.expectError(error.Syntax, parse("cwd = \"/srv\"", &storage));
+    // Only env takes a list inside a section.
+    try t.expectError(error.BadValue, parse("[worker.api]\ncwd = [\"/srv\"]", &storage));
+    // Unknown key inside a section.
+    try t.expectError(error.Syntax, parse("[worker.api]\nbogus = \"x\"", &storage));
 }
 
 test "stop_grace and expected_exit keys" {

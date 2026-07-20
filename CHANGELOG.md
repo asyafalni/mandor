@@ -3,6 +3,44 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.1.0] - 2026-07-20
+
+### Changed — breaking (config only)
+- **Per-worker settings move from flat `"name=value"` arrays to
+  `[worker.NAME]` sections.** The old form put two `=` in one string
+  (`env = ["api=PORT=8080"]`), which read as ambiguous even though it parsed
+  fine. Grouping by worker removes the doubled separator entirely and puts
+  everything about one worker in one place:
+
+  ```toml
+  workers = ["./migrate", "./api --port 8080", "./worker"]
+
+  [worker.migrate]
+  oneshot = true
+
+  [worker.api]
+  env = ["PORT=8080", "LOG_LEVEL=info"]
+  cwd = "/srv/app"
+  health = "/bin/check-api"
+  essential = true
+
+  [worker.worker]
+  start_after = "api"
+  ```
+
+  `env` keeps `KEY=VALUE` deliberately — it is the format `execve`, `.env`,
+  `docker -e`, compose, and Kubernetes all use, and it matches the `KEY=VAL`
+  lines `env_file` reads. The ambiguity was the `worker-name=` prefix, not the
+  environment pair.
+
+  `oneshot` and `essential` become booleans on the worker (`oneshot = true`)
+  instead of separate name lists. Unknown sections and unknown keys inside a
+  section are hard errors. CLI flags are unchanged (`--health=NAME=CMD` still
+  works); this is a `mandor.toml` change only.
+
+  Done now, in 1.x, because nothing has been published yet — the same change
+  after release would cost a major version.
+
 ## [1.0.3] - 2026-07-20
 
 Turns the last asserted-but-unmeasured claim into a measured one, and covers

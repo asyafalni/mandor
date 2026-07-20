@@ -2,23 +2,10 @@
 
 Precedence: **TOML < environment < CLI**. CLI-only always works; `mandor.toml`
 is loaded from `--config=PATH` (must exist) or `./mandor.toml` (best-effort).
-Per-worker keys use flat `"worker-name=value"` pairs, **split at the first
-`=`** — everything after it is the value, verbatim. That matters for `env`,
-whose value is itself a `KEY=VALUE` pair:
-
-```toml
-env = ["api=PORT=8080"]
-#      └─┬─┘ └───┬────┘
-#     worker   the environment pair, passed through as-is
-```
-
-`KEY=VALUE` is deliberate: it is the format `execve`, `.env` files, `docker
--e`, compose, and Kubernetes all use, so values paste in unchanged, and it
-matches the `KEY=VAL` lines `env_file` reads.
-
-The worker name is the basename of the command's first token (duplicates get
-`-2`, `-3`…). Quotes, backslashes, and control characters in a name become
-`_`, so names stay safe in the Prometheus exposition format.
+Per-worker settings live in `[worker.NAME]` sections (see below). The worker
+name is the basename of the command's first token (duplicates get `-2`,
+`-3`…). Quotes, backslashes, and control characters in a name become `_`, so
+names stay safe in the Prometheus exposition format.
 
 ## Global keys
 
@@ -43,24 +30,48 @@ The worker name is the basename of the command's first token (duplicates get
 | `psi_mem_pct = 80` | `--psi-mem=` | off | Incident when container memory pressure (PSI some avg60) sustains above this % |
 | `psi_cpu_pct = 90` | `--psi-cpu=` | off | Incident when container CPU pressure sustains above this % |
 
-## Per-worker keys (arrays of `"name=value"`)
+## Per-worker keys — `[worker.NAME]` sections
 
-| Key | Example | Meaning |
+Anything specific to one worker lives in a `[worker.NAME]` section, where
+`NAME` is the worker's derived name (see above). Unknown sections and unknown
+keys inside a section are hard errors — configs are small, so a typo should
+stop startup rather than be silently ignored.
+
+```toml
+workers = ["./migrate", "./api --port 8080", "./worker"]
+
+[worker.migrate]
+oneshot = true
+
+[worker.api]
+env = ["PORT=8080", "LOG_LEVEL=info"]
+cwd = "/srv/app"
+health = "/bin/check --fast"
+essential = true
+
+[worker.worker]
+start_after = "api"
+```
+
+| Key | Type | Meaning |
 |---|---|---|
-| `health` | `["api=/bin/check --fast"]` | Liveness probe command (exit 0 = healthy; also `--health=` on CLI, repeatable) |
-| `start_after` | `["worker=api"]` | Start `worker` once `api` is up (ready, or alive 1s); dead dependencies unblock |
-| `oneshot` | `["migrate"]` (names) | Init task: runs first, gates all regular workers; failure aborts startup with its code |
-| `essential` | `["api"]` (names) | Leader: its permanent exit stops the fleet and propagates its code |
-| `env` | `["api=PORT=8080"]` | Extra environment (repeatable per worker) |
-| `cwd` | `["api=/srv/app"]` | Working directory |
-| `user` | `["api=1000:1000"]` | Privilege drop before exec (numeric uid:gid; fail-closed, exit 126) |
-| `cap_drop` | `["api=NET_RAW,SYS_ADMIN"]` or `["api=all"]` | Drop Linux capabilities from the bounding set; sets `no_new_privs` when a uid is also dropped |
-| `oom_score_adj` | `["cache=500"]` | Steer the kernel OOM killer (-1000..1000) |
-| `nice` | `["batch=10"]` | Scheduling niceness |
-| `max_rss_mb` | `["api=768"]` | Recycle (graceful planned restart) beyond this RSS |
-| `max_lifetime` | `["api=12h"]` | Periodic recycle |
-| `restart` | `["cron=never"]` | Per-worker override of the global policy |
-| `pre_stop` | `["api=/bin/drain"]` | Drain command on graceful shutdown; TERM follows its completion |
+| `health` | string | Liveness probe command (exit 0 = healthy; also `--health=NAME=CMD` on CLI, repeatable) |
+| `start_after` | string | Start this worker once the named one is up (ready, or alive 1s); dead dependencies unblock |
+| `oneshot` | bool | Init task: runs first, gates all regular workers; failure aborts startup with its code |
+| `essential` | bool | Leader: its permanent exit stops the fleet and propagates its code |
+| `env` | array of `"KEY=VALUE"` | Extra environment. `KEY=VALUE` matches `execve`, `.env`, `docker -e`, and the lines `env_file` reads |
+| `cwd` | string | Working directory |
+| `user` | string | Privilege drop before exec (numeric `uid:gid`; fail-closed, exit 126) |
+| `cap_drop` | string | `"NET_RAW,SYS_ADMIN"` or `"all"` — drop Linux capabilities from the bounding set; sets `no_new_privs` when a uid is also dropped |
+| `oom_score_adj` | int | Steer the kernel OOM killer (-1000..1000) |
+| `nice` | int | Scheduling niceness |
+| `max_rss_mb` | int | Recycle (graceful planned restart) beyond this RSS |
+| `max_lifetime` | duration string | Periodic recycle |
+| `restart` | string | Per-worker override of the global policy |
+| `pre_stop` | string | Drain command on graceful shutdown; TERM follows its completion |
+
+Booleans (`oneshot`, `essential`) record membership, so `false` is simply the
+default and means the same as omitting the key.
 
 ## Signals & exit codes
 

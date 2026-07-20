@@ -169,29 +169,41 @@ life without opening a single incident file. Always on, no configuration:
 CLI-only always works — `mandor.toml` just saves typing. CLI flags override
 file values; `MANDOR_STATE_DIR` overrides the file's `state_dir`.
 
+Global settings sit at the top; anything specific to one worker goes in a
+`[worker.NAME]` section, where `NAME` is the basename of its command.
+
 ```toml
 restart = "on-failure"
 metrics_port = 9464
-workers = [
-  "./api --port 8080",
-  "./worker",
-]
-# optional: liveness probes, ordering, init tasks, per-worker settings
-health = ["api=/bin/check-api"]
-start_after = ["worker=api"]   # worker starts once api is up (ready or alive 1s)
-oneshot = ["migrate"]          # init tasks run first; failure aborts startup
-env = ["api=PORT=8080"]        # worker "api" gets PORT=8080 (first "=" splits)
-cwd = ["api=/srv/app"]         # per-worker working directory
-user = ["api=1000:1000"]       # drop root before exec (numeric uid:gid)
-cap_drop = ["api=all"]         # drop Linux capabilities + set no_new_privs
 psi_mem_pct = 80               # incident if container memory pressure sustains >80%
-essential = ["api"]            # api exiting stops everything (leader)
 env_file = ".env"              # KEY=VAL lines for all workers
-max_rss_mb = ["api=768"]       # recycle worker beyond this RSS (planned, not a failure)
-max_lifetime = ["api=12h"]     # periodic recycle as a leak crutch
-restart = ["cron=never"]       # per-worker override of the global policy
 on_incident = "/notify"        # exec'd with each incident bundle path
 photon = "127.0.0.1:4318"      # auto-forward incidents to photon (OTLP)
+workers = [
+  "./migrate",
+  "./api --port 8080",
+  "./worker",
+  "./cron",
+]
+
+[worker.migrate]
+oneshot = true                 # runs first; failure aborts startup
+
+[worker.api]
+env = ["PORT=8080", "LOG_LEVEL=info"]
+cwd = "/srv/app"
+user = "1000:1000"             # drop root before exec (numeric uid:gid)
+cap_drop = "all"               # drop Linux capabilities + set no_new_privs
+health = "/bin/check-api"
+essential = true               # api exiting stops everything (leader)
+max_rss_mb = 768               # recycle beyond this RSS (planned, not a failure)
+max_lifetime = "12h"           # periodic recycle as a leak crutch
+
+[worker.worker]
+start_after = "api"            # starts once api is up (ready or alive 1s)
+
+[worker.cron]
+restart = "never"              # per-worker override of the global policy
 ```
 
 Signals (dumb-init parity): every worker runs in its own process group, so

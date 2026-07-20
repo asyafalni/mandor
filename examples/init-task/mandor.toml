@@ -12,4 +12,5 @@ workers = [
   "./api --port 8080",
 ]
 
-oneshot = ["setup"]       # runs first; workers wait for it to exit 0
+[worker.setup]
+oneshot = true            # runs first; the other workers wait for it to exit 0
