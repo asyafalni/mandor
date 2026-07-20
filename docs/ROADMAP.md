@@ -167,7 +167,7 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 
 | # | Item | Cx | Value | Notes |
 |---|------|----|-------|-------|
-| 42 | Retry a transient `fork` failure instead of retiring the worker | XS | ● ● ● ○ | PARKED 2026-07-20 (user) — behavior change |
+| 42 | Retry a transient `fork` failure instead of retiring the worker | XS | ● ● ● ● | PARKED 2026-07-20 (user) — **also silently breaks `essential`**, see below |
 | 43 | Exit once all *significant* workers are gone (OTP `all_significant`) | S | ● ● ● ○ | PARKED 2026-07-20 (user) — the one genuinely missing exit mode; semantics need thought |
 | 44 | Per-worker `expected_exit` | XS | ● ● ○ ○ | PARKED 2026-07-20 — currently global-only |
 
@@ -193,6 +193,35 @@ silently missing worker. Silent degradation is arguably worse than dying.
 policy and backoff, giving up only at `max_restarts`. That is exactly what the
 backoff machinery exists for, and it preserves the give-up signal for genuinely
 permanent failures.
+
+**A worker that never starts also silently defeats `essential`** (user
+question, 2026-07-20 — verified by forcing `spawn()` to return `ForkFailed`):
+
+```
+[mandor] fork failed for sleep     <- essential worker, never started
+[mandor] spawned sleep-2 (pid 639) <- fleet carries on regardless
+(mandor still running when an external timeout killed it)
+```
+
+No `essential worker … stopping all`. The leader semantics live at
+`supervisor.zig:471`, *inside the reap/death block* — they only run when a
+worker that was running exits. The spawn-failure path sets `w.done = true;
+w.final_code = 125;` and returns, never reaching that check. So the fleet keeps
+running with a leader that never existed, and the shift report lists the
+worker as `exit 125` as though it had run. The `essential` guarantee breaks in
+precisely the situation it exists for, and mandor never exits, so no
+orchestrator restarts the container either.
+
+**Two defects, one root cause** — a failed spawn is treated as a terminal
+state reached *outside* the normal death path:
+
+1. A transient `EAGAIN` retires the worker permanently instead of retrying
+   under the restart policy and backoff.
+2. That retirement skips leader semantics entirely.
+
+Fixing (1) by routing a failed spawn through the same path as a worker death
+would fix (2) for free, which is an argument for doing it that way rather than
+special-casing the essential check.
 
 **Why parked:** it changes restart semantics and the observable exit code 125.
 Not a crash — mandor stays alive either way — so it did not gate the 1.0.x
