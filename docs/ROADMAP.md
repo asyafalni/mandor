@@ -167,7 +167,7 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 
 | # | Item | Cx | Value | Notes |
 |---|------|----|-------|-------|
-| 42 | Retry a transient `fork` failure instead of retiring the worker | XS | ● ● ● ● | PARKED 2026-07-20 (user) — **also silently breaks `essential`**, see below |
+| 42 | Route a failed spawn through the death path (fixes fork-retry, `essential`, `oneshot`) | S | ● ● ● ● | PARKED 2026-07-20 (user) — **3 verified defects**; a failed `oneshot` currently reads as SUCCESS. See below |
 | 43 | Exit once all *significant* workers are gone (OTP `all_significant`) | S | ● ● ● ○ | PARKED 2026-07-20 (user) — the one genuinely missing exit mode; semantics need thought |
 | 44 | Per-worker `expected_exit` | XS | ● ● ○ ○ | PARKED 2026-07-20 — currently global-only |
 
@@ -212,16 +212,41 @@ worker as `exit 125` as though it had run. The `essential` guarantee breaks in
 precisely the situation it exists for, and mandor never exits, so no
 orchestrator restarts the container either.
 
-**Two defects, one root cause** — a failed spawn is treated as a terminal
-state reached *outside* the normal death path:
+**A oneshot that never starts is treated as SUCCESS** (verified the same way,
+injecting `ForkFailed` for the init task):
+
+```
+[mandor] fork failed for setup
+[mandor] api waits for init tasks
+[mandor] spawned api (pid 459)          <- gate opened anyway
+[api] API SERVING (db may be unmigrated!)
+```
+
+Controls confirm the normal paths are correct: a oneshot that exits 0 logs
+`init task setup completed` and releases the fleet; one that exits nonzero logs
+`init task setup failed, shutting down` and the dependents never start. Only
+the never-started case misbehaves. `allOneshotsDone` (`supervisor.zig:650`)
+tests just `w.done`, which the spawn-failure path sets — so the failed init
+task reads as finished.
+
+This is the worst of the three: not a missing guarantee but a **failure
+silently converted into a success**, with dependents proceeding against
+uninitialized state. Migrations never ran; the API serves anyway.
+
+**Three defects, one root cause** — every terminal-state handler (restart
+policy, `essential` at `supervisor.zig:471`, `oneshot` at `:418`) lives inside
+the reap/death block, and the spawn-failure path bypasses all of them:
 
 1. A transient `EAGAIN` retires the worker permanently instead of retrying
    under the restart policy and backoff.
-2. That retirement skips leader semantics entirely.
+2. That retirement skips leader semantics — the fleet runs on without its
+   leader and mandor never exits.
+3. A failed oneshot counts as a completed one, releasing its dependents.
 
 Fixing (1) by routing a failed spawn through the same path as a worker death
-would fix (2) for free, which is an argument for doing it that way rather than
-special-casing the essential check.
+fixes (2) and (3) for free. That is a strong argument against special-casing
+each check at the spawn site: the bug is the second terminal path, not the
+individual handlers.
 
 **Why parked:** it changes restart semantics and the observable exit code 125.
 Not a crash — mandor stays alive either way — so it did not gate the 1.0.x
