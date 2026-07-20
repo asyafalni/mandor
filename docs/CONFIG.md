@@ -3,7 +3,9 @@
 Precedence: **TOML < environment < CLI**. CLI-only always works; `mandor.toml`
 is loaded from `--config=PATH` (must exist) or `./mandor.toml` (best-effort).
 Per-worker keys use flat `"worker-name=value"` pairs; the worker name is the
-basename of the command's first token (duplicates get `-2`, `-3`…).
+basename of the command's first token (duplicates get `-2`, `-3`…). Quotes,
+backslashes, and control characters in a name become `_`, so names stay safe
+in the Prometheus exposition format.
 
 ## Global keys
 

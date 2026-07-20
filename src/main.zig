@@ -45,9 +45,8 @@ const usage_text =
     \\
     \\Workers are quoted command lines — no shell needed. Signals are forwarded
     \\(grandchildren included); mandor exits with the worst worker exit code.
-    \\Everything else has sane defaults; advanced flags (--backoff-max,
-    \\--stop-grace, --expected-exit, --state-dir, --ready-fd, --health-interval,
-    \\--restart-on-unhealthy) are in the README.
+    \\Everything else has sane defaults. Advanced settings belong in
+    \\mandor.toml — see `man mandor` or docs/CONFIG.md.
     \\
 ;
 

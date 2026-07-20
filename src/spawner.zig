@@ -342,6 +342,13 @@ fn setName(w: *Worker, argv0: []const u8, prior: []const Worker) void {
             fbs[base.len..base.len];
         w.name_len = @intCast(base.len + suffix.len);
     }
+    // The name is a basename, so it can hold any byte a filename can. JSON
+    // sinks escape it, but the Prometheus exposition format has no escaping
+    // for label values — a quote or backslash would silently corrupt every
+    // scrape. Neutralize once here rather than at each sink.
+    for (w.name[0..w.name_len]) |*c| {
+        if (c.* == '"' or c.* == '\\' or c.* < 0x20) c.* = '_';
+    }
 }
 
 /// Look up NAME= in the environ block.
@@ -613,6 +620,14 @@ test "initWorkers derives names and dedups" {
     try std.testing.expectEqualStrings("api-3", workers[2].nameSlice());
     try std.testing.expectEqual(@as(u8, 3), workers[0].argc);
     try std.testing.expectEqual(@as(?[*:0]const u8, null), workers[0].argv[3]);
+}
+
+test "names are neutralized for the unescaped metrics sink" {
+    // setName directly: a quote in the command string would not survive
+    // tokenization, but a basename off the filesystem can hold any byte.
+    var w: Worker = undefined;
+    setName(&w, "./we\"ird\\na\nme", &.{});
+    try std.testing.expectEqualStrings("we_ird_na_me", w.nameSlice());
 }
 
 test "findPath falls back to default" {

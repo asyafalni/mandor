@@ -3,6 +3,38 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.0.1] - 2026-07-20
+
+A second hunting pass over the untrusted-input surface, after finding that one
+fuzz target had been silently testing nothing.
+
+### Fixed
+- **Integer-cast trap loading a corrupt `history.json`**
+  (`history.loadFromText`). A recurrence timestamp past `maxInt(i64)` trapped
+  on the `@intCast` — and this runs on the startup load path, so it killed
+  PID 1. `count`/`builds` were already clamped; `first`/`last` were not.
+- **Prometheus label injection via worker names.** A worker name is a
+  basename, so it can hold any byte a filename can, and it was interpolated
+  raw into `worker="…"`. A quote or backslash silently corrupted every scrape.
+  Names are now neutralized once at derivation, so all sinks benefit. (JSON
+  sinks were already correctly escaped — bundles were never affected.)
+- Histogram counts from a corrupt `cost.json` used wrapping arithmetic, which
+  could not crash but could load nonsense values. Now saturating.
+### Changed
+- One `report.clamp(T, v)` helper replaces the `@intCast(@min(…, maxInt(T)))`
+  pattern that was duplicated across `history.zig` and `cost.zig`. The
+  duplication *was* the bug class: the one site that forgot the clamp is the
+  crash above. The safe form is now the short form.
+- `--help` no longer enumerates advanced flags. The list had already drifted
+  out of date (it omitted `--max-restarts`, `--health-start-period`, and
+  `--on-incident`), and it duplicated the man page and `docs/CONFIG.md`.
+  Advanced settings are pointed at `mandor.toml` instead. No flag changed;
+  every existing flag still works.
+- Fuzz harness: added an argv/command-tokenization target, and corrected the
+  `history.json` seed. The old seed used `"sig":123` where the loader keys off
+  `{"sig":"` plus a fixed 16-digit hex field, so it matched nothing and fuzzed
+  an early return — which is why the crash above survived 1.0.0.
+
 ## [1.0.0] - 2026-07-20
 
 First stable release. The supervision path is now hardened against the inputs

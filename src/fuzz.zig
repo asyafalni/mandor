@@ -64,7 +64,12 @@ const config_seed =
 
 const stat_seed = "1234 (my (evil) worker) S 1 1234 1234 0 -1 4194560 900 0 0 0 12 5 0 0 20 0 3 0 8400 12582912 512";
 const psi_seed = "some avg10=0.00 avg60=12.34 avg300=0.00 total=1234\nfull avg10=0.00 avg60=5.00 avg300=0.00 total=99";
-const history_seed = "{\"v\":2,\"entries\":[{\"sig\":123,\"first\":100,\"last\":200,\"count\":3,\"builds\":2,\"fb\":\"v1.0.0\",\"lb\":\"v1.0.1\"}]}";
+// Must match history.serialize byte-for-byte in shape: the loader keys off the
+// literal `{"sig":"` prefix and a fixed 16-digit hex field. A seed in any other
+// shape silently matches nothing and fuzzes an early return.
+const history_seed = "{\"v\":2,\"entries\":[" ++
+    "{\"sig\":\"00000000deadbeef\",\"first\":1700000000,\"last\":1700009999,\"count\":3,\"builds\":2,\"fb\":\"v1.0.0\",\"lb\":\"v1.0.1\"}," ++
+    "{\"sig\":\"ffffffffffffffff\",\"first\":1,\"last\":2,\"count\":1,\"builds\":0,\"fb\":\"\",\"lb\":\"\"}]}";
 const cost_seed = "{\"v\":1,\"workers\":[{\"name\":\"api\",\"obs\":600,\"rss\":[1,2,3],\"cpu\":[4,5,6]}]}";
 const report_seed = "{\"v\":1,\"now\":1000,\"workers\":[{\"name\":\"api\",\"pid\":42,\"state\":\"running\",\"restarts\":3,\"rss_kb\":2048,\"cpu_pct\":12}]}";
 
@@ -298,6 +303,31 @@ fn stateTarget(text: []const u8) void {
     _ = cost.formatHuman(&fmt_buf, text);
 }
 
+var tok_buf: [8192]u8 = undefined;
+var argv_out: [64][]const u8 = undefined;
+var arg_slots: [16][]const u8 = undefined;
+
+/// argv and command-string tokenization. Not hostile in practice, but a
+/// malformed flag or an unterminated quote must fail cleanly, not trap.
+fn cliTarget(text: []const u8) void {
+    _ = cli.tokenize(text, &tok_buf, &argv_out) catch {};
+    // Feed the mutant as argv too, split on whitespace.
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, text, " \t\n");
+    while (it.next()) |a| {
+        if (n == arg_slots.len) break;
+        arg_slots[n] = a;
+        n += 1;
+    }
+    _ = cli.parse(arg_slots[0..n], &cmd_storage) catch {};
+}
+
+const cli_seed =
+    "--restart=on-failure --backoff-max=30s --stop-grace=10s --metrics=9464 " ++
+    "--health=api=/bin/check --expected-exit=143,129 --max-restarts=5 " ++
+    "--ready-fd=3 --state-dir=/var/lib/mandor --incident=2 -- " ++
+    "'./api --port 8080' \"./worker -v\"";
+
 fn ignoreLine(_: void, _: []const u8, _: u8) void {}
 
 /// The capture hot path: line reassembly across arbitrary read boundaries.
@@ -374,6 +404,12 @@ test "fuzz: state-file loaders survive corruption" {
         stateTarget(mutate(rnd, seed, &buf));
         if (i % 3 == 2) historyTarget(mutate(rnd, history_seed, &buf));
     }
+}
+
+test "fuzz: cli flags and command tokenization survive garbage" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |_| cliTarget(mutate(rnd, cli_seed, &buf));
 }
 
 test "fuzz: capture reassembles arbitrary chunk boundaries" {

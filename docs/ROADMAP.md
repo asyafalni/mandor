@@ -174,9 +174,12 @@ v0.20). No feature backlog remains.
 **v1.0 fuzz-hardening: done (v1.0.0).** `src/fuzz.zig` mutation-fuzzes the
 whole untrusted-input surface — the six trace parsers, the worker ELF header,
 `mandor.toml`, `/proc` + cgroup text, and mandor's own state files — seeded
-from real crash output in `test/fixtures/`. It found two integer-overflow
-panics that would each have killed PID 1 (a malformed worker ELF, a corrupt
-pressure file); both are fixed and pinned by regression tests. The harness was
+from real crash output in `test/fixtures/`. It found three PID-1-fatal traps
+(a malformed worker ELF, a corrupt pressure file, an out-of-range timestamp in
+a corrupt `history.json`) plus a Prometheus label-injection bug; all fixed and
+pinned by regression tests. The third only surfaced in a second pass, after
+the `history.json` seed was found not to match the loader's real format — the
+target had been fuzzing an early return. The harness was
 itself validated by mutation testing: with the fixes reverted it catches both
 bugs on 8 of 8 seeds. Coverage-guided `zig build test --fuzz` is unusable on
 the pinned Zig 0.16.0, so the harness is in-repo and runs under plain

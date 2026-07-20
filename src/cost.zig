@@ -235,7 +235,7 @@ fn loadArray(chunk: []const u8, comptime key: []const u8, out: *[buckets]u32) vo
     while (i < buckets and j < chunk.len and chunk[j] != ']') : (i += 1) {
         var v: u32 = 0;
         while (j < chunk.len and chunk[j] >= '0' and chunk[j] <= '9') : (j += 1)
-            v = v *% 10 +% (chunk[j] - '0');
+            v = v *| 10 +| (chunk[j] - '0');
         out[i] = v;
         if (j < chunk.len and chunk[j] == ',') j += 1;
     }
@@ -243,11 +243,11 @@ fn loadArray(chunk: []const u8, comptime key: []const u8, out: *[buckets]u32) vo
 
 fn loadInto(p: *Profile, chunk: []const u8) void {
     p.peak_rss_kb = scanU64(chunk, "peak_rss_kb");
-    p.peak_cpu_pct = @intCast(@min(scanU64(chunk, "peak_cpu_pct"), std.math.maxInt(u16)));
-    p.peak_fds = @intCast(@min(scanU64(chunk, "peak_fds"), std.math.maxInt(u16)));
-    p.peak_threads = @intCast(@min(scanU64(chunk, "peak_threads"), std.math.maxInt(u16)));
-    p.idle_n = @intCast(@min(scanU64(chunk, "idle_n"), std.math.maxInt(u32)));
-    p.active_n = @intCast(@min(scanU64(chunk, "active_n"), std.math.maxInt(u32)));
+    p.peak_cpu_pct = report.clamp(u16, scanU64(chunk, "peak_cpu_pct"));
+    p.peak_fds = report.clamp(u16, scanU64(chunk, "peak_fds"));
+    p.peak_threads = report.clamp(u16, scanU64(chunk, "peak_threads"));
+    p.idle_n = report.clamp(u32, scanU64(chunk, "idle_n"));
+    p.active_n = report.clamp(u32, scanU64(chunk, "active_n"));
     p.core_ms = scanU64(chunk, "core_ms");
     p.rss_kb_ms = scanU64(chunk, "rss_kb_ms");
     p.first_ms = scanU64(chunk, "first_ms");

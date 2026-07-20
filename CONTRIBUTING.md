@@ -35,9 +35,23 @@ Touching a parser? Run a handful of seeds before pushing, and raise
 
 The property is **survival, not correctness**: return values are ignored, and
 a panic is the only failure. That is the whole point — a parser panic kills
-PID 1, which kills the container. Any arithmetic on a value read from
-untrusted bytes must saturate (`+|`, `*|`) rather than risk a ReleaseSafe
-overflow trap.
+PID 1, which kills the container. Two rules follow, and both have already been
+learned the hard way:
+
+- **Arithmetic on untrusted bytes must saturate** (`+|`, `*|`) rather than
+  risk a ReleaseSafe overflow trap. To narrow a scanned value, use
+  `report.clamp(T, v)` — never a bare `@intCast`.
+- **A seed must match the real serialized format byte-for-byte in shape.** The
+  `history.json` seed once used `"sig":123` while the loader keys off
+  `{"sig":"` plus a fixed 16-digit hex field. It matched nothing, so that
+  target fuzzed an early return and reported green for a release while a live
+  crash sat behind it. If you add a target, confirm the seed actually reaches
+  the parsing code.
+
+And a rule for the harness itself: **do not trust a green fuzzer.** Revert a
+known fix and check the harness catches it. That check is what upgraded the
+mutator from byte flips (1-in-5 detection) to a boundary-value dictionary plus
+a structured ELF generator (8-in-8).
 
 Note: coverage-guided `zig build test --fuzz` is unusable on the pinned Zig
 0.16.0 (its fuzz-mode test runner fails to compile with error tracing on, and

@@ -137,11 +137,11 @@ pub fn loadFromText(text: []const u8) void {
         const sig = std.fmt.parseInt(u64, text[hex_start..][0..16], 16) catch continue;
         var e: Entry = .{
             .sig = sig,
-            .first_seen = @intCast(report.scanU64(chunk, "first") orelse continue),
-            .last_seen = @intCast(report.scanU64(chunk, "last") orelse continue),
-            .count = @intCast(@min(report.scanU64(chunk, "count") orelse continue, std.math.maxInt(u32))),
+            .first_seen = report.clamp(i64, report.scanU64(chunk, "first") orelse continue),
+            .last_seen = report.clamp(i64, report.scanU64(chunk, "last") orelse continue),
+            .count = report.clamp(u32, report.scanU64(chunk, "count") orelse continue),
             // builds/fb/lb absent in v1 files -> 0/empty (backward compatible).
-            .builds = @intCast(@min(report.scanU64(chunk, "builds") orelse 0, std.math.maxInt(u32))),
+            .builds = report.clamp(u32, report.scanU64(chunk, "builds") orelse 0),
             .first_build = undefined,
             .first_build_len = 0,
             .last_build = undefined,
@@ -257,6 +257,20 @@ test "hostile release chars are sanitized" {
     const a = record(0x1234, 1000, "v1\"; rm -rf\n/");
     try std.testing.expect(std.mem.indexOfScalar(u8, a.firstBuild(), '"') == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, a.firstBuild(), '\n') == null);
+    n = 0;
+}
+
+test "out-of-range timestamps in a corrupt state file are clamped, not trapped" {
+    n = 0;
+    // 2^64-1 does not fit i64; a bare @intCast would trap here, and this runs
+    // on the startup load path.
+    loadFromText("{\"v\":2,\"entries\":[{\"sig\":\"00000000deadbeef\"," ++
+        "\"first\":18446744073709551615,\"last\":18446744073709551615," ++
+        "\"count\":18446744073709551615,\"builds\":9999999999999999999," ++
+        "\"fb\":\"a\",\"lb\":\"b\"}]}");
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), entries[0].first_seen);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), entries[0].count);
     n = 0;
 }
 

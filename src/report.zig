@@ -92,6 +92,14 @@ pub fn scanU64(chunk: []const u8, comptime key: []const u8) ?u64 {
     return if (any) v else null;
 }
 
+/// Narrow a state-file number into `T` by clamping. Every scanned value goes
+/// through here rather than a bare `@intCast`: state files are untrusted, and
+/// a cast that does not fit traps in ReleaseSafe — on the startup load path
+/// that kills PID 1.
+pub fn clamp(comptime T: type, v: u64) T {
+    return @intCast(@min(v, std.math.maxInt(T)));
+}
+
 pub fn scanStr(chunk: []const u8, comptime key: []const u8) ?[]const u8 {
     const pat = "\"" ++ key ++ "\":\"";
     const i = std.mem.indexOf(u8, chunk, pat) orelse return null;
