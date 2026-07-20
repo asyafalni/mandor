@@ -20,10 +20,12 @@ suite on Alpine, Debian, and Ubuntu.
 
 ### Fuzzing
 
-`src/fuzz.zig` mutation-fuzzes every parser that touches untrusted input:
-worker stderr (the six trace parsers), the worker's ELF header, `mandor.toml`,
-`/proc` and cgroup text, and mandor's own state files. It runs as part of
-`zig build test`, with a different seed each invocation.
+`src/fuzz.zig` mutation-fuzzes everything that consumes input mandor does not
+control: worker stderr (the six trace parsers), the worker's ELF header,
+`mandor.toml`, argv, `/proc` and cgroup text, mandor's own state files, the
+incident-bundle serializer, the capture ring buffer, and the cost
+accumulators. It runs as part of `zig build test`, with a different seed each
+invocation.
 
 ```console
 zig build test --seed 0xdeadbeef   # replay a specific seed
@@ -40,7 +42,10 @@ learned the hard way:
 
 - **Arithmetic on untrusted bytes must saturate** (`+|`, `*|`) rather than
   risk a ReleaseSafe overflow trap. To narrow a scanned value, use
-  `report.clamp(T, v)` — never a bare `@intCast`.
+  `report.clamp(T, v)` — never a bare `@intCast`. "Untrusted" includes
+  mandor's own persisted state: `history.json` and `cost.json` survive
+  restarts, so a corrupt file can seed a counter at its maximum and the next
+  increment traps. Watch mixed widths too — `u32 + u32` stays `u32`.
 - **A seed must match the real serialized format byte-for-byte in shape.** The
   `history.json` seed once used `"sig":123` while the loader keys off
   `{"sig":"` plus a fixed 16-digit hex field. It matched nothing, so that

@@ -108,7 +108,9 @@ pub fn parseStat(text: []const u8) ?StatFields {
 pub fn cpuPct(prev_ticks: u64, cur_ticks: u64, dt_ms: u64) u16 {
     if (dt_ms == 0 or cur_ticks <= prev_ticks) return 0;
     const dticks = cur_ticks - prev_ticks;
-    const pct = (dticks * 1000 * 100) / (user_hz * dt_ms);
+    // Saturating: parseStat returns whatever /proc held, and the result is
+    // clamped to 60_000 below regardless.
+    const pct = (dticks *| 1000 *| 100) / (user_hz *| dt_ms);
     return @intCast(@min(pct, 60_000));
 }
 
@@ -176,7 +178,7 @@ pub fn sample(window: *Window, pid: i32, now_ms: u64, psi: Psi) void {
     const text = readFile(path.ptr, &stat_buf) orelse return;
     const fields = parseStat(text) orelse return;
 
-    const ticks = fields.utime + fields.stime;
+    const ticks = fields.utime +| fields.stime;
     const dt = now_ms -| window.prev_t_ms;
     const pct = if (window.prev_t_ms == 0) 0 else cpuPct(window.prev_ticks, ticks, dt);
     window.prev_ticks = ticks;
@@ -184,7 +186,7 @@ pub fn sample(window: *Window, pid: i32, now_ms: u64, psi: Psi) void {
 
     window.push(.{
         .t_ms = now_ms,
-        .rss_kb = fields.rss_pages * page_kb,
+        .rss_kb = fields.rss_pages *| page_kb,
         .cpu_pct = pct,
         .fds = countFds(pid, &path_buf),
         .threads = @intCast(@min(fields.threads, std.math.maxInt(u16))),
@@ -229,6 +231,12 @@ test "cpuPct math" {
     try std.testing.expectEqual(@as(u16, 200), cpuPct(0, 1000, 5000));
     try std.testing.expectEqual(@as(u16, 0), cpuPct(100, 100, 1000));
     try std.testing.expectEqual(@as(u16, 0), cpuPct(0, 100, 0));
+    // Extreme tick counts must clamp, not trap: this runs on the sampler
+    // tick path for the life of the container.
+    try std.testing.expectEqual(@as(u16, 60_000), cpuPct(0, std.math.maxInt(u64), 1));
+    // Both operands saturated: the ratio collapses, which is meaningless but
+    // must not trap.
+    try std.testing.expect(cpuPct(1, std.math.maxInt(u64), std.math.maxInt(u64)) <= 60_000);
 }
 
 test "window rolls over keeping newest" {

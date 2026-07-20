@@ -174,12 +174,20 @@ v0.20). No feature backlog remains.
 **v1.0 fuzz-hardening: done (v1.0.0).** `src/fuzz.zig` mutation-fuzzes the
 whole untrusted-input surface — the six trace parsers, the worker ELF header,
 `mandor.toml`, `/proc` + cgroup text, and mandor's own state files — seeded
-from real crash output in `test/fixtures/`. It found three PID-1-fatal traps
-(a malformed worker ELF, a corrupt pressure file, an out-of-range timestamp in
-a corrupt `history.json`) plus a Prometheus label-injection bug; all fixed and
-pinned by regression tests. The third only surfaced in a second pass, after
-the `history.json` seed was found not to match the loader's real format — the
-target had been fuzzing an early return. The harness was
+from real crash output in `test/fixtures/`. Across three passes (v1.0.0,
+v1.0.1, v1.0.2) it grew to 12 targets and found **seven** PID-1-fatal traps
+plus a Prometheus label-injection bug and a backoff-cap violation; all fixed
+and pinned by regression tests. Every one was an integer overflow on a value
+read from an untrusted or persisted source — a malformed worker ELF, a corrupt
+pressure file, a corrupt `history.json` or `cost.json`, `/proc` tick counts,
+and calendar math on an out-of-range epoch (that last one on the
+incident-write path, i.e. firing exactly when a worker had crashed).
+
+Two findings about the *method* are worth keeping: a seed whose shape does not
+match the real serialized format silently fuzzes an early return (the
+`history.json` target did this through the 1.0.0 release), and duplicated
+clamping logic is itself the bug — the one site that forgot `@min` was the
+crash. The harness was
 itself validated by mutation testing: with the fixes reverted it catches both
 bugs on 8 of 8 seeds. Coverage-guided `zig build test --fuzz` is unusable on
 the pinned Zig 0.16.0, so the harness is in-repo and runs under plain

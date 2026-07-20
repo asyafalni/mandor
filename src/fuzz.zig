@@ -20,6 +20,7 @@
 const std = @import("std");
 
 const summarize = @import("summarize.zig");
+const spool = @import("spool.zig");
 const config = @import("config.zig");
 const sampler = @import("sampler.zig");
 const elf = @import("elf.zig");
@@ -28,6 +29,8 @@ const report = @import("report.zig");
 const cost = @import("cost.zig");
 const capture = @import("capture.zig");
 const cli = @import("cli.zig");
+const ring = @import("ring.zig");
+const backoff = @import("backoff.zig");
 
 /// Real crash output — the seeds worth mutating. Doubles as the fixture set
 /// CLAUDE.md calls for.
@@ -228,8 +231,15 @@ fn configTarget(text: []const u8) void {
 }
 
 fn procTarget(text: []const u8) void {
-    _ = sampler.parseStat(text);
+    const fields = sampler.parseStat(text);
     _ = sampler.parsePsiAvg60(text);
+    // Feed parsed /proc values onward the way sample() does. parseStat yields
+    // whatever the text held, so the consumers must survive it too.
+    if (fields) |f| {
+        const ticks = f.utime +| f.stime;
+        _ = sampler.cpuPct(ticks / 2, ticks, 5000);
+        _ = sampler.cpuPct(0, ticks, 1);
+    }
 }
 
 var elf_out: [64]u8 = undefined;
@@ -330,6 +340,129 @@ const cli_seed =
 
 fn ignoreLine(_: void, _: []const u8, _: u8) void {}
 
+// The two targets below assert invariants rather than mere survival — these
+// are pure functions with contracts worth pinning, not parsers.
+
+/// Backoff must never exceed the configured cap, on any path.
+fn backoffTarget(rnd: std.Random) !void {
+    const prev = if (rnd.boolean()) 0 else rnd.int(u64);
+    const uptime = if (rnd.boolean()) rnd.intRangeAtMost(u64, 0, 20_000) else rnd.int(u64);
+    const max_ms = if (rnd.boolean()) rnd.intRangeAtMost(u64, 0, 60_000) else rnd.int(u64);
+    const d = backoff.next(prev, uptime, max_ms);
+    try std.testing.expect(d <= max_ms);
+}
+
+/// Cost accumulators persist in cost.json across restarts, so a corrupt file
+/// can seed any counter at its clamped maximum; the next sampler tick then
+/// increments it. Start from arbitrary state and keep ticking.
+fn costTarget(rnd: std.Random) void {
+    var p: cost.Profile = .{};
+    p.idle_n = rnd.int(u32);
+    p.active_n = rnd.int(u32);
+    p.core_ms = rnd.int(u64);
+    p.rss_kb_ms = rnd.int(u64);
+    p.peak_rss_kb = rnd.int(u64);
+    for (&p.rss_idle) |*c| c.* = rnd.int(u32);
+    for (&p.rss_active) |*c| c.* = rnd.int(u32);
+    for (&p.cpu_active) |*c| c.* = rnd.int(u32);
+    for (0..4) |_| {
+        p.update(rnd.int(u64), rnd.int(u16), rnd.int(u16), rnd.int(u16), rnd.int(u64), rnd.int(u64));
+    }
+    _ = p.summary();
+}
+
+var bundle_out: [128 * 1024]u8 = undefined;
+var log_lines: [8]summarize.CompactLine = undefined;
+var samples: [8]sampler.Sample = undefined;
+
+/// The incident-bundle serializer — the contract photon and the premium agent
+/// parse. Epoch fields are calendar math on an arbitrary i64, and one of them
+/// (`history_first_epoch`) can arrive clamped to maxInt(i64) straight out of a
+/// corrupt history.json.
+fn bundleTarget(rnd: std.Random, text: []const u8) void {
+    const epoch = [_]i64{
+        0,                        1,            -1, std.math.maxInt(i64), std.math.minInt(i64),
+        std.math.maxInt(i64) - 1, rnd.int(i64),
+    };
+    const pick = struct {
+        fn s(r: std.Random, t: []const u8) []const u8 {
+            if (t.len == 0) return "";
+            const a = r.uintLessThan(usize, t.len);
+            return t[a..@min(t.len, a + r.uintLessThan(usize, 256) + 1)];
+        }
+    };
+
+    for (&log_lines, 0..) |*l, i| l.* = .{
+        .text = pick.s(rnd, text),
+        .flags = @truncate(i),
+        .first_t_ms = rnd.int(u64),
+        .last_t_ms = rnd.int(u64),
+        .count = rnd.int(u32),
+    };
+    for (&samples) |*s| s.* = .{
+        .t_ms = rnd.int(u64),
+        .rss_kb = rnd.int(u64),
+        .cpu_pct = rnd.int(u16),
+        .fds = rnd.int(u16),
+        .threads = rnd.int(u16),
+    };
+
+    _ = spool.serialize(&bundle_out, .{
+        .ts_epoch = epoch[rnd.uintLessThan(usize, epoch.len)],
+        .name = pick.s(rnd, text),
+        .cmd = pick.s(rnd, text),
+        .pid = rnd.int(i32),
+        .restarts = rnd.int(u32),
+        .cwd = pick.s(rnd, text),
+        .exe = pick.s(rnd, text),
+        .spawned_at_epoch = epoch[rnd.uintLessThan(usize, epoch.len)],
+        .uptime_s = rnd.int(u64),
+        .release = pick.s(rnd, text),
+        .build_id = pick.s(rnd, text),
+        .limits_nofile = rnd.int(u64),
+        .limits_core = rnd.int(u64),
+        .cause = .{ .kind = "signal", .sig_num = rnd.int(u8) },
+        .cause_str = pick.s(rnd, text),
+        .trace = .{ .lang = "go", .raw = pick.s(rnd, text) },
+        .logs_tail = log_lines[0..rnd.uintLessThan(usize, log_lines.len + 1)],
+        .logs_dropped = rnd.int(u32),
+        .stats = samples[0..rnd.uintLessThan(usize, samples.len + 1)],
+        .now_ms = rnd.int(u64),
+        .history_sig = rnd.int(u64),
+        .history_first_epoch = epoch[rnd.uintLessThan(usize, epoch.len)],
+        .history_count = rnd.int(u32),
+        .history_builds = rnd.int(u32),
+        .history_first_build = pick.s(rnd, text),
+        .history_last_build = pick.s(rnd, text),
+        .verdict = pick.s(rnd, text),
+    });
+}
+
+const RingT = ring.Ring(1024);
+var ring_copy: [4096]u8 = undefined;
+
+/// Random push/evict/iterate traffic against the capture hot-path buffer.
+/// Invariants: accounting stays consistent and every stored record reads back.
+fn ringTarget(rnd: std.Random, text: []const u8) !void {
+    var r: RingT = .{};
+    var pos: usize = 0;
+    while (pos < text.len) {
+        const n = @min(text.len - pos, rnd.intRangeAtMost(usize, 0, 5000));
+        _ = r.push(text[pos..][0..n], rnd.int(u8), rnd.int(u64));
+        pos += n + 1;
+
+        if (rnd.intRangeLessThan(u8, 0, 8) == 0) {
+            var seen: usize = 0;
+            var it = r.iterate(&ring_copy);
+            while (it.next()) |rec| {
+                seen += 1;
+                try std.testing.expect(rec.line.len <= 4095);
+            }
+            try std.testing.expectEqual(r.count(), seen);
+        }
+    }
+}
+
 /// The capture hot path: line reassembly across arbitrary read boundaries.
 fn captureTarget(rnd: std.Random, text: []const u8) void {
     var asm_state: capture.Assembler = .{};
@@ -410,6 +543,47 @@ test "fuzz: cli flags and command tokenization survive garbage" {
     var p = prng();
     const rnd = p.random();
     for (0..iterations) |_| cliTarget(mutate(rnd, cli_seed, &buf));
+}
+
+test "fuzz: cpuPct survives extreme tick counts" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |_| {
+        // /proc values are kernel-generated, but parseStat will hand back
+        // whatever the text held, so the consumer must not trap on it.
+        _ = sampler.cpuPct(rnd.int(u64), rnd.int(u64), rnd.int(u64));
+        _ = sampler.cpuPct(0, std.math.maxInt(u64), rnd.intRangeAtMost(u64, 1, 10_000));
+    }
+}
+
+test "fuzz: cost accumulators survive a corrupt reload plus more ticks" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |_| costTarget(rnd);
+}
+
+test "fuzz: bundle serializer survives adversarial input" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |i| {
+        const seed = corpus[i % corpus.len];
+        bundleTarget(rnd, mutate(rnd, seed, &buf));
+    }
+}
+
+test "fuzz: backoff never exceeds the configured cap" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |_| try backoffTarget(rnd);
+}
+
+test "fuzz: ring buffer accounting survives random traffic" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |i| {
+        const seed = corpus[i % corpus.len];
+        try ringTarget(rnd, mutate(rnd, seed, &buf));
+    }
 }
 
 test "fuzz: capture reassembles arbitrary chunk boundaries" {

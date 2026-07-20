@@ -14,8 +14,18 @@ pub const bundle_version = 7;
 
 pub const Civil = struct { y: i64, mo: u8, d: u8, h: u8, mi: u8, s: u8 };
 
+/// Widest range ISO-8601's 4-digit year can express.
+const min_epoch: i64 = -62_167_219_200; // 0000-01-01T00:00:00Z
+const max_epoch: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
+
 /// Days-since-epoch -> civil date (Howard Hinnant's algorithm).
-pub fn civilFromEpoch(secs: i64) Civil {
+pub fn civilFromEpoch(secs_in: i64) Civil {
+    // Clamped first: epoch values reach here from persisted state (a corrupt
+    // history.json clamps to maxInt(i64)), and near the i64 extremes
+    // `@divFloor(secs, 86_400) * 86_400` falls outside i64. This runs on the
+    // incident-write path, so a trap would kill PID 1 exactly when a worker
+    // has crashed and mandor is recording why.
+    const secs = std.math.clamp(secs_in, min_epoch, max_epoch);
     const z0 = @divFloor(secs, 86_400);
     const sod: u32 = @intCast(secs - z0 * 86_400);
     const z = z0 + 719_468;
@@ -402,6 +412,19 @@ test "iso8601 known dates" {
     try std.testing.expectEqualStrings("2026-07-17T22:47:03Z", iso8601(&buf, 1_784_328_423));
     try std.testing.expectEqualStrings("2000-02-29T12:00:00Z", iso8601(&buf, 951_825_600));
     try std.testing.expectEqualStrings("2024-12-31T23:59:59Z", iso8601(&buf, 1_735_689_599));
+}
+
+test "extreme epochs clamp instead of trapping" {
+    var buf: [20]u8 = undefined;
+    // A corrupt history.json clamps a timestamp to maxInt(i64), and it lands
+    // here on the incident-write path.
+    try std.testing.expectEqualStrings("9999-12-31T23:59:59Z", iso8601(&buf, std.math.maxInt(i64)));
+    try std.testing.expectEqualStrings("0000-01-01T00:00:00Z", iso8601(&buf, std.math.minInt(i64)));
+    var ms_buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "9999-12-31T23:59:59.615Z",
+        iso8601Ms(&ms_buf, std.math.maxInt(u64)),
+    );
 }
 
 test "envRedacted heuristics" {

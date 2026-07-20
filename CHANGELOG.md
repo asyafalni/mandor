@@ -3,6 +3,42 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.0.2] - 2026-07-20
+
+Third hunting pass, widening the harness past parsers into the pure logic and
+the persisted-state paths. Four more traps, all reachable without a hostile
+actor — a corrupt state file or an unusual `/proc` read is enough.
+
+### Fixed
+- **Overflow in `civilFromEpoch`** (`spool.zig`). Near the `i64` extremes,
+  `@divFloor(secs, 86_400) * 86_400` falls outside `i64`. This runs on the
+  **incident-write path**, so it killed PID 1 exactly when a worker had
+  crashed and mandor was recording why — and it was reachable end-to-end: a
+  corrupt `history.json` clamps a timestamp to `maxInt(i64)`, which flows into
+  the bundle as `history_first_epoch`. Epochs are now clamped to the range
+  ISO-8601's 4-digit year can express.
+- **Overflow in `sampler.cpuPct`** — `dticks * 1000 * 100` on tick counts from
+  `/proc`. On the sampler tick path, which runs every 5s for the life of the
+  container. Now saturating, as are `utime + stime` and `rss_pages * page_kb`.
+- **Overflow in the cost accumulators** (`cost.zig`). `idle_n`/`active_n` and
+  the histogram buckets are `u32` counters that persist in `cost.json` across
+  restarts; a corrupt file seeds one at `maxInt(u32)` (post-clamp) and the next
+  sampler tick's `+= 1` trapped. `Profile.summary()` also summed two `u32`
+  counters into a `u32`. Increments now saturate and the sum is widened.
+- **`backoff.next` could exceed the configured cap.** The stable-uptime reset
+  returned `initial_delay_ms` (200ms) unclamped, so `--backoff-max` below
+  200ms was violated after a worker had run 10s. Every path now clamps.
+### Changed
+- Fuzz harness widened from 7 targets to 12: the bundle serializer (with
+  adversarial epochs and strings), the capture ring buffer, the cost
+  accumulators, `cpuPct`, and `backoff`. The last two assert *invariants*
+  rather than mere survival — backoff must never exceed its cap, and the ring's
+  record count must match what iteration yields.
+### Notes
+- Audited and found clean: every untrusted string reaching JSON goes through
+  `appendJsonString` (so incident bundles were never corruptible), and time
+  subtraction across the supervisor already used saturating `-|` throughout.
+
 ## [1.0.1] - 2026-07-20
 
 A second hunting pass over the untrusted-input surface, after finding that one

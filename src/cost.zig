@@ -54,16 +54,20 @@ pub const Profile = struct {
         p.peak_cpu_pct = @max(p.peak_cpu_pct, cpu_pct);
         p.peak_fds = @max(p.peak_fds, fds);
         p.peak_threads = @max(p.peak_threads, threads);
-        p.core_ms +|= @as(u64, cpu_pct) * dt_ms / 100;
-        p.rss_kb_ms +|= rss_kb * dt_ms;
+        // Saturating throughout. These accumulate for the life of the
+        // container and are reloaded from cost.json across restarts, so a
+        // corrupt file can seed a counter at its maximum — the next sample
+        // would then trap on the increment, on the sampler tick path.
+        p.core_ms +|= @as(u64, cpu_pct) *| dt_ms / 100;
+        p.rss_kb_ms +|= rss_kb *| dt_ms;
         const rb = rssBucket(rss_kb);
         if (cpu_pct < idle_threshold_pct) {
-            p.idle_n += 1;
-            p.rss_idle[rb] += 1;
+            p.idle_n +|= 1;
+            p.rss_idle[rb] +|= 1;
         } else {
-            p.active_n += 1;
-            p.rss_active[rb] += 1;
-            p.cpu_active[cpuBucket(cpu_pct)] += 1;
+            p.active_n +|= 1;
+            p.rss_active[rb] +|= 1;
+            p.cpu_active[cpuBucket(cpu_pct)] +|= 1;
         }
     }
 
@@ -109,7 +113,9 @@ pub const Profile = struct {
     };
 
     pub fn summary(p: *const Profile) Summary {
-        const total = p.idle_n + p.active_n;
+        // Widened: two u32 sample counters sum into a u32 otherwise, and both
+        // can arrive at their maximum from a corrupt cost.json.
+        const total = @as(u64, p.idle_n) + p.active_n;
         const obs_s = (p.last_ms -| p.first_ms) / 1000;
         const peak_mb = p.peak_rss_kb / 1024;
         // GB-hours ×100: rss_kb_ms / (1024*1024 KB/GB) / (3_600_000 ms/h) ×100
@@ -346,6 +352,21 @@ test "empty profile summarizes to zeros" {
     const s = p.summary();
     try std.testing.expectEqual(@as(u64, 0), s.peak_rss_mb);
     try std.testing.expectEqual(@as(u8, 0), s.duty_pct);
+}
+
+test "maxed-out counters from a corrupt reload summarize without trapping" {
+    var p: Profile = .{};
+    p.idle_n = std.math.maxInt(u32);
+    p.active_n = std.math.maxInt(u32);
+    p.core_ms = std.math.maxInt(u64);
+    p.rss_kb_ms = std.math.maxInt(u64);
+    p.peak_rss_kb = std.math.maxInt(u64);
+    // The next sampler tick increments those saturated counters, then the
+    // report sums them — both used to overflow.
+    p.update(std.math.maxInt(u64), 60_000, 1024, 64, 5_000, 1_000_000);
+    const s = p.summary();
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), p.idle_n + 0);
+    try std.testing.expect(s.duty_pct <= 100);
 }
 
 test "serialize then re-init round-trips accumulators" {
