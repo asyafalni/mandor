@@ -180,7 +180,7 @@ workers = [
 health = ["api=/bin/check-api"]
 start_after = ["worker=api"]   # worker starts once api is up (ready or alive 1s)
 oneshot = ["migrate"]          # init tasks run first; failure aborts startup
-env = ["api=PORT=8080"]        # per-worker environment additions
+env = ["api=PORT=8080"]        # worker "api" gets PORT=8080 (first "=" splits)
 cwd = ["api=/srv/app"]         # per-worker working directory
 user = ["api=1000:1000"]       # drop root before exec (numeric uid:gid)
 cap_drop = ["api=all"]         # drop Linux capabilities + set no_new_privs

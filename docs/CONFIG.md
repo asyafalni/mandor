@@ -2,10 +2,23 @@
 
 Precedence: **TOML < environment < CLI**. CLI-only always works; `mandor.toml`
 is loaded from `--config=PATH` (must exist) or `./mandor.toml` (best-effort).
-Per-worker keys use flat `"worker-name=value"` pairs; the worker name is the
-basename of the command's first token (duplicates get `-2`, `-3`…). Quotes,
-backslashes, and control characters in a name become `_`, so names stay safe
-in the Prometheus exposition format.
+Per-worker keys use flat `"worker-name=value"` pairs, **split at the first
+`=`** — everything after it is the value, verbatim. That matters for `env`,
+whose value is itself a `KEY=VALUE` pair:
+
+```toml
+env = ["api=PORT=8080"]
+#      └─┬─┘ └───┬────┘
+#     worker   the environment pair, passed through as-is
+```
+
+`KEY=VALUE` is deliberate: it is the format `execve`, `.env` files, `docker
+-e`, compose, and Kubernetes all use, so values paste in unchanged, and it
+matches the `KEY=VAL` lines `env_file` reads.
+
+The worker name is the basename of the command's first token (duplicates get
+`-2`, `-3`…). Quotes, backslashes, and control characters in a name become
+`_`, so names stay safe in the Prometheus exposition format.
 
 ## Global keys
 

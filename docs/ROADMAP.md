@@ -163,6 +163,39 @@ mandor already speaks in point-events (bundles) and present-tense snapshots
 immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 (config change = new image). Both already on the rejected list.
 
+## Tier 9 — parked (found during v1.0.x hardening)
+
+| # | Item | Cx | Value | Notes |
+|---|------|----|-------|-------|
+| 42 | Retry a transient `fork` failure instead of retiring the worker | XS | ● ● ● ○ | PARKED 2026-07-20 (user) — behavior change, needs 1.1.0 |
+
+### #42 — `fork` failure permanently retires a worker
+
+`supervisor.zig` currently handles a failed spawn by marking the worker
+`done` with `final_code = 125`:
+
+```zig
+spawner.spawn(...) catch {
+    logmod.print("[mandor] fork failed for {s}\n", ...);
+    w.done = true;
+    w.final_code = 125;
+```
+
+But `fork` returning `EAGAIN` — a pids-cgroup limit or `RLIMIT_NPROC` under
+load, entirely plausible in a container during a restart storm — is
+*transient*. mandor retires the worker permanently even after the pressure
+clears, and keeps running, so the orchestrator sees a healthy container with a
+silently missing worker. Silent degradation is arguably worse than dying.
+
+**Proposed:** treat a failed spawn as a failed *start* — apply the restart
+policy and backoff, giving up only at `max_restarts`. That is exactly what the
+backoff machinery exists for, and it preserves the give-up signal for genuinely
+permanent failures.
+
+**Why parked:** it changes restart semantics and the observable exit code 125,
+so it is a 1.1.0 item, not a patch. Not a crash — mandor stays alive either
+way — so it does not gate the 1.0.x stability line.
+
 ## Backlog status
 
 Four research rounds complete; all surfaced features shipped or
