@@ -167,7 +167,9 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 
 | # | Item | Cx | Value | Notes |
 |---|------|----|-------|-------|
-| 42 | Retry a transient `fork` failure instead of retiring the worker | XS | ● ● ● ○ | PARKED 2026-07-20 (user) — behavior change, needs 1.1.0 |
+| 42 | Retry a transient `fork` failure instead of retiring the worker | XS | ● ● ● ○ | PARKED 2026-07-20 (user) — behavior change |
+| 43 | Exit once all *significant* workers are gone (OTP `all_significant`) | S | ● ● ● ○ | PARKED 2026-07-20 (user) — the one genuinely missing exit mode; semantics need thought |
+| 44 | Per-worker `expected_exit` | XS | ● ● ○ ○ | PARKED 2026-07-20 — currently global-only |
 
 ### #42 — `fork` failure permanently retires a worker
 
@@ -192,9 +194,61 @@ policy and backoff, giving up only at `max_restarts`. That is exactly what the
 backoff machinery exists for, and it preserves the give-up signal for genuinely
 permanent failures.
 
-**Why parked:** it changes restart semantics and the observable exit code 125,
-so it is a 1.1.0 item, not a patch. Not a crash — mandor stays alive either
-way — so it does not gate the 1.0.x stability line.
+**Why parked:** it changes restart semantics and the observable exit code 125.
+Not a crash — mandor stays alive either way — so it did not gate the 1.0.x
+stability line. Note this is about a worker that *never started*, which is a
+different trigger from #43 (workers that started and later exited).
+
+### #43 — exit when all significant workers are gone
+
+**Prompted by the user's question (2026-07-20): what modes should exist when
+*some* workers exit?** Three obvious ones already exist and should not be
+re-spelled as a new `mode =` knob — that would be a second way to say the same
+thing:
+
+| Mode | Already expressed as |
+|------|----------------------|
+| Shut the fleet down | `essential = true` (exit stops the fleet, code propagates) |
+| Restart the exited worker | `restart = "on-failure"` / `"always"` |
+| Leave it dead, keep going | `restart = "never"` and not essential (the default) |
+
+These map onto OTP's child restart types (`permanent` / `transient` /
+`temporary`), and mandor already has `one_for_one` (per-worker restart) and
+`rest_for_one` (`restart_dependents`). `one_for_all` stays rejected —
+"restart everything" is the orchestrator's job.
+
+**The actual gap.** mandor exits only when *every* worker is done. So:
+
+> `api` and `worker` both die permanently. A log-shipper sidecar runs forever.
+> mandor stays alive forever — the container looks healthy while doing nothing
+> useful, and no orchestrator ever restarts it.
+
+`essential` does not cover this: it fires when *any one* leader exits, not when
+*all* the real workers are gone. There is currently no way to say "stay up
+while at least one of api/worker lives; exit once none do, ignoring sidecars."
+This is OTP 24's `auto_shutdown = all_significant`, and it is the one exit mode
+mandor genuinely lacks.
+
+**Open questions to settle before building:**
+
+- **Which flag marks "significant"?** Reusing `essential` would overload it
+  with two different meanings (any-exits-stops vs all-exited-stops). A separate
+  per-worker flag is clearer but adds a knob — and the simplicity budget says
+  every knob must earn itself.
+- **Which exit code?** With `essential` the leader's code propagates. With N
+  significant workers gone at different times and codes, "worst code" (the
+  existing rule) is the obvious answer but should be stated explicitly.
+- **Interaction with `max_restarts` give-up.** A worker that gave up is
+  permanently dead — does that count as "gone" for this purpose? Almost
+  certainly yes, but it needs to be written down.
+- **Is the default safe?** Changing the default exit condition would be
+  breaking; this should be opt-in.
+
+### #44 — per-worker `expected_exit`
+
+`expected_exit` is global today, so "exit 2 is fine for `cron` but a failure
+for `api`" is inexpressible. Small and mechanical; slots naturally into
+`[worker.NAME]` now that the sections exist.
 
 ## Backlog status
 
