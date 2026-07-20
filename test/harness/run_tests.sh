@@ -562,6 +562,59 @@ if echo "$out" | grep -q "shift report — 2 worker(s)" \
 else bad "shift report digest" "$(echo "$out" | tail -4)"; fi
 unset MANDOR_STATE_DIR
 
+# 49. corrupt state files must not stop the supervisor. These are the
+# real-world form of the overflow traps fixed in 1.0.1/1.0.2: mandor's own
+# persisted state is untrusted input, and it is read on the startup path.
+export MANDOR_STATE_DIR="$TMP/state49"
+mkdir -p "$MANDOR_STATE_DIR"
+printf '{"v":2,"entries":[{"sig":"ffffffffffffffff","first":18446744073709551615,"last":18446744073709551615,"count":18446744073709551615,"builds":4294967295,"fb":"x","lb":"y"}]}' \
+  >"$MANDOR_STATE_DIR/history.json"
+printf '{"v":1,"workers":[{"name":"sh","idle_n":4294967295,"active_n":4294967295,"core_ms":18446744073709551615,"rss_kb_ms":18446744073709551615,"peak_rss_kb":18446744073709551615,"rss_idle":[4294967295,4294967295],"cpu_active":[4294967295]}]}' \
+  >"$MANDOR_STATE_DIR/cost.json"
+out=$(timeout 20 "$MANDOR" "sh -c 'exit 3'" 2>&1); c=$?
+if [ $c -eq 3 ] && echo "$out" | grep -q "shift report"; then
+  ok "corrupt history/cost state files do not kill the supervisor"
+else bad "corrupt state files" "exit $c: $(echo "$out" | tail -3)"; fi
+
+# 50. and `report` must survive reading them back
+if timeout 10 "$MANDOR" report --cost >"$TMP/50" 2>&1 && timeout 10 "$MANDOR" report --incidents >>"$TMP/50" 2>&1; then
+  ok "report survives corrupt state files"
+else bad "report survives corrupt state files" "$(tail -3 "$TMP/50")"; fi
+
+# 51. truncated / garbage state files (partial write, disk full)
+printf '{"v":2,"entries":[{"sig":"ff' >"$MANDOR_STATE_DIR/history.json"
+head -c 300 /dev/urandom >"$MANDOR_STATE_DIR/cost.json"
+timeout 20 "$MANDOR" "sh -c 'exit 5'" >"$TMP/51" 2>&1; c=$?
+if [ $c -eq 5 ]; then ok "truncated/garbage state files tolerated"
+else bad "truncated state files" "exit $c: $(tail -3 "$TMP/51")"; fi
+unset MANDOR_STATE_DIR
+
+# 52. an unwritable state dir must degrade, not abort: supervision outranks
+# bookkeeping (PID 1 must not die because a volume is read-only).
+export MANDOR_STATE_DIR="$TMP/state52"
+mkdir -p "$MANDOR_STATE_DIR"; chmod 500 "$MANDOR_STATE_DIR"
+timeout 20 "$MANDOR" "sh -c 'exit 4'" >"$TMP/52" 2>&1; c=$?
+chmod 700 "$MANDOR_STATE_DIR"
+if [ $c -eq 4 ]; then ok "read-only state dir degrades without aborting"
+else bad "read-only state dir" "exit $c: $(tail -3 "$TMP/52")"; fi
+unset MANDOR_STATE_DIR
+
+# 53/54. worker-table boundary: the table is a fixed [64], so exactly-full
+# must work and one-over must be rejected cleanly rather than overrun it.
+export MANDOR_STATE_DIR="$TMP/state53"
+args=(); for _ in $(seq 1 64); do args+=("sh -c 'exit 0'"); done
+timeout 60 "$MANDOR" "${args[@]}" >"$TMP/53" 2>&1; c=$?
+n=$(grep -c "spawned" "$TMP/53")
+if [ $c -eq 0 ] && [ "$n" -eq 64 ]; then ok "64 workers (table exactly full) supervise cleanly"
+else bad "64 workers" "exit $c, spawns $n"; fi
+
+args+=("sh -c 'exit 0'")   # 65th
+timeout 30 "$MANDOR" "${args[@]}" >"$TMP/54" 2>&1; c=$?
+if [ $c -ne 0 ] && [ $c -ne 139 ] && grep -qi "worker" "$TMP/54"; then
+  ok "65 workers rejected cleanly (no overrun)"
+else bad "65 workers rejected" "exit $c: $(head -2 "$TMP/54")"; fi
+unset MANDOR_STATE_DIR
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

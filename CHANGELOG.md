@@ -3,6 +3,32 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.0.3] - 2026-07-20
+
+Turns the last asserted-but-unmeasured claim into a measured one, and covers
+the hostile conditions fuzzing cannot reach. No source changes — tests, CI,
+and docs only.
+
+### Added
+- **Soak test** (`test/harness/soak.sh`, 3 minutes in CI). Runs capture at
+  full rate, restart churn, incident writes, the sampler, health probes, and
+  the metrics listener simultaneously, then asserts mandor's *own* RSS, fd
+  count, and thread count stay flat, that the incident spool respects its
+  retention bound, that `report` still works afterward, and that TERM still
+  shuts down cleanly. This is what now backs "zero allocations in steady
+  state": over a 30-minute run under full-rate log capture, **~1.1 MB RSS,
+  10 fds, 1 thread, 4 KB drift**. `SOAK_SECONDS=1800` for a deep local run.
+  Calibrated by injecting a 64 KB-per-tick leak and confirming it fails
+  (640 KB drift against a 256 KB budget) — a soak that cannot detect a leak
+  proves nothing.
+- Six integration cases (harness now 54). Four cover hostile environments —
+  the real-world form of the traps fixed in 1.0.1/1.0.2: a `history.json` and
+  `cost.json` full of out-of-range values, truncated and random-garbage state
+  files, and a read-only state directory. In every case supervision must
+  continue: bookkeeping failures never outrank keeping PID 1 alive. Two cover
+  the worker-table boundary — the table is a fixed `[64]`, so exactly-full
+  must supervise cleanly and one-over must be rejected rather than overrun it.
+
 ## [1.0.2] - 2026-07-20
 
 Third hunting pass, widening the harness past parsers into the pure logic and

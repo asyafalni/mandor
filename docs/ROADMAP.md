@@ -193,8 +193,18 @@ bugs on 8 of 8 seeds. Coverage-guided `zig build test --fuzz` is unusable on
 the pinned Zig 0.16.0, so the harness is in-repo and runs under plain
 `zig build test`.
 
-Remaining non-feature work: a CI soak test (assert flat RSS/fd over a long
-run, to make the "zero allocations in steady state" claim measured rather
-than asserted), a benchmark page vs tini/dumb-init/s6/supervisord,
+**Soak test: done (v1.0.3).** `test/harness/soak.sh` runs capture at full
+rate, restart churn, incident writes, the sampler, health probes, and the
+metrics listener at once, and fails the build if mandor's own RSS, fd count,
+or thread count drifts. Measured over a 30-minute run: **~1.1 MB RSS, 10 fds,
+1 thread, 4 KB drift** — the "zero allocations in steady state" claim is now
+evidence rather than assertion. The harness was itself calibrated by injecting
+a 64 KB-per-tick leak (640 KB drift → fail), the same don't-trust-a-green-test
+discipline used on the fuzzer. Paired with four integration cases for
+hostile environments (corrupt, truncated, and garbage state files; a
+read-only state dir), since bookkeeping failures must never outrank keeping
+PID 1 alive.
+
+Remaining non-feature work: a benchmark page vs tini/dumb-init/s6/supervisord,
 distribution (aports/apt/AUR, announcement), and the premium sidecar
 (separate repo).

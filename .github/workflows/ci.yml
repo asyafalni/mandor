@@ -42,6 +42,13 @@ jobs:
           zig build
           bash test/harness/run_tests.sh
 
+      # Steady-state proof: the README claims zero allocations once running.
+      # 3 minutes is enough to catch any real leak (a 1 KB/s drift blows the
+      # 256 KB budget in ~4 minutes of soak; the workload runs capture, the
+      # sampler, restart churn, incidents, health probes, and metrics at once).
+      - name: Soak (steady-state RSS / fd / thread flatness)
+        run: SOAK_SECONDS=180 bash test/harness/soak.sh
+
       - name: Capture perf gate (nanozlog batching must not regress)
         run: |
           start=$(date +%s%N)

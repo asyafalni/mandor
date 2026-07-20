@@ -18,6 +18,37 @@ zig fmt src build.zig     # formatting (CI enforces --check)
 The harness needs Linux (PID-1/signalfd/procfs semantics). CI runs the full
 suite on Alpine, Debian, and Ubuntu.
 
+### Soak
+
+```console
+bash test/harness/soak.sh                    # ~2 min, the CI default is 3
+SOAK_SECONDS=1800 bash test/harness/soak.sh  # deep local run
+```
+
+Runs capture, the sampler, restart churn, incident writes, health probes, and
+the metrics listener all at once, then asserts mandor's **own** RSS, fd count,
+and thread count stay flat. This is what backs the "zero allocations in steady
+state" claim — treat a drift failure as a leak until proven otherwise. Fixed
+buffers fault in lazily, so early samples are discarded (`WARMUP_PCT`).
+
+Same rule as the fuzzer: **don't trust a green soak.** It was calibrated by
+injecting a 64 KB-per-tick leak into the supervisor and confirming it fails
+(640 KB drift vs a 256 KB budget, against 4-8 KB on a clean build). Inject the
+leak on the *sampler tick*, not the poll loop — under full-rate log spam the
+poll loop allocates gigabytes in seconds and simply OOM-kills mandor, which
+tests nothing.
+
+Two footguns, both found the hard way on 30-minute runs:
+
+- Anything the script writes to a socket needs a subshell and `|| true`. The
+  metrics endpoint closes the connection after responding, so a write that
+  loses that race raises **SIGPIPE and kills the soak itself** (exit 141) —
+  rare per scrape, near-certain across a long run. The script now also
+  `trap '' PIPE`s.
+- Bash reads a script incrementally as it executes, so editing `soak.sh` while
+  a long soak runs can corrupt that run. Snapshot it
+  (`cp test/harness/soak.sh /tmp/soak.sh`) before a long session.
+
 ### Fuzzing
 
 `src/fuzz.zig` mutation-fuzzes everything that consumes input mandor does not
