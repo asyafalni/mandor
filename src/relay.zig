@@ -199,6 +199,20 @@ pub fn buildOtlp(bundle: []const u8) BuildError![]const u8 {
     return body_buf[0..pos];
 }
 
+/// True only for a genuine HTTP status line reporting 2xx.
+///
+/// The `HTTP/` prefix check is the point: without it, any reply at least 12
+/// bytes long whose bytes 9..11 happen to read `200` — a plain-text error
+/// page, another protocol's banner — would be taken as a successful delivery
+/// and the incident silently dropped. Any 2xx counts, not just `200`: OTLP
+/// receivers may answer `202 Accepted`, and treating that as a rejection
+/// would report a delivery that actually worked as a failure.
+fn statusOk(resp: []const u8) bool {
+    if (resp.len < 12) return false;
+    if (!std.mem.startsWith(u8, resp, "HTTP/")) return false;
+    return resp[9] == '2';
+}
+
 fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (posix.errno(rc) != .SUCCESS) {
@@ -260,7 +274,8 @@ fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
         err("photon accepted the connection but never answered (timed out) — see docs/INTEGRATION-PHOTON.md");
         return 1;
     }
-    if (posix.errno(got) == .SUCCESS and got > 12 and std.mem.eql(u8, resp[9..12], "200")) return 0;
+    if (posix.errno(got) == .SUCCESS and got > 0 and
+        statusOk(resp[0..@min(@as(usize, @intCast(got)), resp.len)])) return 0;
     // Echo the status line: "did not accept the payload" alone gives the
     // operator nothing to act on, and the most likely cause is a receiver that
     // decodes OTLP protobuf only while mandor sends OTLP/JSON — which the
@@ -277,6 +292,31 @@ fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
 }
 
 const testing = std.testing;
+
+test "statusOk accepts real 2xx and nothing else" {
+    try testing.expect(statusOk("HTTP/1.1 200 OK\r\n"));
+    try testing.expect(statusOk("HTTP/1.0 200 OK\r\n"));
+    // OTLP receivers may answer 202; treating that as a rejection would report
+    // a delivery that actually succeeded as a failure.
+    try testing.expect(statusOk("HTTP/1.1 202 Accepted\r\n"));
+    try testing.expect(statusOk("HTTP/1.1 204 No Content\r\n"));
+
+    try testing.expect(!statusOk("HTTP/1.1 500 Internal Server Error\r\n"));
+    try testing.expect(!statusOk("HTTP/1.1 404 Not Found\r\n"));
+    try testing.expect(!statusOk("HTTP/1.1 400 Bad Request\r\n"));
+
+    // The false-positive class this guards: a non-HTTP reply whose bytes 9..11
+    // read "200" was previously accepted as a successful delivery, silently
+    // dropping the incident.
+    try testing.expect(!statusOk("error at 200ms while decoding"));
+    try testing.expect(!statusOk("SSH-2.0-OpenSSH_8.9p1 200"));
+    try testing.expect(!statusOk("\x00\x00\x00\x00\x00\x00\x00\x00\x00200"));
+
+    // Too short to hold a status line at all.
+    try testing.expect(!statusOk(""));
+    try testing.expect(!statusOk("HTTP/1.1 2"));
+    try testing.expect(!statusOk("200 OK"));
+}
 
 test "parseHostPort accepts and rejects" {
     const ok = parseHostPort("127.0.0.1:4318").?;

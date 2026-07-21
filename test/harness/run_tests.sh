@@ -932,6 +932,65 @@ elif [ $c -ne 0 ] && grep -q "never answered" "$TMP/69"; then
 else bad "relay timeout" "exit $c: $(head -2 "$TMP/69")"; fi
 fi
 
+# 70-72. relay's response handling. A collector can answer in more ways than
+# "200 OK", and post() had no coverage beyond the happy path.
+cat > "$TMP/responder.py" <<'PY'
+import socket, sys
+mode = sys.argv[2]
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(1)
+srv.settimeout(30)
+with open(sys.argv[1], "w") as f:
+    f.write(str(srv.getsockname()[1]))
+conn, _ = srv.accept()
+try:
+    conn.recv(65536)
+except Exception:
+    pass
+if mode == "reject":
+    conn.sendall(b"HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n")
+elif mode == "accepted":
+    conn.sendall(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+# mode "close" sends nothing at all
+conn.close()
+PY
+
+relay_against() {   # $1=mode -> sets $relay_rc, output in $TMP/resp_out
+  rm -f "$TMP/rport"
+  python3 "$TMP/responder.py" "$TMP/rport" "$1" >/dev/null 2>&1 &
+  local rp=$!
+  local i=0
+  while [ ! -s "$TMP/rport" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+  if [ ! -s "$TMP/rport" ]; then relay_rc=999; return; fi
+  timeout 40 "$MANDOR" relay "$TMP/b65.json" "127.0.0.1:$(cat "$TMP/rport")" \
+    >"$TMP/resp_out" 2>&1
+  relay_rc=$?
+  wait $rp 2>/dev/null
+}
+
+# 70. a rejection must fail loudly and echo the status line, so the operator
+# can tell a protobuf-only receiver from a genuine outage.
+relay_against reject
+if [ $relay_rc -ne 0 ] && [ $relay_rc -ne 124 ] && grep -q "415" "$TMP/resp_out"; then
+  ok "relay reports a rejection and echoes the status line"
+else bad "relay rejection" "exit $relay_rc: $(head -2 "$TMP/resp_out")"; fi
+
+# 71. a peer that closes without answering must be reported, not hang and not
+# be mistaken for success.
+relay_against close
+if [ $relay_rc -ne 0 ] && [ $relay_rc -ne 124 ]; then
+  ok "relay reports a peer that closes without answering"
+else bad "relay empty response" "exit $relay_rc (124=hung, 0=false success)"; fi
+
+# 72. 202 Accepted is a success. OTLP receivers may answer it, and treating it
+# as a rejection would report a delivery that actually worked as a failure.
+relay_against accepted
+if [ $relay_rc -eq 0 ]; then
+  ok "relay treats 202 Accepted as delivered"
+else bad "relay 202" "exit $relay_rc: $(head -2 "$TMP/resp_out")"; fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

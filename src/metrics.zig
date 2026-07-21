@@ -108,6 +108,60 @@ pub const Server = struct {
 
 // ---------------------------------------------------------------- tests
 
+test "a full worker table still renders every series" {
+    // The worst realistic case: the table at capacity, names at name_cap, and
+    // counters wide enough to be near-maximum width. `ap` drops silently on
+    // overflow and Content-Length is taken from whatever survived, so a
+    // too-small body_buf loses metrics with no error anywhere.
+    var workers: [64]spawner.Worker = undefined;
+    for (&workers, 0..) |*w, i| {
+        w.name_len = 32;
+        for (0..32) |c| w.name[c] = 'a' + @as(u8, @intCast((i + c) % 26));
+        w.pid = @intCast(i + 1);
+        w.restarts = std.math.maxInt(u32);
+        w.stats.next = 0;
+        w.stats.len = 0;
+        w.stats.push(.{
+            .t_ms = 0,
+            .rss_kb = std.math.maxInt(u64),
+            .cpu_pct = 100,
+            .fds = std.math.maxInt(u16),
+            .threads = std.math.maxInt(u16),
+        });
+    }
+    const text = render(&body_buf, &workers, std.math.maxInt(u64));
+
+    // Every worker must appear in every metric family -- six lines each.
+    for (&workers) |*w| {
+        const n = w.nameSlice();
+        var needle: [96]u8 = undefined;
+        inline for (.{
+            "mandor_worker_up{{worker=\"{s}\"}} ",
+            "mandor_worker_restarts_total{{worker=\"{s}\"}} ",
+            "mandor_worker_rss_kilobytes{{worker=\"{s}\"}} ",
+            "mandor_worker_cpu_percent{{worker=\"{s}\"}} ",
+            "mandor_worker_fds{{worker=\"{s}\"}} ",
+            "mandor_worker_threads{{worker=\"{s}\"}} ",
+        }) |fmt| {
+            const want = try std.fmt.bufPrint(&needle, fmt, .{n});
+            try std.testing.expect(std.mem.indexOf(u8, text, want) != null);
+        }
+    }
+    // ...and the trailing counter, which is emitted last and so is the first
+    // thing a silent truncation would eat.
+    try std.testing.expect(std.mem.indexOf(u8, text, "mandor_incidents_total ") != null);
+
+    // The rendered response must also fit the response buffer with headers.
+    try std.testing.expect(text.len + 128 < resp_buf.len);
+
+    // Worst case measures ~28.9KB against a 32KB buffer: it fits, but only by
+    // ~3.8KB. One more metric family costs 64 workers * ~80 bytes = ~5KB and
+    // would overflow -- silently, since `ap` drops on overflow and
+    // Content-Length is taken from whatever survived. If this assertion fires,
+    // grow body_buf and resp_buf together rather than shrinking the output.
+    try std.testing.expect(text.len < body_buf.len);
+}
+
 test "renders prometheus text" {
     var workers: [1]spawner.Worker = undefined;
     const w = &workers[0];

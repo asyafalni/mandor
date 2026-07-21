@@ -3,6 +3,39 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.4] - 2026-07-21
+
+### Fixed
+- **A successful delivery could be reported as a rejection.** The response
+  check matched the status line against exactly `"200"`, so a receiver
+  answering `202 Accepted` — valid for OTLP ingest — printed "photon rejected
+  the payload" and exited 1, sending the operator to investigate a working
+  integration. Any 2xx now counts. Proven by mutation: restoring the exact
+  match makes harness case 72 fail.
+- **A non-HTTP reply could be mistaken for success.** The same check indexed
+  offset 9 without verifying the response was HTTP at all, so any reply of at
+  least 12 bytes whose bytes 9..11 happened to read `200` — a plain-text error
+  page, another protocol's banner — was taken as a successful delivery and the
+  incident silently dropped. The status line is now validated as HTTP first.
+
+### Added
+- **`post()` has coverage.** It previously had none beyond the happy path.
+  `statusOk` is now a tested unit (2xx, 4xx/5xx, non-HTTP look-alikes, short
+  replies), plus harness cases for a rejection with its status echoed, a peer
+  that closes without answering, and a 202.
+- **A metrics boundary test at full worker-table capacity.** `render` writes
+  into a 32KB buffer via an `ap` that drops silently on overflow, with
+  Content-Length taken from whatever survived — so an overflow would lose
+  series with no error anywhere. Worst case (64 workers, 32-char names,
+  near-maximum counters) measures 28,974 bytes: it fits, but with only ~3.8KB
+  spare, and one more metric family would cost ~5KB. The test pins every
+  series so a future addition fails loudly instead of silently truncating.
+
+### Checked, no change needed
+- The metrics listener and its accepted connections are already `SOCK.NONBLOCK`,
+  so a client that connects and never sends cannot stall the supervision loop.
+  This was the worst-case suspicion behind the audit; it does not hold.
+
 ## [1.5.3] - 2026-07-21
 
 ### Fixed
