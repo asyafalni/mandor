@@ -126,19 +126,25 @@ wait "$mpid"; c=$?
 if [ $c -eq 0 ] && [ -f "$marker_usr1" ]; then ok "USR1 forwarded to workers"
 else bad "USR1 forwarded" "exit $c, marker $([ -f "$marker_usr1" ] && echo yes || echo no)"; fi
 
-# 13. signals reach grandchildren via process groups
-m1="$TMP/gc_parent"; m2="$TMP/gc_child"
+# 13. signals reach grandchildren via process groups.
+# Both processes announce that their trap is installed, and the test waits for
+# those markers instead of sleeping a fixed second: under I/O load the
+# grandchild can still be starting when TERM arrives, which made this fail
+# ~40% of the time while a large image pull was running. A test that fails on
+# a busy machine teaches people to ignore it.
+m1="$TMP/gc_parent"; m2="$TMP/gc_child"; r1="$TMP/gc_pready"; r2="$TMP/gc_cready"
 cat > "$TMP/gc.sh" <<GCEOF
-(trap 'touch $m2; exit 0' TERM; sleep 30 & wait \$!) &
+(trap 'touch $m2; exit 0' TERM; touch $r2; sleep 30 & wait \$!) &
 trap 'touch $m1; exit 0' TERM
+touch $r1
 sleep 30 & wait \$!
 GCEOF
 "$MANDOR" "bash $TMP/gc.sh" >"$TMP/13" 2>&1 &
 mpid=$!
-sleep 1
+i=0; while { [ ! -f "$r1" ] || [ ! -f "$r2" ]; } && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
 kill -TERM "$mpid"
 wait "$mpid" 2>/dev/null
-sleep 0.5
+i=0; while { [ ! -f "$m1" ] || [ ! -f "$m2" ]; } && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
 if [ -f "$m1" ] && [ -f "$m2" ]; then ok "TERM reaches grandchildren (process group)"
 else bad "TERM reaches grandchildren" "parent=$([ -f $m1 ] && echo y || echo n) child=$([ -f $m2 ] && echo y || echo n)"; fi
 

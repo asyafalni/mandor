@@ -171,7 +171,8 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 | 43 ✅ | Exit once all *essential* workers are done | XS | ● ● ● ○ | SHIPPED v1.4.0 — the loop-exit test asks it of essential workers only; sidecars are drained and the exit code is the essential outcome |
 | 44 ✅ | Per-worker `expected_exit` | XS | ● ● ○ ○ | SHIPPED v1.3.0 |
 | 45 | `relay.zig` has no test coverage | S | ● ● ● ○ | PARKED 2026-07-21 — zero fuzz targets, zero harness cases; parses two untrusted inputs |
-| 46 | `supervisor.run` is very large | M | ● ● ○ ○ | PARKED 2026-07-21 — dominates the size profile and is hard to review |
+| 46 | `supervisor.run` is very large | M | ● ● ○ ○ | IN PROGRESS — steps 1–2 shipped (`Shutdown` struct, `handleDeaths`); `run` 451 → 344 lines |
+| 47 | Post-death group sweep can cut short a grandchild's own TERM handler | S | ● ● ○ ○ | PARKED 2026-07-21 — found via a flaky harness case; see below |
 
 ### #42 — `fork` failure permanently retires a worker
 
@@ -319,6 +320,30 @@ work left.
 live or pending"; it should ask that of *essential* workers only. Non-essential
 workers then get TERM'd through the normal graceful shutdown. One condition
 plus a harness case — the design thinking is done.
+
+### #47 — the group sweep can cut short a grandchild's TERM handler
+
+When a worker dies, `reaper.drain` sweeps its process group with `SIGKILL` so
+restarts never accumulate strays (`reaper.zig`, "Leader is dead"). Under load
+that races a grandchild that is still running its *own* TERM handler: the
+worker traps TERM and exits quickly, the sweep fires, and the grandchild is
+killed mid-drain. `stop_grace` does not cover it — the sweep is immediate.
+
+Found while investigating harness case 13, which failed ~40% of the time while
+a large image pull was running. Making the test wait for readiness markers
+instead of a fixed `sleep 1` removed one race, but roughly 1-in-5 failures
+remain under heavy I/O, and the residual is this.
+
+**The design question:** stray prevention versus letting grandchildren drain.
+Both are legitimate. A middle option is to sweep with TERM first and reserve
+KILL for the stop-grace expiry, matching how the fleet shutdown already
+escalates — but that costs a deferred sweep and some state, and the current
+behaviour is defensible for the "restart must not leak processes" case it was
+written for. Worth deciding deliberately rather than by default.
+
+Note the harness case is a *real* signal here, not just flakiness: it is
+detecting genuine non-determinism in mandor's shutdown, so it should not be
+"fixed" by loosening the assertion.
 
 ### #45 — `relay.zig` has no test coverage
 
