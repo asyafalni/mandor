@@ -18,6 +18,26 @@ zig fmt src build.zig     # formatting (CI enforces --check)
 The harness needs Linux (PID-1/signalfd/procfs semantics). CI runs the full
 suite on Alpine, Debian, and Ubuntu.
 
+### Container (real PID 1)
+
+```console
+bash test/container/run.sh                 # podman by default
+ENGINE=docker bash test/container/run.sh
+```
+
+The host harness runs mandor as an ordinary process: nothing is reparented to
+it, and the process-group behaviour it relies on is never exercised. These
+cases cover what the host cannot — that mandor really is PID 1, that it reaps
+grandchildren the kernel reparents to it, that a grandchild's own TERM handler
+drains rather than being cut short by the post-death sweep (the v1.5.1 case),
+and the exit-code contract an orchestrator reads. It skips cleanly when no
+container engine is present.
+
+Set `MANDOR_MUSL=/path/to/mandor` to supply a prebuilt static binary instead of
+cross-compiling — needed where the toolchain and the container engine live in
+different environments (a Windows box building under WSL but running
+`podman.exe` on the host).
+
 ### Soak
 
 ```console

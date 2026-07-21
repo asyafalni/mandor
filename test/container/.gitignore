@@ -1,0 +1,5 @@
+# Build artifacts: the musl binary is copied in for the image build and the
+# cross build lands in out/. Never commit either.
+mandor
+mandor.prebuilt
+out/

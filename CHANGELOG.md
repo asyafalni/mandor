@@ -3,6 +3,33 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.12] - 2026-07-22
+
+### Added
+- **`test/container/run.sh` — real PID-1 tests.** The host harness runs mandor
+  as an ordinary process: nothing is reparented to it, so zombie reaping is
+  literally unobservable there, and the process-group behaviour it relies on is
+  never exercised. Five cases now cover what the host cannot — mandor really
+  being PID 1, reaping grandchildren the kernel reparents to it, a grandchild's
+  own TERM handler draining rather than being cut short by the post-death sweep
+  (the v1.5.1 case), and the exit-code contract an orchestrator reads (7, 139,
+  127). Skips cleanly with no container engine; `MANDOR_MUSL` supplies a
+  prebuilt binary where the toolchain and engine live in different
+  environments.
+
+### Validation of the 1.5.x series
+Every release from 1.5.1 to 1.5.11 was developed and verified on the host,
+where PID-1 semantics differ. Both gaps are now closed:
+
+- **Container, 5/5.** The v1.5.1 grandchild-drain fix holds under genuine
+  PID 1 — the grandchild's handler completes rather than being killed
+  mid-drain. Zombie reaping confirmed (`zombies=0`), which the host suite
+  could never have shown.
+- **30-minute soak, 6/6.** Steady-state RSS drift **0 KB** against a 256 KB
+  budget, fds flat at 9, single-threaded throughout, incident spool bounded by
+  retention, report and shutdown clean afterwards — with the state-file
+  buffers, incident path and pruning all changed during the series.
+
 ## [1.5.11] - 2026-07-22
 
 ### Testing
