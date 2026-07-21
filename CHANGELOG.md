@@ -3,6 +3,33 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.1] - 2026-07-21
+
+### Fixed
+- **The post-death group sweep no longer cuts short a grandchild's own TERM
+  handler.** When a worker died, the reaper immediately `SIGKILL`ed its process
+  group so a restart could never inherit strays. During a *graceful shutdown*
+  that raced the grandchildren: mandor had already TERMed the whole group, and
+  the leader exiting (having handled TERM promptly) killed processes that were
+  still draining well inside `stop_grace`.
+
+  The sweep is now conditional on what mandor is actually doing. Still
+  supervising — a restart is coming, nothing is draining — it KILLs as before.
+  Shutting down, it leaves the group alone; those processes are draining on
+  purpose and the existing stop-grace escalation is the right backstop.
+
+  Skipping the sweep alone would have orphaned them instead: the escalation
+  only ever signalled workers with a live pid, and the leader is already
+  reaped. `Worker.pgid` is therefore recorded at spawn and outlives the reap,
+  and the stop-grace `SIGKILL` now also reaches recorded groups whose leader
+  has exited. The reaper clears `pgid` when it does sweep, so a recorded pgid
+  means exactly one thing — "left draining during a shutdown" — and can never
+  be a stale id the kernel has since recycled.
+
+  Found via harness case 13 (`TERM reaches grandchildren`), which failed
+  roughly 1-in-5 under heavy I/O; it now passes 6/6 under the same load.
+  Cost: +160 bytes.
+
 ## [1.5.0] - 2026-07-21
 
 ### Changed

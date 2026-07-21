@@ -32,6 +32,10 @@ pub const Worker = struct {
     argv: [max_args + 1]?[*:0]const u8 = undefined, // null-terminated for execve
     argc: u8 = 0,
     pid: i32 = 0, // 0 = not running
+    /// Process-group id (== the pid at spawn). Kept after `pid` is
+    /// cleared on reap so a graceful shutdown can still reach
+    /// grandchildren whose leader has already exited.
+    pgid: i32 = 0,
     status: Status = .not_started,
     core_dumped: bool = false,
     exe_buf: [256]u8 = undefined,
@@ -127,6 +131,7 @@ fn resetWorker(w: *Worker) void {
     w.cmd = "";
     w.argc = 0;
     w.pid = 0;
+    w.pgid = 0;
     w.status = .not_started;
     w.core_dumped = false;
     w.restarts = 0;
@@ -464,6 +469,7 @@ pub fn spawn(
     // Parent sets it too — whichever side wins the race, the group exists
     // before we ever signal it.
     _ = linux.setpgid(@intCast(rc), @intCast(rc));
+    w.pgid = @intCast(rc);
     if (out_p) |p| {
         _ = linux.close(p.w);
         w.out_r = p.r;

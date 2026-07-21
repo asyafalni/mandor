@@ -10,7 +10,12 @@ pub const ReapSummary = struct { reaped_workers: u8 = 0 };
 
 /// Drain every exited child without blocking. Dead workers get their status
 /// classified (exit code, or 128+signal) and pid cleared.
-pub fn drain(workers: []spawner.Worker) ReapSummary {
+/// `sweep_kill` KILLs a dead worker's process group so a restart never
+/// inherits strays. It is false during a graceful shutdown: the group was
+/// already sent TERM, and killing it here would cut short grandchildren
+/// still running their own handlers inside stop-grace. They are reached
+/// via `Worker.pgid` if stop-grace expires.
+pub fn drain(workers: []spawner.Worker, sweep_kill: bool) ReapSummary {
     var summary: ReapSummary = .{};
     while (true) {
         var st: u32 = 0;
@@ -23,10 +28,14 @@ pub fn drain(workers: []spawner.Worker) ReapSummary {
         const pid: i32 = @intCast(rc);
         if (pid == 0) return summary; // children exist, none exited
         for (workers) |*w| {
-            if (w.pid == pid) {
-                // Leader is dead: sweep any grandchildren left in its
-                // process group so restarts never accumulate strays.
+            if (w.pid == pid and sweep_kill) {
+                // Leader is dead and we are still supervising: sweep any
+                // grandchildren left in its process group so a restart never
+                // inherits strays. The group is gone, so drop the id — a
+                // recorded pgid must only ever mean "left draining during a
+                // shutdown", never a stale id the kernel may have recycled.
                 posix.kill(-pid, .KILL) catch {};
+                w.pgid = 0;
             }
             if (w.health_pid == pid) {
                 w.health_pid = 0;
@@ -86,7 +95,7 @@ test "spawn, reap, classify exit and signal deaths" {
     var reaped: u8 = 0;
     var tries: u32 = 0;
     while (reaped < 2 and tries < 5000) : (tries += 1) {
-        reaped += drain(workers[0..2]).reaped_workers;
+        reaped += drain(workers[0..2], true).reaped_workers;
         if (reaped < 2) sleepMs(1);
     }
     try std.testing.expectEqual(@as(u8, 2), reaped);

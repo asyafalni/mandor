@@ -172,7 +172,7 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 | 44 ✅ | Per-worker `expected_exit` | XS | ● ● ○ ○ | SHIPPED v1.3.0 |
 | 45 | `relay.zig` has no test coverage | S | ● ● ● ○ | PARKED 2026-07-21 — zero fuzz targets, zero harness cases; parses two untrusted inputs |
 | 46 ✅ | `supervisor.run` is very large | M | ● ● ○ ○ | SHIPPED v1.5.0 — six steps; `run` 451 → 208 lines, binary −5,152 B, perf neutral |
-| 47 | Post-death group sweep can cut short a grandchild's own TERM handler | S | ● ● ○ ○ | PARKED 2026-07-21 — found via a flaky harness case; see below |
+| 47 ✅ | Post-death group sweep can cut short a grandchild's own TERM handler | S | ● ● ○ ○ | SHIPPED v1.5.1 — sweep is now conditional on supervising-vs-shutting-down; `Worker.pgid` outlives the reap so stop-grace still reaches orphaned groups. Case 13 now 6/6 under the load that failed it ~1-in-5. +160 bytes. |
 
 ### #42 — `fork` failure permanently retires a worker
 
@@ -344,6 +344,15 @@ written for. Worth deciding deliberately rather than by default.
 Note the harness case is a *real* signal here, not just flakiness: it is
 detecting genuine non-determinism in mandor's shutdown, so it should not be
 "fixed" by loosening the assertion.
+
+**Resolved in v1.5.1** — and the deferred TERM sweep above turned out to be
+unnecessary. Both behaviours are correct, just in different states: while
+supervising (a restart is coming, nothing is draining) the immediate KILL is
+right; while shutting down the group was already TERMed on purpose, so the
+sweep should not fire at all and stop-grace is already the backstop. No timer,
+no deferred state. The only new state is `Worker.pgid`, needed because the
+escalation only signalled live pids and would otherwise have orphaned the
+grandchildren rather than killing them early.
 
 ### #45 — `relay.zig` has no test coverage
 

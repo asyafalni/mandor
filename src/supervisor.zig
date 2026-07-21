@@ -844,7 +844,7 @@ fn handleDeaths(
     path_env: []const u8,
     oom_kills: *u64,
 ) void {
-    const reaped = reaper.drain(workers).reaped_workers;
+    const reaped = reaper.drain(workers, !sd.active).reaped_workers;
     const now = nowMs();
     if (reaped > 0) report.writeState(state_dir, workers, now);
     var oom_hit = false;
@@ -1038,6 +1038,11 @@ fn killAll(workers: []spawner.Worker) void {
     forwardAll(workers, .KILL);
     for (workers) |*w| {
         if (w.prestop_pid > 0) posix.kill(w.prestop_pid, .KILL) catch {};
+        // Also reach groups whose leader already exited during the shutdown:
+        // the reaper deliberately leaves those alone so grandchildren can
+        // drain, which makes this the only thing that stops a group that
+        // ignored TERM.
+        if (w.pid == 0 and w.pgid > 0) posix.kill(-w.pgid, .KILL) catch {};
     }
 }
 
