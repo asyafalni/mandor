@@ -266,6 +266,14 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     // since no child was ever created to report one.
     var spawn_deaths = false;
 
+    // With no essential worker at all, "all essential finished" would be true
+    // from the start and mandor would exit immediately. Fall back to waiting
+    // for every worker in that degenerate case.
+    var any_essential = false;
+    for (workers) |*w| {
+        if (w.essential) any_essential = true;
+    }
+
     for (workers, 0..) |*w, i| {
         if (dep_of[i] != null or (oneshot_count > 0 and !w.is_oneshot)) {
             waiting[i] = true;
@@ -283,8 +291,13 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     while (true) {
         var live: usize = 0;
         var pending: usize = 0;
+        // Outstanding work that the container actually exists for. A
+        // non-essential worker is a sidecar: useful while the real workers
+        // run, not a reason to stay alive once they are all finished.
+        var essential_busy: usize = 0;
         var next_deadline: u64 = 0;
         for (workers, 0..) |*w, i| {
+            var busy = true;
             if (w.pid != 0) {
                 live += 1;
             } else if (waiting[i]) {
@@ -300,9 +313,29 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                 // term there makes the compiler duplicate the loop body and
                 // costs ~6 KB.
                 pending += 1;
-            }
+            } else busy = false;
+            if (busy and w.essential) essential_busy += 1;
         }
+        // `live` counts every worker, so a shutdown still drains sidecars
+        // before exiting; only the decision to *start* shutting down keys off
+        // the essential ones.
         if (live == 0 and (shutting_down or pending == 0)) break;
+        if (!shutting_down and any_essential and essential_busy == 0) {
+            // Every essential worker has finished. Nothing the container is
+            // for is still running, so stop the sidecars gracefully and exit
+            // rather than idling forever behind a process that never ends.
+            //
+            // The exit code is the worst code among the *essential* workers.
+            // Sidecars are about to die from a TERM mandor is sending itself,
+            // and letting their 143 become the worst code would report a
+            // completely successful run as a failure.
+            var essential_code: u8 = 0;
+            for (workers) |*w| {
+                if (w.essential and w.final_code > essential_code) essential_code = w.final_code;
+            }
+            logmod.print("[mandor] all essential workers finished; stopping the rest\n", .{});
+            beginShutdown(workers, &waiting, envp, path_env, &shutting_down, &shutdown_deadline_ms, &give_up_code, nowMs(), cfg.stop_grace_ms, essential_code);
+        }
 
         // Deferred starts: a dependency is "up" once ready (readiness fd) or
         // simply alive for 1 s; a permanently-dead dependency unblocks its
@@ -834,9 +867,12 @@ fn beginShutdown(
     give_up_code: *?u8,
     now: u64,
     grace_ms: u64,
-    code: u8,
+    /// Exit code to force, or null to leave the normal worst-code rule alone
+    /// (used when the run ends because everything finished, not because
+    /// something failed).
+    code: ?u8,
 ) void {
-    give_up_code.* = code;
+    if (code) |c| give_up_code.* = c;
     shutting_down.* = true;
     deadline_ms.* = now + grace_ms;
     stopWorkers(workers, envp, path_env, .TERM);

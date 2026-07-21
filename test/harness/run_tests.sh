@@ -761,6 +761,36 @@ if [ $c -eq 124 ] && [ "$n" -ge 1 ] && ! grep -q "stopping all" "$TMP/62"; then
   ok "recycling does not trip essential-by-default ($n recycles)"
 else bad "recycle vs essential" "exit $c, recycles $n: $(grep stopping "$TMP/62" | head -1)"; fi
 
+# 63. once every essential worker has finished, sidecars are stopped and the
+# run ends — otherwise a never-exiting sidecar keeps the container alive with
+# no real work left. The exit code is the essential workers' outcome, not the
+# 143 from the TERM mandor sends the sidecar itself.
+printf '#!/bin/sh\nsleep 1\nexit 0\n' >"$TMP/bin/job"
+printf '#!/bin/sh\nwhile :; do sleep 1; done\n' >"$TMP/bin/side"
+chmod +x "$TMP/bin/job" "$TMP/bin/side"
+cat > "$TMP/es43.toml" <<TOML
+workers = ["$TMP/bin/job", "$TMP/bin/side"]
+[worker.side]
+essential = false
+TOML
+timeout 15 "$MANDOR" --config="$TMP/es43.toml" >"$TMP/63" 2>&1
+c=$?
+if [ $c -eq 0 ] && grep -q "all essential workers finished; stopping the rest" "$TMP/63"; then
+  ok "finished essential workers end the run (exit 0, sidecar stopped)"
+else bad "essential-finished exit" "exit $c: $(grep -E 'all essential|killed' "$TMP/63" | head -2)"; fi
+
+# 64. ...but a fleet with no essential worker at all must keep supervising,
+# not exit instantly on the same condition.
+cat > "$TMP/es44.toml" <<TOML
+workers = ["$TMP/bin/side"]
+[worker.side]
+essential = false
+TOML
+timeout 6 "$MANDOR" --config="$TMP/es44.toml" >"$TMP/64" 2>&1
+c=$?
+if [ $c -eq 124 ]; then ok "a fleet with no essential worker keeps supervising"
+else bad "no-essential fleet" "exit $c (expected 124)"; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

@@ -168,7 +168,7 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 | # | Item | Cx | Value | Notes |
 |---|------|----|-------|-------|
 | 42 ✅ | Route a failed spawn through the death path (fixes fork-retry, `essential`, `oneshot`) | S | ● ● ● ● | SHIPPED v1.2.0 — all 3 defects fixed by one structural change; +496 B. See below |
-| 43 | Exit once all *essential* workers are done | XS | ● ● ● ○ | PARKED, **re-scoped 2026-07-21** — 1.3 answered every open question; now a one-condition change. Still reproducible |
+| 43 ✅ | Exit once all *essential* workers are done | XS | ● ● ● ○ | SHIPPED v1.4.0 — the loop-exit test asks it of essential workers only; sidecars are drained and the exit code is the essential outcome |
 | 44 ✅ | Per-worker `expected_exit` | XS | ● ● ○ ○ | SHIPPED v1.3.0 |
 | 45 | `relay.zig` has no test coverage | S | ● ● ● ○ | PARKED 2026-07-21 — zero fuzz targets, zero harness cases; parses two untrusted inputs |
 | 46 | `supervisor.run` is very large | M | ● ● ○ ○ | PARKED 2026-07-21 — dominates the size profile and is hard to review |

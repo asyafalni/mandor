@@ -3,6 +3,25 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.4.0] - 2026-07-21
+
+### Added
+- **The run ends once every essential worker has finished.** Previously mandor
+  waited for *all* workers, so a never-exiting sidecar kept the container alive
+  after the real work was done — healthy-looking, doing nothing. Sidecars are
+  now stopped gracefully (`pre_stop`, TERM, stop-grace) and mandor exits with
+  the **essential** workers' outcome, so the 143 from the TERM mandor sends a
+  sidecar cannot report a successful run as a failure.
+
+  Behaviour is unchanged for the default fleet: when every worker is essential,
+  "all essential finished" is identical to "all finished". It only differs once
+  a worker opts out with `essential = false`. A fleet with *no* essential
+  worker keeps supervising rather than exiting instantly.
+
+  This was roadmap #43, parked since 2026-07-20 behind four open design
+  questions; v1.3's essential-by-default answered all of them, leaving a single
+  loop-exit condition.
+
 ## [1.3.1] - 2026-07-21
 
 ### Fixed
