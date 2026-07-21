@@ -59,7 +59,20 @@ the CLI too. Auth: set `PHOTON_TOKEN` in the environment and the relay sends
 `Authorization: Bearer …`. The generic `on_incident` hook remains for custom
 tooling and the premium sidecar.
 
-**Current photon-side gap (2026-07-18 recon):** photon's `/v1/logs` decodes
+> **Status: still blocked. Re-verified 2026-07-21** against
+> `crates/photon-ingest/src/http.rs` on photon `main`. `decode_export_request`
+> is unchanged — `prost::Message::decode(body)`, protobuf only, and the handler
+> does not inspect `Content-Type` at all. photon's README describing it as
+> "OTEL-native" refers to the protobuf receivers; it does not imply OTLP/JSON.
+>
+> So `photon = "ip:port"` still fails on every incident: mandor POSTs OTLP/JSON
+> and photon returns a protobuf decode error. The failure is *visible* — the
+> relay inherits mandor's stderr, so `photon rejected the payload …` plus the
+> HTTP status line lands in `docker logs` — but nothing is ingested. Nothing
+> regressed; this has never worked end to end. The fix is photon-side and
+> specified in `docs/photon-contrib/otlp-json-ingest-spec.md`.
+
+**Original photon-side gap (2026-07-18 recon):** photon's `/v1/logs` decodes
 protobuf only; mandor sends OTLP/JSON (which the OTLP spec requires servers
 to accept). The exact, afternoon-sized fix for photon is specced in
 [docs/photon-contrib/otlp-json-ingest-spec.md](photon-contrib/otlp-json-ingest-spec.md).

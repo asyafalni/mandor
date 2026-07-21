@@ -171,6 +171,17 @@ fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
     var resp: [128]u8 = undefined;
     const got = linux.read(fd, &resp, resp.len);
     if (posix.errno(got) == .SUCCESS and got > 12 and std.mem.eql(u8, resp[9..12], "200")) return 0;
-    err("photon did not accept the payload");
+    // Echo the status line: "did not accept the payload" alone gives the
+    // operator nothing to act on, and the most likely cause is a receiver that
+    // decodes OTLP protobuf only while mandor sends OTLP/JSON — which the
+    // status plus docs/INTEGRATION-PHOTON.md makes diagnosable.
+    if (posix.errno(got) == .SUCCESS and got > 0) {
+        const line = resp[0..@min(@as(usize, @intCast(got)), 64)];
+        const cut = std.mem.indexOfScalar(u8, line, '\r') orelse line.len;
+        err("photon rejected the payload — see docs/INTEGRATION-PHOTON.md");
+        err(line[0..cut]);
+    } else {
+        err("photon rejected the payload (no response) — see docs/INTEGRATION-PHOTON.md");
+    }
     return 1;
 }
