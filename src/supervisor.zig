@@ -473,111 +473,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
 
         if (ev.chld or spawn_deaths) {
             spawn_deaths = false;
-            const reaped = reaper.drain(workers).reaped_workers;
-            const now = nowMs();
-            if (reaped > 0) report.writeState(state_dir, workers, now);
-            var oom_hit = false;
-            if (reaped > 0) {
-                const cur = cgroup.readOomKills() orelse oom_kills;
-                oom_hit = cur > oom_kills;
-                oom_kills = cur;
-            }
-            for (workers) |*w| {
-                if (w.pid != 0 or w.done or w.next_restart_ms != 0) continue;
-                var clean = switch (w.status) {
-                    .exited => |code| expectedFor(w, cfg, code),
-                    .signaled => false,
-                    else => continue, // not_started/running: nothing new here
-                };
-                const was_recycle = w.recycling;
-                if (was_recycle) {
-                    w.recycling = false;
-                    clean = true; // planned recycling is never a failure
-                    w.final_code = 0;
-                }
-                if (w.health_killed) {
-                    // We killed it because its probe failed. That is a failure
-                    // whatever code it exited with — otherwise `expected_exit`
-                    // containing 143 (the usual graceful-shutdown code) would
-                    // silently turn a hung worker into a successful run.
-                    w.health_killed = false;
-                    clean = false;
-                }
-                if (clean) w.final_code = 0; // expected codes count as success
-                const uptime_ms = now -| w.last_start_ms;
-                w.fail_streak = if (clean)
-                    0
-                else if (uptime_ms >= backoff.stable_uptime_ms) 1 else w.fail_streak + 1;
-                closePipes(w);
-                logDeath(w);
-                var loop_detected = false;
-                if (!sd.active and !clean) {
-                    w.det.recordDeath(now);
-                    incident.onDeath(state_dir, workers, w, now, oom_hit);
-                    if (w.det.restartLoopTriggered(now)) |count| {
-                        incident.onRestartLoop(state_dir, workers, w, count, now);
-                        loop_detected = true;
-                    }
-                }
-                if (w.is_oneshot) {
-                    // Init task: never restarted. Success unblocks the fleet;
-                    // failure takes the whole container down, visibly.
-                    w.done = true;
-                    if (clean) {
-                        logmod.print("[mandor] init task {s} completed\n", .{w.nameSlice()});
-                    } else if (!sd.active) {
-                        logmod.print("[mandor] init task {s} failed, shutting down\n", .{w.nameSlice()});
-                        beginShutdown(&sd, workers, &waiting, envp, path_env, now, cfg.stop_grace_ms, w.final_code);
-                    }
-                    continue;
-                }
-                if (!sd.active and was_recycle) {
-                    // planned recycle: always come back, immediately
-                    w.next_restart_ms = now;
-                    continue;
-                }
-                // Only failures are retried — a clean exit means the worker
-                // finished. A detected restart loop stops retrying too: the
-                // fail-streak resets after 10s of uptime, so a worker crashing
-                // every 11s would otherwise retry forever and never signal.
-                if (!sd.active and !clean and !loop_detected and
-                    retriesLeft(cfg.max_restarts, w.fail_streak))
-                {
-                    w.cur_delay_ms = backoff.next(w.cur_delay_ms, now -| w.last_start_ms, cfg.backoff_max_ms);
-                    w.next_restart_ms = now + w.cur_delay_ms;
-                    logmod.print("[mandor] restarting {s} in {d}ms\n", .{
-                        w.nameSlice(), w.cur_delay_ms,
-                    });
-                } else {
-                    w.done = true;
-                }
-                // A failure that will not be retried ends the run, propagating
-                // the worker's code, so the layer above is signalled. A worker
-                // marked `essential = false` is exempt — but mandor still says
-                // it has stopped trying, because silently abandoning a worker
-                // is the same invisible degradation this release exists to
-                // remove; it is only the *scope* that the opt-out changes.
-                if (w.done and !clean and !sd.active) {
-                    // One format string; the varying parts are composed first.
-                    // Separate formats each cost their own copy of std.fmt.
-                    var why_buf: [48]u8 = undefined;
-                    const why: []const u8 = if (loop_detected)
-                        "is in a restart loop"
-                    else if (cfg.max_restarts != 0)
-                        std.fmt.bufPrint(&why_buf, "failed {d} restart(s)", .{
-                            cfg.max_restarts,
-                        }) catch "failed"
-                    else
-                        "failed";
-                    const what: []const u8 = if (w.essential)
-                        "stopping all"
-                    else
-                        "not restarting it (essential = false)";
-                    logmod.print("[mandor] {s} {s}, {s}\n", .{ w.nameSlice(), why, what });
-                    if (w.essential)
-                        beginShutdown(&sd, workers, &waiting, envp, path_env, now, cfg.stop_grace_ms, w.final_code);
-                }
-            }
+            handleDeaths(&sd, workers, &waiting, cfg, state_dir, envp, path_env, &oom_kills);
         }
 
         // preStop ordering: a finished drain hook (recorded by the reaper
@@ -854,6 +750,130 @@ fn expectedFor(w: *const spawner.Worker, cfg: *const cli.Config, code: u8) bool 
 /// first, then TERM, and the stop-grace deadline escalates to KILL. One place
 /// because three call sites (oneshot failure, unretried failure, and the
 /// give-up path) must behave identically.
+/// Reap, classify, and act on every worker death: restart with backoff,
+/// give up, or end the run. Lifted out of `run` because it is the loop's
+/// one genuinely separable decision — and because every terminal-state rule
+/// lives here, so it is the block a reader needs to find.
+///
+/// Runs on a SIGCHLD *or* a failed spawn: a spawn that never forked has no
+/// child to report one, so `run` stages a synthetic death instead.
+fn handleDeaths(
+    sd: *Shutdown,
+    workers: []spawner.Worker,
+    waiting: []bool,
+    cfg: *const cli.Config,
+    state_dir: []const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+    oom_kills: *u64,
+) void {
+    const reaped = reaper.drain(workers).reaped_workers;
+    const now = nowMs();
+    if (reaped > 0) report.writeState(state_dir, workers, now);
+    var oom_hit = false;
+    if (reaped > 0) {
+        const cur = cgroup.readOomKills() orelse oom_kills.*;
+        oom_hit = cur > oom_kills.*;
+        oom_kills.* = cur;
+    }
+    for (workers) |*w| {
+        if (w.pid != 0 or w.done or w.next_restart_ms != 0) continue;
+        var clean = switch (w.status) {
+            .exited => |code| expectedFor(w, cfg, code),
+            .signaled => false,
+            else => continue, // not_started/running: nothing new here
+        };
+        const was_recycle = w.recycling;
+        if (was_recycle) {
+            w.recycling = false;
+            clean = true; // planned recycling is never a failure
+            w.final_code = 0;
+        }
+        if (w.health_killed) {
+            // We killed it because its probe failed. That is a failure
+            // whatever code it exited with — otherwise `expected_exit`
+            // containing 143 (the usual graceful-shutdown code) would
+            // silently turn a hung worker into a successful run.
+            w.health_killed = false;
+            clean = false;
+        }
+        if (clean) w.final_code = 0; // expected codes count as success
+        const uptime_ms = now -| w.last_start_ms;
+        w.fail_streak = if (clean)
+            0
+        else if (uptime_ms >= backoff.stable_uptime_ms) 1 else w.fail_streak + 1;
+        closePipes(w);
+        logDeath(w);
+        var loop_detected = false;
+        if (!sd.active and !clean) {
+            w.det.recordDeath(now);
+            incident.onDeath(state_dir, workers, w, now, oom_hit);
+            if (w.det.restartLoopTriggered(now)) |count| {
+                incident.onRestartLoop(state_dir, workers, w, count, now);
+                loop_detected = true;
+            }
+        }
+        if (w.is_oneshot) {
+            // Init task: never restarted. Success unblocks the fleet;
+            // failure takes the whole container down, visibly.
+            w.done = true;
+            if (clean) {
+                logmod.print("[mandor] init task {s} completed\n", .{w.nameSlice()});
+            } else if (!sd.active) {
+                logmod.print("[mandor] init task {s} failed, shutting down\n", .{w.nameSlice()});
+                beginShutdown(sd, workers, waiting, envp, path_env, now, cfg.stop_grace_ms, w.final_code);
+            }
+            continue;
+        }
+        if (!sd.active and was_recycle) {
+            // planned recycle: always come back, immediately
+            w.next_restart_ms = now;
+            continue;
+        }
+        // Only failures are retried — a clean exit means the worker
+        // finished. A detected restart loop stops retrying too: the
+        // fail-streak resets after 10s of uptime, so a worker crashing
+        // every 11s would otherwise retry forever and never signal.
+        if (!sd.active and !clean and !loop_detected and
+            retriesLeft(cfg.max_restarts, w.fail_streak))
+        {
+            w.cur_delay_ms = backoff.next(w.cur_delay_ms, now -| w.last_start_ms, cfg.backoff_max_ms);
+            w.next_restart_ms = now + w.cur_delay_ms;
+            logmod.print("[mandor] restarting {s} in {d}ms\n", .{
+                w.nameSlice(), w.cur_delay_ms,
+            });
+        } else {
+            w.done = true;
+        }
+        // A failure that will not be retried ends the run, propagating
+        // the worker's code, so the layer above is signalled. A worker
+        // marked `essential = false` is exempt — but mandor still says
+        // it has stopped trying, because silently abandoning a worker
+        // is the same invisible degradation this release exists to
+        // remove; it is only the *scope* that the opt-out changes.
+        if (w.done and !clean and !sd.active) {
+            // One format string; the varying parts are composed first.
+            // Separate formats each cost their own copy of std.fmt.
+            var why_buf: [48]u8 = undefined;
+            const why: []const u8 = if (loop_detected)
+                "is in a restart loop"
+            else if (cfg.max_restarts != 0)
+                std.fmt.bufPrint(&why_buf, "failed {d} restart(s)", .{
+                    cfg.max_restarts,
+                }) catch "failed"
+            else
+                "failed";
+            const what: []const u8 = if (w.essential)
+                "stopping all"
+            else
+                "not restarting it (essential = false)";
+            logmod.print("[mandor] {s} {s}, {s}\n", .{ w.nameSlice(), why, what });
+            if (w.essential)
+                beginShutdown(sd, workers, waiting, envp, path_env, now, cfg.stop_grace_ms, w.final_code);
+        }
+    }
+}
+
 /// Mutable shutdown state. One struct because it is one decision: the paths
 /// that can end a run (oneshot failure, unretried failure, all-essential-done,
 /// an external signal) all need the same four fields, and passing them
