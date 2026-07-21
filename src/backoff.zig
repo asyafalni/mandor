@@ -1,7 +1,6 @@
 //! Restart backoff math and restart-policy decisions. Pure — tests run anywhere.
 
 const std = @import("std");
-const cli = @import("cli.zig");
 
 pub const initial_delay_ms: u64 = 200;
 /// A run at least this long is considered stable; backoff resets.
@@ -13,14 +12,6 @@ pub fn next(prev_delay_ms: u64, uptime_ms: u64, max_ms: u64) u64 {
     if (uptime_ms >= stable_uptime_ms) return @min(initial_delay_ms, max_ms);
     if (prev_delay_ms == 0) return @min(initial_delay_ms, max_ms);
     return @min(prev_delay_ms *| 2, max_ms);
-}
-
-pub fn shouldRestart(policy: cli.RestartPolicy, exited_clean: bool) bool {
-    return switch (policy) {
-        .never => false,
-        .on_failure => !exited_clean,
-        .always => true,
-    };
 }
 
 // ---------------------------------------------------------------- tests
@@ -51,13 +42,4 @@ test "max smaller than initial clamps" {
     // The stable-uptime reset is a path too: it used to return the raw
     // initial delay and overshoot a cap below 200ms.
     try expectEqual(@as(u64, 100), next(6_400, 11_000, 100));
-}
-
-test "shouldRestart matrix" {
-    try expect(!shouldRestart(.never, true));
-    try expect(!shouldRestart(.never, false));
-    try expect(!shouldRestart(.on_failure, true));
-    try expect(shouldRestart(.on_failure, false));
-    try expect(shouldRestart(.always, true));
-    try expect(shouldRestart(.always, false));
 }

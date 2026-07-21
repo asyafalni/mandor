@@ -234,7 +234,8 @@ fn traceTarget(text: []const u8) void {
 var cmd_storage: [cli.max_workers][]const u8 = undefined;
 
 fn configTarget(text: []const u8) void {
-    _ = config.parse(text, &cmd_storage) catch return;
+    var fc: config.FileConfig = undefined;
+    config.parse(text, &cmd_storage, &fc) catch return;
 }
 
 fn procTarget(text: []const u8) void {
@@ -336,11 +337,12 @@ fn cliTarget(text: []const u8) void {
         arg_slots[n] = a;
         n += 1;
     }
-    _ = cli.parse(arg_slots[0..n], &cmd_storage) catch {};
+    var parsed: cli.Config = undefined;
+    cli.parse(arg_slots[0..n], &cmd_storage, &parsed) catch {};
 }
 
 const cli_seed =
-    "--restart=on-failure --backoff-max=30s --stop-grace=10s --metrics=9464 " ++
+    "--max-restarts=3 --backoff-max=30s --stop-grace=10s --metrics=9464 " ++
     "--health=api=/bin/check --expected-exit=143,129 --max-restarts=5 " ++
     "--ready-fd=3 --state-dir=/var/lib/mandor --incident=2 -- " ++
     "'./api --port 8080' \"./worker -v\"";

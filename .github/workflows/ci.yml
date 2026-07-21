@@ -49,6 +49,19 @@ jobs:
       - name: Soak (steady-state RSS / fd / thread flatness)
         run: SOAK_SECONDS=180 bash test/harness/soak.sh
 
+      # Config surface is budgeted like binary size. Every knob looks justified
+      # on its own; surface grows one reasonable-seeming addition at a time.
+      # Raising this ceiling should be a deliberate, reviewed act.
+      - name: Config surface gate
+        run: |
+          budget=32
+          n=$(grep -cE '^\| `[a-z_]+' docs/CONFIG.md)
+          echo "documented config keys: ${n} (budget ${budget})"
+          if [ "$n" -gt "$budget" ]; then
+            echo "::error::config surface grew to ${n} keys (budget ${budget}). Justify it in CHANGELOG and raise the budget deliberately, or drop a key."
+            exit 1
+          fi
+
       - name: Capture perf gate (nanozlog batching must not regress)
         run: |
           start=$(date +%s%N)

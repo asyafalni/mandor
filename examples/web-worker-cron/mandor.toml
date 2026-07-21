@@ -1,6 +1,10 @@
 # Typical web app: an API, a background worker, and a cron loop.
 # Run:  mandor --config=mandor.toml   (or just `mandor` if named mandor.toml)
-restart = "on-failure"
+
+# Retry a failed worker 3 times, then stop everything and exit with its code
+# so the orchestrator can restart the container. 0 (the default) would not
+# retry at all; -1 would retry forever and never signal upward.
+max_restarts = 3
 
 workers = [
   "./api --port 8080",
@@ -8,12 +12,16 @@ workers = [
   "./cron-loop",
 ]
 
-# Liveness: mandor restarts the API if this probe fails 3× in a row.
-restart_on_unhealthy = true
-
 [worker.api]
+# A configured probe is always acted on: 3 consecutive failures mean the
+# worker is hung, so mandor stops it and the retry rules above take over.
 health = "curl -fsS localhost:8080/healthz"
 
 [worker.worker]
 # Only start once the API is accepting connections.
 start_after = "api"
+
+[worker.cron-loop]
+# This loop exits 3 when it has nothing to do — that is success for it, and
+# declaring it here does not make exit 3 acceptable for any other worker.
+expected_exit = "3"

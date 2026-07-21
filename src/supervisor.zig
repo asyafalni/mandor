@@ -48,7 +48,7 @@ pub fn wallMs() u64 {
 var setup_warnings: u32 = 0;
 
 fn applyConfig(
-    cfg: cli.Config,
+    cfg: *const cli.Config,
     workers: []spawner.Worker,
     dep_of: *[cli.max_workers]?u8,
     oneshot_count: *usize,
@@ -73,7 +73,7 @@ fn applyConfig(
         .{ .pairs = cfg.nice_pairs[0..cfg.nice_pairs_n], .label = "nice", .apply = applyNice },
         .{ .pairs = cfg.max_rss_pairs[0..cfg.max_rss_pairs_n], .label = "max_rss_mb", .apply = applyMaxRss },
         .{ .pairs = cfg.lifetime_pairs[0..cfg.lifetime_pairs_n], .label = "max_lifetime", .apply = applyLifetime },
-        .{ .pairs = cfg.restart_pairs[0..cfg.restart_pairs_n], .label = "restart", .apply = applyRestart },
+        .{ .pairs = cfg.expected_pairs[0..cfg.expected_pairs_n], .label = "expected_exit", .apply = applyExpected },
         .{ .pairs = cfg.prestop_pairs[0..cfg.prestop_pairs_n], .label = "pre_stop", .apply = applyPreStop },
         .{ .pairs = cfg.health[0..cfg.health_n], .label = "health", .apply = applyHealth },
     };
@@ -90,9 +90,12 @@ fn applyConfig(
             }
         }
     }
-    for (cfg.essential[0..cfg.essential_n]) |name| {
+    // Every worker is essential unless it opted out: a failure that exhausts
+    // retries must reach the orchestrator, so silence is never the default.
+    for (workers) |*w| w.essential = true;
+    for (cfg.not_essential[0..cfg.not_essential_n]) |name| {
         if (findWorker(workers, name)) |w| {
-            w.essential = true;
+            w.essential = false;
         } else {
             logmod.print("[mandor] essential: no worker named {s}\n", .{name});
             setup_warnings += 1;
@@ -106,6 +109,16 @@ fn applyConfig(
         } else {
             logmod.print("[mandor] oneshot: no worker named {s}\n", .{name});
             setup_warnings += 1;
+        }
+    }
+    // A oneshot's failure always aborts startup, so `essential` never applies
+    // to it. Silently ignoring the key is how contradictory config goes
+    // unnoticed, so say so and stop.
+    for (workers) |*w| {
+        if (w.is_oneshot and !w.essential) {
+            logmod.print("[mandor] {s}: 'essential' is meaningless on a oneshot — " ++
+                "an init task's failure always stops startup\n", .{w.nameSlice()});
+            return 2;
         }
     }
     // start-after ordering: dep_of[i] = worker index i must wait for.
@@ -150,7 +163,7 @@ fn applyConfig(
 
 /// `mandor validate` — apply the full config to the worker table without
 /// spawning anything, then report. Exit 0 = config is sound.
-pub fn validate(cfg: cli.Config) u8 {
+pub fn validate(cfg: *const cli.Config) u8 {
     const workers = workers_buf[0..cfg.commands.len];
     var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
     var oneshot_count: usize = 0;
@@ -162,17 +175,53 @@ pub fn validate(cfg: cli.Config) u8 {
         logmod.print("[mandor] config invalid: {d} unknown worker reference(s)\n", .{setup_warnings});
         return 1;
     }
-    logmod.print("[mandor] config OK: {d} worker(s)", .{workers.len});
-    if (oneshot_count > 0) logmod.print(", {d} oneshot", .{oneshot_count});
-    logmod.print("\n", .{});
+    printPlan(cfg, workers, &dep_of);
     return 0;
 }
 
-pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
+/// One-time summary of the resolved lifecycle, printed by both `run` and
+/// `validate`. This is how the model reaches people who never open the docs:
+/// it lands in `docker logs` / `kubectl logs` on every deployment.
+///
+/// Deliberately quiet — a worker with default lifecycle prints nothing, so a
+/// plain two-worker config produces exactly one line. Two format strings for
+/// the whole plan is also deliberate: each distinct format instantiates its
+/// own copy of the `std.fmt` machinery.
+fn printPlan(cfg: *const cli.Config, workers: []const spawner.Worker, dep_of: []const ?u8) void {
+    var buf: [96]u8 = undefined;
+    const summary: []const u8 = if (cfg.max_restarts == 0)
+        "a failure ends the run (max_restarts=0)"
+    else if (cfg.max_restarts < 0)
+        "failed workers retry forever (max_restarts=-1)"
+    else
+        std.fmt.bufPrint(&buf, "a failed worker retries {d}x, then the run ends", .{
+            cfg.max_restarts,
+        }) catch "retries are bounded";
+    logmod.print("[mandor] {d} worker(s) | {s}\n", .{ workers.len, summary });
+
+    for (workers, 0..) |*w, i| {
+        if (w.is_oneshot) planLine(w, "init task — runs first, failure aborts startup");
+        if (!w.essential) planLine(w, "essential=false — its failure will not end the run");
+        if (dep_of[i]) |di| {
+            var dep_buf: [96]u8 = undefined;
+            planLine(w, std.fmt.bufPrint(&dep_buf, "starts after {s}", .{
+                workers[di].nameSlice(),
+            }) catch "starts after a dependency");
+        }
+        if (w.has_health) planLine(w, "health probe — 3 failures stop the worker");
+    }
+}
+
+fn planLine(w: *const spawner.Worker, note: []const u8) void {
+    logmod.print("[mandor]   {s}: {s}\n", .{ w.nameSlice(), note });
+}
+
+pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
     const workers = workers_buf[0..cfg.commands.len];
     var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
     var oneshot_count: usize = 0;
     if (applyConfig(cfg, workers, &dep_of, &oneshot_count)) |code| return code;
+    printPlan(cfg, workers, &dep_of);
 
     tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
     tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
@@ -406,7 +455,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             for (workers) |*w| {
                 if (w.pid != 0 or w.done or w.next_restart_ms != 0) continue;
                 var clean = switch (w.status) {
-                    .exited => |code| cfg.expected_exit[code],
+                    .exited => |code| expectedFor(w, cfg, code),
                     .signaled => false,
                     else => continue, // not_started/running: nothing new here
                 };
@@ -416,6 +465,14 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     clean = true; // planned recycling is never a failure
                     w.final_code = 0;
                 }
+                if (w.health_killed) {
+                    // We killed it because its probe failed. That is a failure
+                    // whatever code it exited with — otherwise `expected_exit`
+                    // containing 143 (the usual graceful-shutdown code) would
+                    // silently turn a hung worker into a successful run.
+                    w.health_killed = false;
+                    clean = false;
+                }
                 if (clean) w.final_code = 0; // expected codes count as success
                 const uptime_ms = now -| w.last_start_ms;
                 w.fail_streak = if (clean)
@@ -423,11 +480,14 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 else if (uptime_ms >= backoff.stable_uptime_ms) 1 else w.fail_streak + 1;
                 closePipes(w);
                 logDeath(w);
+                var loop_detected = false;
                 if (!shutting_down and !clean) {
                     w.det.recordDeath(now);
                     incident.onDeath(state_dir, workers, w, now, oom_hit);
-                    if (w.det.restartLoopTriggered(now)) |count|
+                    if (w.det.restartLoopTriggered(now)) |count| {
                         incident.onRestartLoop(state_dir, workers, w, count, now);
+                        loop_detected = true;
+                    }
                 }
                 if (w.is_oneshot) {
                     // Init task: never restarted. Success unblocks the fleet;
@@ -437,15 +497,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                         logmod.print("[mandor] init task {s} completed\n", .{w.nameSlice()});
                     } else if (!shutting_down) {
                         logmod.print("[mandor] init task {s} failed, shutting down\n", .{w.nameSlice()});
-                        give_up_code = w.final_code;
-                        shutting_down = true;
-                        shutdown_deadline_ms = now + cfg.stop_grace_ms;
-                        stopWorkers(workers, envp, path_env, .TERM);
-                        for (workers, 0..) |*other, oi| {
-                            other.next_restart_ms = 0;
-                            waiting[oi] = false;
-                            if (other.pid == 0) other.done = true;
-                        }
+                        beginShutdown(workers, &waiting, envp, path_env, &shutting_down, &shutdown_deadline_ms, &give_up_code, now, cfg.stop_grace_ms, w.final_code);
                     }
                     continue;
                 }
@@ -454,45 +506,38 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     w.next_restart_ms = now;
                     continue;
                 }
-                if (!shutting_down and backoff.shouldRestart(w.restart_override orelse cfg.restart, clean)) {
-                    if (cfg.max_restarts > 0 and w.fail_streak > cfg.max_restarts) {
-                        // give up: make the failure visible to the orchestrator
-                        logmod.print("[mandor] {s} failed {d} consecutive restarts, giving up\n", .{
-                            w.nameSlice(), cfg.max_restarts,
-                        });
-                        w.done = true;
-                        give_up_code = w.final_code;
-                        shutting_down = true;
-                        shutdown_deadline_ms = now + cfg.stop_grace_ms;
-                        stopWorkers(workers, envp, path_env, .TERM);
-                        for (workers, 0..) |*other, oi| {
-                            other.next_restart_ms = 0;
-                            waiting[oi] = false;
-                            if (other.pid == 0) other.done = true;
-                        }
-                    } else {
-                        w.cur_delay_ms = backoff.next(w.cur_delay_ms, now -| w.last_start_ms, cfg.backoff_max_ms);
-                        w.next_restart_ms = now + w.cur_delay_ms;
-                        logmod.print("[mandor] restarting {s} in {d}ms\n", .{
-                            w.nameSlice(), w.cur_delay_ms,
-                        });
-                    }
+                // Only failures are retried — a clean exit means the worker
+                // finished. A detected restart loop stops retrying too: the
+                // fail-streak resets after 10s of uptime, so a worker crashing
+                // every 11s would otherwise retry forever and never signal.
+                if (!shutting_down and !clean and !loop_detected and
+                    retriesLeft(cfg.max_restarts, w.fail_streak))
+                {
+                    w.cur_delay_ms = backoff.next(w.cur_delay_ms, now -| w.last_start_ms, cfg.backoff_max_ms);
+                    w.next_restart_ms = now + w.cur_delay_ms;
+                    logmod.print("[mandor] restarting {s} in {d}ms\n", .{
+                        w.nameSlice(), w.cur_delay_ms,
+                    });
                 } else {
                     w.done = true;
                 }
-                // Leader semantics: a permanently-finished essential worker
-                // takes the whole container down with its exit code.
-                if (w.done and w.essential and !shutting_down) {
-                    logmod.print("[mandor] essential worker {s} finished, stopping all\n", .{w.nameSlice()});
-                    give_up_code = w.final_code;
-                    shutting_down = true;
-                    shutdown_deadline_ms = now + cfg.stop_grace_ms;
-                    stopWorkers(workers, envp, path_env, .TERM);
-                    for (workers, 0..) |*other, oi| {
-                        other.next_restart_ms = 0;
-                        waiting[oi] = false;
-                        if (other.pid == 0) other.done = true;
-                    }
+                // A failure that will not be retried ends the run, propagating
+                // the worker's code, so the layer above is signalled. Only a
+                // worker marked `essential = false` is exempt.
+                if (w.done and !clean and w.essential and !shutting_down) {
+                    // One format string; the reason is composed first. Three
+                    // separate formats cost three copies of std.fmt.
+                    var why_buf: [48]u8 = undefined;
+                    const why: []const u8 = if (loop_detected)
+                        "is in a restart loop"
+                    else if (cfg.max_restarts != 0)
+                        std.fmt.bufPrint(&why_buf, "failed {d} restart(s)", .{
+                            cfg.max_restarts,
+                        }) catch "failed"
+                    else
+                        "failed";
+                    logmod.print("[mandor] {s} {s}, stopping all\n", .{ w.nameSlice(), why });
+                    beginShutdown(workers, &waiting, envp, path_env, &shutting_down, &shutdown_deadline_ms, &give_up_code, now, cfg.stop_grace_ms, w.final_code);
                 }
             }
         }
@@ -633,15 +678,14 @@ fn applyLifetime(w: *spawner.Worker, v: []const u8) bool {
     w.max_lifetime_ms = cli.parseDuration(v) orelse return false;
     return true;
 }
-fn applyRestart(w: *spawner.Worker, v: []const u8) bool {
-    w.restart_override = if (std.mem.eql(u8, v, "never"))
-        .never
-    else if (std.mem.eql(u8, v, "on-failure"))
-        .on_failure
-    else if (std.mem.eql(u8, v, "always"))
-        .always
-    else
-        return false;
+fn applyExpected(w: *spawner.Worker, v: []const u8) bool {
+    var set = [1]bool{true} ++ [1]bool{false} ** 255;
+    if (!cli.parseExpectedExit(v, &set)) return false; // reject junk at startup
+    w.expected_bits = .{0} ** 32;
+    for (set, 0..) |ok, code| {
+        if (ok) w.expected_bits[code >> 3] |= @as(u8, 1) << @intCast(code & 7);
+    }
+    w.expected_set = true;
     return true;
 }
 fn applyPreStop(w: *spawner.Worker, v: []const u8) bool {
@@ -673,7 +717,7 @@ const health_fail_threshold: u8 = 3;
 /// Drive health probes: consume results, time out hung probes, start due
 /// ones, and declare workers unhealthy at the failure threshold.
 fn runHealth(
-    cfg: cli.Config,
+    cfg: *const cli.Config,
     workers: []spawner.Worker,
     state_dir: []const u8,
     envp: [*:null]const ?[*:0]const u8,
@@ -697,12 +741,14 @@ fn runHealth(
                     w.nameSlice(), w.health_fails, health_fail_threshold,
                 });
                 if (w.health_fails >= health_fail_threshold and w.pid > 0) {
+                    // A configured probe is always acted on — detecting a hung
+                    // worker and leaving it running would be the quietest
+                    // failure mandor could produce.
                     w.health_fails = 0;
                     incident.onUnhealthy(state_dir, workers, w, health_fail_threshold, now);
-                    if (cfg.restart_on_unhealthy) {
-                        logmod.print("[mandor] {s} unhealthy, sending SIGTERM\n", .{w.nameSlice()});
-                        posix.kill(-w.pid, .TERM) catch {};
-                    }
+                    logmod.print("[mandor] {s} unhealthy, sending SIGTERM\n", .{w.nameSlice()});
+                    w.health_killed = true;
+                    posix.kill(-w.pid, .TERM) catch {};
                 }
             }
         }
@@ -749,6 +795,49 @@ fn spawnWorker(
 
 /// Exit code stamped on a worker that could not be spawned at all.
 const spawn_fail_code: u8 = 125;
+
+/// Is a *failed* worker still allowed a retry? `0` means no retries at all,
+/// `-1` means unlimited, `N` allows N.
+fn retriesLeft(max_restarts: i32, fail_streak: u32) bool {
+    if (max_restarts < 0) return true;
+    if (max_restarts == 0) return false;
+    return fail_streak <= @as(u32, @intCast(max_restarts));
+}
+
+/// Does `code` count as success for this worker? A per-worker `expected_exit`
+/// replaces the global set; parsing here keeps it off the hot path and out of
+/// per-worker storage.
+fn expectedFor(w: *const spawner.Worker, cfg: *const cli.Config, code: u8) bool {
+    if (!w.expected_set) return cfg.expected_exit[code];
+    return w.expected_bits[code >> 3] & (@as(u8, 1) << @intCast(code & 7)) != 0;
+}
+
+/// Start a graceful fleet shutdown propagating `code`: pre_stop hooks run
+/// first, then TERM, and the stop-grace deadline escalates to KILL. One place
+/// because three call sites (oneshot failure, unretried failure, and the
+/// give-up path) must behave identically.
+fn beginShutdown(
+    workers: []spawner.Worker,
+    waiting: []bool,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+    shutting_down: *bool,
+    deadline_ms: *u64,
+    give_up_code: *?u8,
+    now: u64,
+    grace_ms: u64,
+    code: u8,
+) void {
+    give_up_code.* = code;
+    shutting_down.* = true;
+    deadline_ms.* = now + grace_ms;
+    stopWorkers(workers, envp, path_env, .TERM);
+    for (workers, 0..) |*other, oi| {
+        other.next_restart_ms = 0;
+        waiting[oi] = false;
+        if (other.pid == 0) other.done = true;
+    }
+}
 
 fn logDeath(w: *const spawner.Worker) void {
     if (w.spawn_failed) {

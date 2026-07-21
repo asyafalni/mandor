@@ -5,7 +5,7 @@
 #
 # A failed init task aborts startup with its exit code, so the orchestrator
 # sees a hard failure instead of workers crash-looping against a bad state.
-restart = "on-failure"
+max_restarts = 3
 
 workers = [
   "./setup",              # your init task (e.g. "./manage migrate")

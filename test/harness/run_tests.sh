@@ -33,14 +33,15 @@ c=$?; [ $c -eq 139 ] && ok "segv maps to 139" || bad "segv maps to 139" "exit $c
 timeout 10 "$MANDOR" "definitely-not-a-binary-xyz" >"$TMP/4" 2>&1
 c=$?; [ $c -eq 127 ] && ok "exec failure maps to 127" || bad "exec failure maps to 127" "exit $c"
 
-# 5. --restart=never spawns exactly once
-timeout 10 "$MANDOR" --restart=never "sh -c 'exit 1'" >"$TMP/5" 2>&1
+# 5. default (max_restarts=0): one spawn, failure ends the run
+timeout 10 "$MANDOR" "sh -c 'exit 1'" >"$TMP/5" 2>&1
 c=$?; n=$(grep -c "spawned" "$TMP/5")
-if [ $c -eq 1 ] && [ "$n" -eq 1 ]; then ok "never policy: one spawn, exit 1"
-else bad "never policy: one spawn, exit 1" "exit $c, spawns $n"; fi
+if [ $c -eq 1 ] && [ "$n" -eq 1 ] && grep -q "sh failed, stopping all" "$TMP/5"; then
+  ok "default: one spawn, failure ends the run (exit 1)"
+else bad "default no-retry" "exit $c, spawns $n"; fi
 
-# 6. --restart=on-failure restarts with growing backoff; TERM stops it
-"$MANDOR" --restart=on-failure "sh -c 'exit 1'" >"$TMP/6" 2>&1 &
+# 6. max-restarts=-1 retries forever with growing backoff; TERM stops it
+"$MANDOR" --max-restarts=-1 "sh -c 'exit 1'" >"$TMP/6" 2>&1 &
 mpid=$!
 sleep 2
 kill -TERM "$mpid" 2>/dev/null
@@ -48,20 +49,17 @@ wait "$mpid"; c=$?
 n=$(grep -c "spawned" "$TMP/6")
 delays=$(grep -o "in [0-9]*ms" "$TMP/6" | head -2 | tr -d "inms " | paste -sd,)
 if [ $c -eq 1 ] && [ "$n" -ge 3 ] && [ "$delays" = "200,400" ]; then
-  ok "on-failure: restarts, 200/400ms backoff, TERM stops"
+  ok "max-restarts=-1: retries with 200/400ms backoff, TERM stops"
 else
-  bad "on-failure restarts+backoff" "exit $c, spawns $n, delays [$delays]"
+  bad "infinite retry + backoff" "exit $c, spawns $n, delays [$delays]"
 fi
 
-# 7. stable-for-10s NOT required for this test: --restart=always restarts clean exits too
-"$MANDOR" --restart=always "sh -c 'exit 0'" >"$TMP/7" 2>&1 &
-mpid=$!
-sleep 1
-kill -TERM "$mpid" 2>/dev/null
-wait "$mpid"; c=$?
-n=$(grep -c "spawned" "$TMP/7")
-if [ $c -eq 0 ] && [ "$n" -ge 2 ]; then ok "always policy restarts clean exit"
-else bad "always policy restarts clean exit" "exit $c, spawns $n"; fi
+# 7. a CLEAN exit is never retried, even with unlimited retries: exiting 0
+# means the worker finished, not that it failed.
+timeout 10 "$MANDOR" --max-restarts=-1 "sh -c 'exit 0'" >"$TMP/7" 2>&1
+c=$?; n=$(grep -c "spawned" "$TMP/7")
+if [ $c -eq 0 ] && [ "$n" -eq 1 ]; then ok "clean exit is never retried"
+else bad "clean exit is never retried" "exit $c, spawns $n"; fi
 
 # 8. SIGTERM is forwarded to live workers
 marker="$TMP/got_term"
@@ -146,7 +144,6 @@ else bad "TERM reaches grandchildren" "parent=$([ -f $m1 ] && echo y || echo n) 
 
 # 14. mandor.toml supplies workers and policy; CLI still wins
 cat > "$TMP/m.toml" <<'TOML'
-restart = "never"
 workers = [
   "sh -c 'exit 4'",
 ]
@@ -189,7 +186,11 @@ unset MANDOR_STATE_DIR
 
 # 16. --expected-exit: listed code behaves like success (exit 0, no incident)
 export MANDOR_STATE_DIR="$TMP/state16"
-timeout 10 "$MANDOR" --expected-exit=7 "sh -c 'exit 7'" >"$TMP/16" 2>&1
+cat > "$TMP/ee.toml" <<'TOML'
+expected_exit = "7"
+workers = ["sh -c 'exit 7'"]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/ee.toml" >"$TMP/16" 2>&1
 c=$?
 n=$(ls "$TMP/state16/incidents/" 2>/dev/null | wc -l)
 if [ $c -eq 0 ] && [ "$n" -eq 0 ]; then ok "expected-exit treated as clean"
@@ -198,7 +199,15 @@ unset MANDOR_STATE_DIR
 
 # 17. --stop-grace force-kills TERM-ignoring workers
 start=$(date +%s)
-"$MANDOR" --stop-grace=1s "bash -c 'trap \"\" TERM; sleep 30'" >"$TMP/17" 2>&1 &
+# A script file, not an inline command: mandor's TOML strings are not
+# unescaped, so a literal `"` cannot appear inside one.
+printf '#!/bin/bash\ntrap "" TERM\nsleep 30\n' > "$TMP/ignoreterm"
+chmod +x "$TMP/ignoreterm"
+cat > "$TMP/sg.toml" <<TOML
+stop_grace = "1s"
+workers = ["$TMP/ignoreterm"]
+TOML
+"$MANDOR" --config="$TMP/sg.toml" >"$TMP/17" 2>&1 &
 mpid=$!
 sleep 1
 kill -TERM "$mpid"
@@ -209,7 +218,11 @@ if [ $c -eq 137 ] && [ "$took" -le 6 ] && grep -q "stop-grace expired" "$TMP/17"
 else bad "stop-grace escalates" "exit $c after ${took}s: $(tail -2 "$TMP/17")"; fi
 
 # 18. readiness fd: worker announces, mandor logs it
-"$MANDOR" --ready-fd=5 "bash -c 'sleep 0.3; echo up >&5; sleep 30'" >"$TMP/18" 2>&1 &
+cat > "$TMP/rf.toml" <<'TOML'
+ready_fd = 5
+workers = ["bash -c 'sleep 0.3; echo up >&5; sleep 30'"]
+TOML
+"$MANDOR" --config="$TMP/rf.toml" >"$TMP/18" 2>&1 &
 mpid=$!
 sleep 1.5
 kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
@@ -218,7 +231,14 @@ else bad "readiness fd" "$(head -4 "$TMP/18")"; fi
 
 # 19. health checks: failing probe -> unhealthy incident with worker alive
 export MANDOR_STATE_DIR="$TMP/state19"
-"$MANDOR" --health='sleep=/bin/false' --health-interval=1s --health-start-period=0s "sleep 30" >"$TMP/19" 2>&1 &
+cat > "$TMP/hp.toml" <<'TOML'
+health_interval = "1s"
+health_start_period = "0s"
+workers = ["sleep 30"]
+[worker.sleep]
+health = "/bin/false"
+TOML
+"$MANDOR" --config="$TMP/hp.toml" >"$TMP/19" 2>&1 &
 mpid=$!
 sleep 6
 f=$(ls "$TMP/state19/incidents/"*.json 2>/dev/null | head -1)
@@ -274,12 +294,12 @@ if [ $c -eq 0 ] && [ -n "$waits" ] && [ -n "$spawn_b" ] && [ "$spawn_b" -gt "$wa
 else bad "start_after ordering" "exit $c: $(head -6 "$TMP/21")"; fi
 
 # 22. --max-restarts gives up with the worker's exit code
-timeout 15 "$MANDOR" --restart=always --max-restarts=2 "sh -c 'exit 5'" >"$TMP/22" 2>&1
+timeout 15 "$MANDOR" --max-restarts=2 "sh -c 'exit 5'" >"$TMP/22" 2>&1
 c=$?
 n=$(grep -c "spawned" "$TMP/22")
-if [ $c -eq 5 ] && [ "$n" -eq 3 ] && grep -q "giving up" "$TMP/22"; then
+if [ $c -eq 5 ] && [ "$n" -eq 3 ] && grep -q "failed 2 restart(s), stopping all" "$TMP/22"; then
   ok "max-restarts gives up visibly (exit 5 after 3 spawns)"
-else bad "max-restarts give-up" "exit $c, spawns $n"; fi
+else bad "max-restarts give-up" "exit $c, spawns $n: $(grep stopping "$TMP/22" | head -1)"; fi
 
 # 23. on-incident hook fires with the bundle path
 cat > "$TMP/hook.sh" <<'HOOK'
@@ -287,7 +307,11 @@ echo "$1" >> "${HOOK_OUT:-/tmp/hook-out}"
 HOOK
 chmod +x "$TMP/hook.sh"
 export MANDOR_STATE_DIR="$TMP/state23" HOOK_OUT="$TMP/hook-fired"
-timeout 10 "$MANDOR" --on-incident="sh $TMP/hook.sh" "sh -c 'exit 4'" >"$TMP/23" 2>&1
+cat > "$TMP/oi.toml" <<TOML
+on_incident = "sh $TMP/hook.sh"
+workers = ["sh -c 'exit 4'"]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/oi.toml" >"$TMP/23" 2>&1
 sleep 0.5
 if [ -f "$TMP/hook-fired" ] && grep -q "state23/incidents/.*\.json" "$TMP/hook-fired" \
    && [ -f "$(cat "$TMP/hook-fired" | head -1)" ]; then
@@ -296,7 +320,14 @@ else bad "on-incident hook" "$(cat "$TMP/hook-fired" 2>/dev/null)"; fi
 unset MANDOR_STATE_DIR HOOK_OUT
 
 # 24. health start-period: early failures don't count
-"$MANDOR" --health='sleep=/bin/false' --health-interval=1s --health-start-period=1m "sleep 30" >"$TMP/24" 2>&1 &
+cat > "$TMP/hs.toml" <<'TOML'
+health_interval = "1s"
+health_start_period = "1m"
+workers = ["sleep 30"]
+[worker.sleep]
+health = "/bin/false"
+TOML
+"$MANDOR" --config="$TMP/hs.toml" >"$TMP/24" 2>&1 &
 mpid=$!
 sleep 5
 kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
@@ -401,20 +432,32 @@ if grep -q "recycling sleep: max lifetime" "$TMP/32" && [ "$n" -ge 2 ]; then
   ok "max_lifetime recycles worker ($n spawns)"
 else bad "recycle" "spawns=$n $(grep recycl "$TMP/32" | head -1)"; fi
 
-# 33. per-worker restart override beats the global policy
+# 33. per-worker expected_exit: a non-zero code declared successful for one
+# worker must not end the run (and must not apply to the others)
 cat > "$TMP/ov.toml" <<'TOML'
-restart = "never"
-workers = ["sh -c 'exit 1'"]
+workers = ["sh -c 'exit 2'", "sleep 3"]
 [worker.sh]
-restart = "always"
+expected_exit = "2"
 TOML
-"$MANDOR" --config="$TMP/ov.toml" >"$TMP/33" 2>&1 &
-mpid=$!
-sleep 2
-kill -TERM "$mpid"; wait "$mpid" 2>/dev/null
-n=$(grep -c "spawned sh" "$TMP/33")
-if [ "$n" -ge 2 ]; then ok "per-worker restart override ($n spawns under global never)"
-else bad "restart override" "spawns=$n"; fi
+timeout 15 "$MANDOR" --config="$TMP/ov.toml" >"$TMP/33" 2>&1
+c=$?
+# exit 2 is declared success for sh, so the run continues to sleep's end.
+if [ $c -eq 0 ] && ! grep -q "failed, stopping all" "$TMP/33"; then
+  ok "per-worker expected_exit keeps a non-zero exit from ending the run"
+else bad "per-worker expected_exit" "exit $c: $(grep -E 'stopping|exited' "$TMP/33" | head -2)"; fi
+
+# 33b. and it must NOT leak to other workers: the same code from a worker
+# without the override still ends the run.
+cat > "$TMP/ov2.toml" <<'TOML'
+workers = ["sleep 3", "sh -c 'exit 2'"]
+[worker.sleep]
+expected_exit = "2"
+TOML
+timeout 15 "$MANDOR" --config="$TMP/ov2.toml" >"$TMP/33b" 2>&1
+c=$?
+if [ $c -eq 2 ] && grep -q "sh failed, stopping all" "$TMP/33b"; then
+  ok "per-worker expected_exit does not leak to other workers"
+else bad "expected_exit scoping" "exit $c: $(grep -E 'stopping' "$TMP/33b" | head -1)"; fi
 
 # 34. termination-log death rattle (root only — CI containers)
 if [ "$(id -u)" -eq 0 ]; then
@@ -441,17 +484,15 @@ else bad "env_file" "$(grep got= "$TMP/35")"; fi
 # 36. essential worker exit stops the fleet with its code
 cat > "$TMP/es.toml" <<'TOML'
 workers = [
-  "sh -c 'sleep 0.5; exit 0'",
+  "sh -c 'sleep 0.5; exit 6'",
   "sleep 30",
 ]
-[worker.sh]
-essential = true
 TOML
 start=$(date +%s)
 timeout 15 "$MANDOR" --config="$TMP/es.toml" >"$TMP/36" 2>&1
 c=$?; took=$(( $(date +%s) - start ))
-if [ $c -eq 0 ] && [ "$took" -le 5 ] && grep -q "essential worker sh finished" "$TMP/36"; then
-  ok "essential worker stops fleet (exit 0 in ${took}s)"
+if [ $c -eq 6 ] && [ "$took" -le 5 ] && grep -q "sh failed, stopping all" "$TMP/36"; then
+  ok "essential-by-default: a failure stops the fleet (exit 6 in ${took}s)"
 else bad "essential" "exit $c after ${took}s: $(tail -2 "$TMP/36")"; fi
 
 # 37. TTY color prefixes (needs util-linux script to fake a tty)
@@ -465,7 +506,7 @@ fi
 
 # 38. restart_dependents: dependency restart recycles the dependent
 cat > "$TMP/rd.toml" <<'TOML'
-restart = "always"
+max_restarts = -1
 restart_dependents = true
 backoff_max = "300ms"
 workers = [
@@ -626,6 +667,63 @@ if [ $c -ne 0 ] && [ $c -ne 139 ] && grep -qi "worker" "$TMP/54"; then
   ok "65 workers rejected cleanly (no overrun)"
 else bad "65 workers rejected" "exit $c: $(head -2 "$TMP/54")"; fi
 unset MANDOR_STATE_DIR
+
+# 55. a health-kill is a failure whatever code the worker reports. Without
+# this, expected_exit="143" (the usual graceful-shutdown code) turned a hung
+# worker into a successful run — mandor detected the hang and reported success.
+cat > "$TMP/hk.toml" <<'TOML'
+workers = ["sh -c 'trap \"exit 143\" TERM; while true; do sleep 0.2; done'"]
+expected_exit = "143"
+health_interval = "1s"
+health_start_period = "1s"
+[worker.sh]
+health = "/bin/false"
+TOML
+timeout 20 "$MANDOR" --config="$TMP/hk.toml" >"$TMP/55" 2>&1
+c=$?
+if [ $c -ne 0 ] && grep -q "unhealthy, sending SIGTERM" "$TMP/55" && grep -q "stopping all" "$TMP/55"; then
+  ok "health-kill counts as a failure despite expected_exit"
+else bad "health-kill vs expected_exit" "exit $c: $(grep -E 'unhealthy|stopping' "$TMP/55" | head -2)"; fi
+
+# 56. a slow crash loop still escalates. fail_streak resets after 10s of
+# uptime, so max_restarts alone can never catch a worker crashing every 11s;
+# the restart-loop detector has to end the run instead of only logging.
+timeout 30 "$MANDOR" --max-restarts=-1 "sh -c 'exit 1'" >"$TMP/56" 2>&1
+c=$?
+if [ $c -eq 1 ] && grep -q "is in a restart loop, stopping all" "$TMP/56"; then
+  ok "restart loop escalates even with unlimited retries"
+else bad "restart-loop escalation" "exit $c: $(grep -E 'restart loop|stopping' "$TMP/56" | head -2)"; fi
+
+# 57. contradictory config stops startup instead of being ignored
+cat > "$TMP/os2.toml" <<'TOML'
+workers = ["sh -c 'exit 0'"]
+[worker.sh]
+oneshot = true
+essential = false
+TOML
+timeout 10 "$MANDOR" --config="$TMP/os2.toml" >"$TMP/57" 2>&1
+c=$?
+if [ $c -eq 2 ] && grep -q "meaningless on a oneshot" "$TMP/57"; then
+  ok "essential on a oneshot is rejected, not ignored"
+else bad "oneshot+essential" "exit $c: $(head -2 "$TMP/57")"; fi
+
+# 58. removed flags/keys say what to use instead
+timeout 10 "$MANDOR" --restart=on-failure "sh -c 'exit 0'" >"$TMP/58a" 2>&1
+a=$?
+printf 'workers = ["sh -c \x27exit 0\x27"]\nrestart_on_unhealthy = true\n' > "$TMP/rm.toml"
+timeout 10 "$MANDOR" --config="$TMP/rm.toml" >"$TMP/58b" 2>&1
+b=$?
+if [ $a -eq 2 ] && grep -q "use --max-restarts=N" "$TMP/58a" \
+   && [ $b -eq 2 ] && grep -q "always acted on" "$TMP/58b"; then
+  ok "removed flag/key errors name the replacement"
+else bad "teaching errors" "a=$a b=$b: $(head -1 "$TMP/58a"); $(head -1 "$TMP/58b")"; fi
+
+# 59. the startup plan is printed, and stays quiet for a simple config
+timeout 10 "$MANDOR" "sh -c 'exit 0'" >"$TMP/59" 2>&1
+lines=$(grep -c "^\[mandor\]   " "$TMP/59" || true)
+if grep -q "1 worker(s) | a failure ends the run (max_restarts=0)" "$TMP/59"; then
+  ok "startup plan states the lifecycle in one line"
+else bad "startup plan" "$(head -2 "$TMP/59")"; fi
 
 echo
 echo "passed $pass, failed $fail"

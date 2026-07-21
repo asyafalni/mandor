@@ -3,6 +3,78 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.3.0] - 2026-07-21
+
+Lifecycle simplification. mandor now defaults to **giving up** rather than
+retrying quietly, because a retry the orchestrator never hears about is a
+failure that never gets fixed.
+
+### Changed — breaking (config)
+- **`restart` is gone; `max_restarts` is the only retry knob.** One integer
+  replaces the policy enum, with the intuitive encoding:
+
+  ```toml
+  max_restarts = 0     # default — don't retry; a failure ends the run
+  max_restarts = 3     # retry a failed worker 3 times, then exit with its code
+  max_restarts = -1    # retry forever (explicit opt-in; nothing upstream is told)
+  ```
+
+  Previously `0` meant *unlimited*, which was backwards from every intuition
+  and meant `restart = "on-failure"` retried forever by default. Only
+  **failures** are retried — a worker exiting 0 has finished, so
+  `restart = "always"` has no successor. Per-worker `restart` is gone too:
+  policy is a fleet decision.
+- **`essential` defaults to `true`.** A failure that exhausts its retries stops
+  the fleet and propagates that worker's code, so the layer above is always
+  signalled. `essential = false` opts a sidecar out. A *clean* exit still stops
+  nothing, so "run several things until they finish" is unchanged. `essential`
+  on a `oneshot` is now a hard error rather than silently ignored.
+- **`restart_on_unhealthy` is gone.** A configured probe is always acted on —
+  detecting a hung worker and leaving it running was the quietest failure
+  mandor could produce, and it was the flag's default.
+- Removed flags and keys produce errors that **name the replacement** instead
+  of a bare "unknown key".
+
+- **The CLI is now four flags:** `--max-restarts`, `--config`, `--metrics`,
+  `--state-dir` (plus `report`/`validate`/`--help`/`--version`). Eleven runtime
+  flags moved to `mandor.toml` only — `--health`, `--health-interval`,
+  `--health-start-period`, `--backoff-max`, `--stop-grace`, `--expected-exit`,
+  `--ready-fd`, `--on-incident`, `--photon`, `--psi-mem`, `--psi-cpu`. None are
+  things you would type in a Dockerfile `ENTRYPOINT`, and `--health=api=/bin/x`
+  was the same `name=value=value` awkwardness this release removed from TOML.
+  Each keeps its name minus the dashes (`--stop-grace` → `stop_grace`), and
+  passing an old flag says exactly that.
+
+### Added
+- **Per-worker `expected_exit`.** Declares which codes mean success for one
+  worker without whitelisting them fleet-wide. This is what makes
+  essential-by-default safe: a job that legitimately exits 3 can say so
+  instead of killing the container.
+- **Startup plan line.** mandor prints the resolved lifecycle on start, so the
+  model lands in `docker logs` without anyone reading documentation. Verbosity
+  scales with the config — a plain two-worker setup prints one line.
+- **Config surface gate in CI**, budgeted like binary size. Every knob looks
+  justified alone; surface grows one reasonable-seeming addition at a time.
+
+### Fixed
+- **A health-kill counted as success if `expected_exit` contained 143.** mandor
+  would detect a hung worker, SIGTERM it, see 143, treat it as a graceful
+  shutdown, and **exit 0** — reporting a hung app as a successful run. A
+  health-kill is now a failure whatever code the worker reports.
+- **A slow crash loop never escalated.** The fail-streak resets after 10s of
+  uptime, so a worker crashing every 11 seconds could never reach
+  `max_restarts` at any value — it retried forever while the container looked
+  healthy. A detected restart loop now ends the run.
+
+### Notes
+- **The binary shrank by 17 KB despite everything above** (269,128 → 251,992
+  on x86_64). `cli.parse` and `config.parse` returned a ~10 KB struct by
+  value, and an error union carrying that payload materializes a full copy in
+  `.rodata` *per distinct error-return path* — the release build was carrying
+  six of them. Returning through an out-pointer (`ParseError!void`) dropped
+  that to two. The waste predated this release; adding two error returns is
+  what made it visible.
+
 ## [1.2.0] - 2026-07-21
 
 ### Fixed

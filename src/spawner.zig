@@ -73,7 +73,15 @@ pub const Worker = struct {
     max_rss_kb: ?u64 = null, // planned recycle thresholds
     max_lifetime_ms: ?u64 = null,
     recycling: bool = false, // current death is planned, not a failure
-    restart_override: ?cli.RestartPolicy = null,
+    /// Per-worker `expected_exit`, parsed once at startup into a 256-bit set
+    /// (32 bytes). Keeping the parse out of the death path matters: inlining
+    /// the string parser into the supervision loop cost ~20 KB of .text.
+    /// `expected_set = false` means fall back to the global set.
+    expected_bits: [32]u8 = .{0} ** 32,
+    expected_set: bool = false,
+    /// Set when mandor TERMs a worker for failing its health probe. The death
+    /// that follows is a failure regardless of the exit code it reports.
+    health_killed: bool = false,
     essential: bool = false, // leader semantics: its exit stops everything
     /// This worker's last spawn failed outright (fork/exec setup), so it never
     /// ran. Reported as a death so restart policy, `essential`, and `oneshot`
@@ -169,7 +177,8 @@ fn resetWorker(w: *Worker) void {
     w.max_rss_kb = null;
     w.max_lifetime_ms = null;
     w.recycling = false;
-    w.restart_override = null;
+    w.expected_set = false;
+    w.health_killed = false;
     w.essential = false;
     w.color = 0;
     w.has_prestop = false;

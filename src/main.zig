@@ -38,15 +38,19 @@ const usage_text =
     \\  mandor --help | --version
     \\
     \\flags:
-    \\  --restart=never|on-failure|always   restart crashed workers (default: never)
+    \\  --max-restarts=N                    retry a failed worker N times (default: 0,
+    \\                                      don't retry; -1 retries forever)
     \\  --config=PATH                       mandor.toml (default: ./mandor.toml if present)
-    \\  --health="NAME=CMD"                 liveness probe for a worker (exit 0 = healthy)
     \\  --metrics=PORT                      Prometheus metrics on 127.0.0.1:PORT
+    \\  --state-dir=PATH                    state + incident spool (or MANDOR_STATE_DIR)
     \\
     \\Workers are quoted command lines — no shell needed. Signals are forwarded
-    \\(grandchildren included); mandor exits with the worst worker exit code.
-    \\Everything else has sane defaults. Advanced settings belong in
-    \\mandor.toml — see `man mandor` or docs/CONFIG.md.
+    \\(grandchildren included). A worker that fails is retried up to
+    \\--max-restarts times; when retries run out mandor stops the rest
+    \\gracefully and exits with that worker's code.
+    \\These four flags are the whole CLI. Everything else — probes, drain
+    \\hooks, per-worker settings, tuning — is a mandor.toml key with sane
+    \\defaults; see `man mandor` or docs/CONFIG.md.
     \\
 ;
 
@@ -79,11 +83,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const args = args_buf[0 .. vec.len - 1];
 
     var cmd_storage: [cli.max_workers][]const u8 = undefined;
-    var cfg = cli.parse(args, &cmd_storage) catch |err| {
+    var cfg: cli.Config = undefined;
+    cli.parse(args, &cmd_storage, &cfg) catch |err| {
         logmod.print("[mandor] {s}\n\n", .{switch (err) {
             error.UnknownFlag => "unknown flag",
             error.BadValue => "bad flag value",
             error.TooManyWorkers => "too many workers (max 64)",
+            // Removed flags get an answer, not just a rejection.
+            error.RestartRemoved => "--restart was removed: use --max-restarts=N " ++
+                "(0 = don't retry, the default; -1 = retry forever)",
+            error.UnhealthyFlagRemoved => "--restart-on-unhealthy was removed: " ++
+                "a configured health probe is always acted on",
+            error.MovedToToml => "that setting moved to mandor.toml (same name, no " ++
+                "dashes). The CLI keeps only --max-restarts, --config, --metrics " ++
+                "and --state-dir; see `man mandor` or docs/CONFIG.md",
         }});
         writeOut(usage_text);
         return 2;
@@ -116,42 +129,33 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             text = readSmallFile("mandor.toml", &config_buf);
         }
         if (text) |txt| {
-            file_cfg = config.parse(txt, &file_cmds) catch |err| {
-                logmod.print("[mandor] invalid config file: {s}\n", .{@errorName(err)});
+            config.parse(txt, &file_cmds, &file_cfg) catch |err| {
+                logmod.print("[mandor] invalid config file: {s}\n", .{switch (err) {
+                    error.RestartRemoved => "'restart' was removed — use max_restarts = N " ++
+                        "(0 = don't retry, the default; -1 = retry forever). A worker whose " ++
+                        "death should not stop the run takes essential = false",
+                    error.UnhealthyKeyRemoved => "'restart_on_unhealthy' was removed — " ++
+                        "a configured health probe is always acted on",
+                    error.Syntax => "syntax",
+                    error.BadValue => "bad value",
+                    error.TooManyWorkers => "too many workers (max 64)",
+                }});
                 return 2;
             };
-            if (!cfg.restart_set) {
-                if (file_cfg.restart) |r| cfg.restart = r;
-            }
-            if (!cfg.backoff_set) {
-                if (file_cfg.backoff_max_ms) |b| cfg.backoff_max_ms = b;
-            }
+            if (file_cfg.backoff_max_ms) |b| cfg.backoff_max_ms = b;
             if (cfg.metrics_port == null) cfg.metrics_port = file_cfg.metrics_port;
-            if (!cfg.stop_grace_set) {
-                if (file_cfg.stop_grace_ms) |g| cfg.stop_grace_ms = g;
-            }
-            if (!cfg.expected_exit_set) {
-                if (file_cfg.expected_exit) |set| cfg.expected_exit = set;
-            }
+            if (file_cfg.stop_grace_ms) |g| cfg.stop_grace_ms = g;
+            if (file_cfg.expected_exit) |set| cfg.expected_exit = set;
             if (cfg.ready_fd == null) cfg.ready_fd = file_cfg.ready_fd;
-            if (!cfg.health_interval_set) {
-                if (file_cfg.health_interval_ms) |ms| cfg.health_interval_ms = ms;
-            }
-            if (file_cfg.restart_on_unhealthy) |b| {
-                if (b) cfg.restart_on_unhealthy = true;
-            }
-            if (cfg.health_n == 0) {
-                cfg.health = file_cfg.health;
-                cfg.health_n = file_cfg.health_n;
-            }
+            if (file_cfg.health_interval_ms) |ms| cfg.health_interval_ms = ms;
+            cfg.health = file_cfg.health;
+            cfg.health_n = file_cfg.health_n;
             cfg.start_after = file_cfg.start_after;
             cfg.start_after_n = file_cfg.start_after_n;
             if (!cfg.max_restarts_set) {
                 if (file_cfg.max_restarts) |m| cfg.max_restarts = m;
             }
-            if (!cfg.health_start_period_set) {
-                if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
-            }
+            if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
             if (cfg.photon == null) cfg.photon = file_cfg.photon;
             if (cfg.psi_mem_pct == 0) {
@@ -160,8 +164,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (cfg.psi_cpu_pct == 0) {
                 if (file_cfg.psi_cpu_pct) |v| cfg.psi_cpu_pct = v;
             }
-            cfg.essential = file_cfg.essential;
-            cfg.essential_n = file_cfg.essential_n;
+            cfg.not_essential = file_cfg.not_essential;
+            cfg.not_essential_n = file_cfg.not_essential_n;
             if (file_cfg.restart_dependents) |b| cfg.restart_dependents = b;
             cfg.prestop_pairs = file_cfg.prestop_pairs;
             cfg.prestop_pairs_n = file_cfg.prestop_pairs_n;
@@ -184,8 +188,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.max_rss_pairs_n = file_cfg.max_rss_pairs_n;
             cfg.lifetime_pairs = file_cfg.lifetime_pairs;
             cfg.lifetime_pairs_n = file_cfg.lifetime_pairs_n;
-            cfg.restart_pairs = file_cfg.restart_pairs;
-            cfg.restart_pairs_n = file_cfg.restart_pairs_n;
+            cfg.expected_pairs = file_cfg.expected_pairs;
+            cfg.expected_pairs_n = file_cfg.expected_pairs_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.env_file) |path| {
@@ -221,8 +225,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
 
     const supervisor = @import("supervisor.zig");
-    if (cfg.mode == .validate) return supervisor.validate(cfg);
-    return supervisor.run(cfg, state_dir, environ);
+    if (cfg.mode == .validate) return supervisor.validate(&cfg);
+    return supervisor.run(&cfg, state_dir, environ);
 }
 
 var config_buf: [64 * 1024]u8 = undefined;

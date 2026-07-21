@@ -8,12 +8,10 @@ pub const default_state_dir = "/var/lib/mandor";
 
 pub const HealthSpec = struct { worker: []const u8, cmd: []const u8 };
 
-pub const RestartPolicy = enum { never, on_failure, always };
 pub const Mode = enum { supervise, report, validate };
 
 pub const Config = struct {
     mode: Mode = .supervise,
-    restart: RestartPolicy = .never,
     backoff_max_ms: u64 = 30_000,
     commands: []const []const u8 = &.{},
     help: bool = false,
@@ -42,19 +40,18 @@ pub const Config = struct {
     health: [max_health]HealthSpec = undefined,
     health_n: u8 = 0,
     health_interval_ms: u64 = 30_000,
-    health_interval_set: bool = false,
-    restart_on_unhealthy: bool = false,
     /// "dependent=dependency" ordering pairs (TOML-only; no CLI flag).
     start_after: [max_workers]HealthSpec = undefined,
     start_after_n: u8 = 0,
-    /// Consecutive failed restarts before mandor gives up and exits with the
-    /// worker's code (0 = retry forever, the default).
-    max_restarts: u32 = 0,
+    /// How many times a *failed* worker is retried before mandor gives up and
+    /// exits with its code. `0` (the default) means don't retry: a failure
+    /// ends the run so the layer above is signalled. `-1` retries forever.
+    /// Clean exits are never retried — a worker that exits 0 has finished.
+    max_restarts: i32 = 0,
     max_restarts_set: bool = false,
     /// Probe failures within this window after spawn (and before the first
     /// success) don't count — the k8s startupProbe lesson.
     health_start_period_ms: u64 = 10_000,
-    health_start_period_set: bool = false,
     /// Command exec'd after each incident bundle write, bundle path appended.
     on_incident: ?[]const u8 = null,
     /// photon OTLP endpoint ("ip:port"); when set, incidents auto-forward.
@@ -83,11 +80,13 @@ pub const Config = struct {
     max_rss_pairs_n: u8 = 0,
     lifetime_pairs: [16]HealthSpec = undefined,
     lifetime_pairs_n: u8 = 0,
-    restart_pairs: [16]HealthSpec = undefined,
-    restart_pairs_n: u8 = 0,
-    /// Worker names whose exit stops everything (Nomad leader-task).
-    essential: [16][]const u8 = undefined,
-    essential_n: u8 = 0,
+    /// Per-worker `expected_exit` overrides ("name" -> "143,129").
+    expected_pairs: [16]HealthSpec = undefined,
+    expected_pairs_n: u8 = 0,
+    /// Workers marked `essential = false`. Every worker is essential by
+    /// default — its failure ends the run — so this records the opt-outs.
+    not_essential: [16][]const u8 = undefined,
+    not_essential_n: u8 = 0,
     /// OTP rest_for_one: a dependency's restart also restarts dependents.
     restart_dependents: bool = false,
     /// "name=CMD" drain hooks exec'd before TERM on graceful shutdown.
@@ -95,11 +94,6 @@ pub const Config = struct {
     prestop_pairs_n: u8 = 0,
     /// Optional KEY=VAL file loaded into every worker's environment.
     env_file: ?[]const u8 = null,
-    /// Track explicit CLI flags so a config file never overrides them.
-    restart_set: bool = false,
-    backoff_set: bool = false,
-    stop_grace_set: bool = false,
-    expected_exit_set: bool = false,
 };
 
 /// "143,129" -> set the listed codes (on top of the always-clean 0).
@@ -116,10 +110,17 @@ pub fn parseExpectedExit(s: []const u8, out: *[256]bool) bool {
     return any;
 }
 
-pub const ParseError = error{ UnknownFlag, BadValue, TooManyWorkers };
+pub const ParseError = error{ UnknownFlag, BadValue, TooManyWorkers, RestartRemoved, UnhealthyFlagRemoved, MovedToToml };
 
-pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) ParseError!Config {
-    var cfg: Config = .{};
+pub fn parse(
+    args: []const []const u8,
+    cmd_storage: *[max_workers][]const u8,
+    out: *Config,
+) ParseError!void {
+    // See config.parse: returning this by value costs ~10 KB of .rodata
+    // for every distinct error-return path.
+    out.* = .{};
+    const cfg = out;
     var n: usize = 0;
     var no_more_flags = false;
     for (args, 0..) |arg, arg_idx| {
@@ -141,68 +142,32 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
             } else if (std.mem.eql(u8, arg, "--version")) {
                 cfg.version = true;
             } else if (std.mem.startsWith(u8, arg, "--restart=")) {
-                const v = arg["--restart=".len..];
-                cfg.restart = if (std.mem.eql(u8, v, "never"))
-                    .never
-                else if (std.mem.eql(u8, v, "on-failure"))
-                    .on_failure
-                else if (std.mem.eql(u8, v, "always"))
-                    .always
-                else
-                    return error.BadValue;
-                cfg.restart_set = true;
-            } else if (std.mem.startsWith(u8, arg, "--backoff-max=")) {
-                cfg.backoff_max_ms = parseDuration(arg["--backoff-max=".len..]) orelse
-                    return error.BadValue;
-                cfg.backoff_set = true;
+                // Removed in 1.3: one integer replaces the policy enum.
+                return error.RestartRemoved;
+            } else if (std.mem.startsWith(u8, arg, "--restart-on-unhealthy")) {
+                // Removed in 1.3: a configured probe is always acted on.
+                return error.UnhealthyFlagRemoved;
+            } else if (std.mem.startsWith(u8, arg, "--backoff-max=") or
+                std.mem.startsWith(u8, arg, "--health-start-period=") or
+                std.mem.startsWith(u8, arg, "--on-incident=") or
+                std.mem.startsWith(u8, arg, "--photon=") or
+                std.mem.startsWith(u8, arg, "--psi-mem=") or
+                std.mem.startsWith(u8, arg, "--psi-cpu=") or
+                std.mem.startsWith(u8, arg, "--health=") or
+                std.mem.startsWith(u8, arg, "--health-interval=") or
+                std.mem.startsWith(u8, arg, "--ready-fd=") or
+                std.mem.startsWith(u8, arg, "--stop-grace=") or
+                std.mem.startsWith(u8, arg, "--expected-exit="))
+            {
+                // Advanced settings live in mandor.toml, so the everyday CLI
+                // stays at four flags. Nothing is lost: every one of these is
+                // a TOML key with the same name minus the dashes.
+                return error.MovedToToml;
             } else if (std.mem.startsWith(u8, arg, "--max-restarts=")) {
-                cfg.max_restarts = std.fmt.parseInt(u32, arg["--max-restarts=".len..], 10) catch
+                cfg.max_restarts = std.fmt.parseInt(i32, arg["--max-restarts=".len..], 10) catch
                     return error.BadValue;
+                if (cfg.max_restarts < -1) return error.BadValue;
                 cfg.max_restarts_set = true;
-            } else if (std.mem.startsWith(u8, arg, "--health-start-period=")) {
-                cfg.health_start_period_ms = parseDuration(arg["--health-start-period=".len..]) orelse
-                    return error.BadValue;
-                cfg.health_start_period_set = true;
-            } else if (std.mem.startsWith(u8, arg, "--on-incident=")) {
-                const v = arg["--on-incident=".len..];
-                if (v.len == 0) return error.BadValue;
-                cfg.on_incident = v;
-            } else if (std.mem.startsWith(u8, arg, "--photon=")) {
-                const v = arg["--photon=".len..];
-                if (v.len == 0) return error.BadValue;
-                cfg.photon = v;
-            } else if (std.mem.startsWith(u8, arg, "--psi-mem=")) {
-                cfg.psi_mem_pct = std.fmt.parseInt(u16, arg["--psi-mem=".len..], 10) catch
-                    return error.BadValue;
-            } else if (std.mem.startsWith(u8, arg, "--psi-cpu=")) {
-                cfg.psi_cpu_pct = std.fmt.parseInt(u16, arg["--psi-cpu=".len..], 10) catch
-                    return error.BadValue;
-            } else if (std.mem.startsWith(u8, arg, "--health=")) {
-                const v = arg["--health=".len..];
-                const eq2 = std.mem.indexOfScalar(u8, v, '=') orelse return error.BadValue;
-                if (eq2 == 0 or eq2 + 1 >= v.len) return error.BadValue;
-                if (cfg.health_n == max_health) return error.BadValue;
-                cfg.health[cfg.health_n] = .{ .worker = v[0..eq2], .cmd = v[eq2 + 1 ..] };
-                cfg.health_n += 1;
-            } else if (std.mem.startsWith(u8, arg, "--health-interval=")) {
-                cfg.health_interval_ms = parseDuration(arg["--health-interval=".len..]) orelse
-                    return error.BadValue;
-                cfg.health_interval_set = true;
-            } else if (std.mem.eql(u8, arg, "--restart-on-unhealthy")) {
-                cfg.restart_on_unhealthy = true;
-            } else if (std.mem.startsWith(u8, arg, "--ready-fd=")) {
-                const fd = std.fmt.parseInt(u8, arg["--ready-fd=".len..], 10) catch
-                    return error.BadValue;
-                if (fd < 3) return error.BadValue; // stdio is taken
-                cfg.ready_fd = fd;
-            } else if (std.mem.startsWith(u8, arg, "--stop-grace=")) {
-                cfg.stop_grace_ms = parseDuration(arg["--stop-grace=".len..]) orelse
-                    return error.BadValue;
-                cfg.stop_grace_set = true;
-            } else if (std.mem.startsWith(u8, arg, "--expected-exit=")) {
-                if (!parseExpectedExit(arg["--expected-exit=".len..], &cfg.expected_exit))
-                    return error.BadValue;
-                cfg.expected_exit_set = true;
             } else if (std.mem.startsWith(u8, arg, "--config=")) {
                 const v = arg["--config=".len..];
                 if (v.len == 0) return error.BadValue;
@@ -249,10 +214,9 @@ pub fn parse(args: []const []const u8, cmd_storage: *[max_workers][]const u8) Pa
             cfg.report_filter = cmd_storage[0];
             cfg.commands = cmd_storage[0..0];
         }
-        return cfg;
+        return;
     }
     // Zero commands is legal here: a config file may provide the workers.
-    return cfg;
 }
 
 /// "500ms" | "30s" | "2m" -> milliseconds. Integer only, no whitespace.
@@ -346,6 +310,13 @@ fn isSpace(c: u8) bool {
 
 // ---------------------------------------------------------------- tests
 
+/// By-value wrapper so tests read naturally. Test-only: never in the binary.
+fn parseTest(args: []const []const u8, cmd_storage: *[max_workers][]const u8) ParseError!Config {
+    var cfg: Config = undefined;
+    try parse(args, cmd_storage, &cfg);
+    return cfg;
+}
+
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
@@ -406,8 +377,8 @@ test "tokenize errors" {
 
 test "parse defaults and commands" {
     var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{ "./api --port 8080", "./worker" }, &storage);
-    try expectEqual(RestartPolicy.never, cfg.restart);
+    const cfg = try parseTest(&.{ "./api --port 8080", "./worker" }, &storage);
+    try expectEqual(@as(i32, 0), cfg.max_restarts); // give up first by default
     try expectEqual(@as(u64, 30_000), cfg.backoff_max_ms);
     try expectEqual(@as(usize, 2), cfg.commands.len);
     try expectEqualStrings("./worker", cfg.commands[1]);
@@ -415,112 +386,75 @@ test "parse defaults and commands" {
 
 test "parse flags" {
     var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{ "--restart=on-failure", "--backoff-max=5s", "./a" }, &storage);
-    try expectEqual(RestartPolicy.on_failure, cfg.restart);
-    try expectEqual(@as(u64, 5_000), cfg.backoff_max_ms);
+    const cfg = try parseTest(&.{ "--max-restarts=3", "./a" }, &storage);
+    try expectEqual(@as(i32, 3), cfg.max_restarts);
     try expectEqual(@as(usize, 1), cfg.commands.len);
 }
 
 test "parse double-dash separator makes flag-looking args commands" {
     var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{ "--restart=always", "--", "--weird-command" }, &storage);
-    try expectEqual(RestartPolicy.always, cfg.restart);
+    const cfg = try parseTest(&.{ "--max-restarts=-1", "--", "--weird-command" }, &storage);
+    try expectEqual(@as(i32, -1), cfg.max_restarts); // -1 = retry forever
     try expectEqual(@as(usize, 1), cfg.commands.len);
     try expectEqualStrings("--weird-command", cfg.commands[0]);
 }
 
 test "parse errors" {
     var storage: [max_workers][]const u8 = undefined;
-    try expectError(error.UnknownFlag, parse(&.{ "--nope", "./a" }, &storage));
-    try expectError(error.BadValue, parse(&.{ "--restart=sometimes", "./a" }, &storage));
-    try expectError(error.BadValue, parse(&.{ "--backoff-max=fast", "./a" }, &storage));
-    try expectError(error.BadValue, parse(&.{ "--metrics=nope", "./a" }, &storage));
+    try expectError(error.UnknownFlag, parseTest(&.{ "--nope", "./a" }, &storage));
+    // Removed flags report *why*, so the message can name the replacement.
+    try expectError(error.RestartRemoved, parseTest(&.{ "--restart=on-failure", "./a" }, &storage));
+    try expectError(error.UnhealthyFlagRemoved, parseTest(&.{ "--restart-on-unhealthy", "./a" }, &storage));
+    try expectError(error.BadValue, parseTest(&.{ "--max-restarts=-2", "./a" }, &storage));
+    try expectError(error.BadValue, parseTest(&.{ "--max-restarts=lots", "./a" }, &storage));
+    try expectError(error.BadValue, parseTest(&.{ "--metrics=nope", "./a" }, &storage));
 }
 
 test "zero commands allowed (config file may supply workers)" {
     var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{}, &storage);
+    const cfg = try parseTest(&.{}, &storage);
     try expectEqual(@as(usize, 0), cfg.commands.len);
 }
 
-test "config and metrics flags, explicit-set tracking" {
+test "the CLI is four flags; everything else moved to mandor.toml" {
     var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{ "--config=/etc/mandor.toml", "--metrics=9464", "./a" }, &storage);
+    const cfg = try parseTest(&.{
+        "--config=/etc/mandor.toml", "--metrics=9464", "--state-dir=/srv/s",
+        "--max-restarts=2",          "./a",
+    }, &storage);
     try expectEqualStrings("/etc/mandor.toml", cfg.config_path.?);
     try expectEqual(@as(u16, 9464), cfg.metrics_port.?);
-    try expect(!cfg.restart_set);
-    const cfg2 = try parse(&.{ "--restart=always", "--backoff-max=1s", "./a" }, &storage);
-    try expect(cfg2.restart_set);
-    try expect(cfg2.backoff_set);
+    try expectEqualStrings("/srv/s", cfg.state_dir.?);
+    try expect(cfg.max_restarts_set);
+
+    // Advanced settings are TOML keys now, and say so rather than being
+    // reported as an unknown flag.
+    for ([_][]const u8{
+        "--backoff-max=1s",  "--stop-grace=5s",      "--expected-exit=143",
+        "--health=a=/bin/t", "--health-interval=1s", "--health-start-period=1s",
+        "--ready-fd=5",      "--on-incident=/n",     "--photon=1.2.3.4:1",
+        "--psi-mem=80",      "--psi-cpu=90",
+    }) |flag| {
+        try expectError(error.MovedToToml, parseTest(&.{ flag, "./a" }, &storage));
+    }
 }
 
 test "parse report subcommand" {
     var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{ "report", "--json", "--state-dir=/tmp/x" }, &storage);
+    const cfg = try parseTest(&.{ "report", "--json", "--state-dir=/tmp/x" }, &storage);
     try expectEqual(Mode.report, cfg.mode);
     try expect(cfg.json);
     try expectEqualStrings("/tmp/x", cfg.state_dir.?);
-    const cf = try parse(&.{ "report", "api", "--since=1h" }, &storage);
+    const cf = try parseTest(&.{ "report", "api", "--since=1h" }, &storage);
     try expectEqualStrings("api", cf.report_filter.?);
     try expectEqual(@as(u64, 3_600_000), cf.since_ms.?);
-    try expectError(error.BadValue, parse(&.{ "report", "a", "b" }, &storage));
+    try expectError(error.BadValue, parseTest(&.{ "report", "a", "b" }, &storage));
     // --json is report-only
-    try expectError(error.UnknownFlag, parse(&.{ "--json", "./cmd" }, &storage));
-}
-
-test "v0.8 flags: max-restarts, start-period, on-incident" {
-    var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{
-        "--max-restarts=10",
-        "--health-start-period=30s",
-        "--on-incident=/notify --room ops",
-        "./a",
-    }, &storage);
-    try expectEqual(@as(u32, 10), cfg.max_restarts);
-    try expectEqual(@as(u64, 30_000), cfg.health_start_period_ms);
-    try expectEqualStrings("/notify --room ops", cfg.on_incident.?);
-    try expectError(error.BadValue, parse(&.{ "--max-restarts=lots", "./a" }, &storage));
-}
-
-test "health flags" {
-    var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{
-        "--health=api=/bin/check-api --fast",
-        "--health=worker=/bin/check-w",
-        "--health-interval=10s",
-        "--restart-on-unhealthy",
-        "./api",
-    }, &storage);
-    try expectEqual(@as(u8, 2), cfg.health_n);
-    try expectEqualStrings("api", cfg.health[0].worker);
-    try expectEqualStrings("/bin/check-api --fast", cfg.health[0].cmd);
-    try expectEqual(@as(u64, 10_000), cfg.health_interval_ms);
-    try expect(cfg.restart_on_unhealthy);
-    try expectError(error.BadValue, parse(&.{ "--health=nocmd", "./a" }, &storage));
-}
-
-test "ready-fd flag" {
-    var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{ "--ready-fd=5", "./a" }, &storage);
-    try expectEqual(@as(?u8, 5), cfg.ready_fd);
-    try expectError(error.BadValue, parse(&.{ "--ready-fd=1", "./a" }, &storage));
-    try expectError(error.BadValue, parse(&.{ "--ready-fd=x", "./a" }, &storage));
-}
-
-test "stop-grace and expected-exit flags" {
-    var storage: [max_workers][]const u8 = undefined;
-    const cfg = try parse(&.{ "--stop-grace=3s", "--expected-exit=143,129", "./a" }, &storage);
-    try expectEqual(@as(u64, 3_000), cfg.stop_grace_ms);
-    try expect(cfg.expected_exit[0]);
-    try expect(cfg.expected_exit[143]);
-    try expect(cfg.expected_exit[129]);
-    try expect(!cfg.expected_exit[1]);
-    try expectError(error.BadValue, parse(&.{ "--expected-exit=abc", "./a" }, &storage));
-    try expectError(error.BadValue, parse(&.{ "--stop-grace=oops", "./a" }, &storage));
+    try expectError(error.UnknownFlag, parseTest(&.{ "--json", "./cmd" }, &storage));
 }
 
 test "parse help and version short-circuit NoCommands" {
     var storage: [max_workers][]const u8 = undefined;
-    try expect((try parse(&.{"--help"}, &storage)).help);
-    try expect((try parse(&.{"--version"}, &storage)).version);
+    try expect((try parseTest(&.{"--help"}, &storage)).help);
+    try expect((try parseTest(&.{"--version"}, &storage)).version);
 }

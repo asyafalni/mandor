@@ -21,7 +21,7 @@ restarts what crashes — and when something dies, it writes an incident summary
 explaining what happened instead of leaving you to scroll logs.
 
 ```console
-$ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
+$ mandor --max-restarts=3 -- "./api --port 8080" "./worker" "./cron-loop"
 [mandor] spawned api (pid 12)
 [mandor] spawned worker (pid 13)
 [mandor] spawned cron-loop (pid 14)
@@ -34,7 +34,7 @@ $ mandor --restart=on-failure -- "./api --port 8080" "./worker" "./cron-loop"
 | Single static binary | ✅ | ✅ | ❌ |
 | Works in `scratch` / distroless | ✅ | ✅ | ❌ |
 | Full signal forwarding + process groups (dumb-init parity) | ✅ | partial | ✅ |
-| Restart policies + backoff | ✅ | ❌ | ✅ |
+| Bounded retries + backoff, then exit so the orchestrator acts | ✅ | ❌ | partial |
 | Log capture with per-worker prefix | ✅ | ✅ | ✅ |
 | CPU / RSS / fd tracking | ✅ | ❌ | ❌ |
 | Crash summaries ("restart loop", "leak suspect") | ✅ | ❌ | ❌ |
@@ -76,7 +76,7 @@ FROM scratch
 COPY --from=build /app/api /api
 COPY --from=build /app/worker /worker
 COPY --from=ghcr.io/asyafalni/mandor:latest /mandor /mandor
-ENTRYPOINT ["/mandor", "--restart=on-failure", "/api", "/worker"]
+ENTRYPOINT ["/mandor", "--max-restarts=3", "/api", "/worker"]
 ```
 
 ### On the command line
@@ -85,8 +85,8 @@ ENTRYPOINT ["/mandor", "--restart=on-failure", "/api", "/worker"]
 # run two workers, exit when both exit, propagate the worst exit code
 mandor "./api --port 8080" "./worker"
 
-# restart crashed workers with exponential backoff (200ms → 30s cap)
-mandor --restart=on-failure --backoff-max=30s -- "./api" "./worker"
+# retry a failed worker 3 times (200ms → 30s backoff), then exit with its code
+mandor --max-restarts=3 --backoff-max=30s -- "./api" "./worker"
 
 # what happened while I was away?
 mandor report            # live worker status
@@ -100,28 +100,46 @@ Everyday — this is the whole surface most deployments need:
 
 | Flag | Values | Default |
 |---|---|---|
-| `--restart` | `never` \| `on-failure` \| `always` | `never` |
+| `--max-restarts` | retries for a *failed* worker: `0` = none, `-1` = forever | `0` |
 | `--config` | path to `mandor.toml` | `./mandor.toml` if present |
-| `--health` | `NAME=CMD` probe (repeatable; exit 0 = healthy) | none |
 | `--metrics` | port for Prometheus text metrics on 127.0.0.1 | off |
-
-<details>
-<summary>Advanced flags (sane defaults — most users never touch these)</summary>
-
-| Flag | Values | Default |
-|---|---|---|
-| `--backoff-max` | restart backoff cap (`500ms`, `30s`, `2m`) | `30s` |
 | `--state-dir` | state + incident spool dir (or `MANDOR_STATE_DIR`) | `/var/lib/mandor` |
-| `--stop-grace` | TERM→KILL escalation grace period | `10s` |
-| `--expected-exit` | extra exit codes treated as success, e.g. `143,129` | none |
-| `--health-interval` | probe cadence | `30s` |
-| `--restart-on-unhealthy` | SIGTERM a worker after 3 failed probes | off |
-| `--ready-fd` | fd workers write a newline to when ready (s6-style) | off |
-| `--max-restarts` | consecutive failed restarts before mandor gives up and exits with the worker's code | `0` (never) |
-| `--health-start-period` | probe failures ignored this long after spawn (until first success) | `10s` |
-| `--on-incident` | command exec'd after each incident bundle write (bundle path appended) | off |
 
-</details>
+**That is the entire CLI.** Everything else — liveness probes, drain hooks,
+ordering, privilege drops, tuning — is a `mandor.toml` key with a sane default,
+so the command line stays something you can read at a glance in a Dockerfile.
+Settings that used to have flags kept the same name without the dashes
+(`--stop-grace` → `stop_grace`), and passing the old flag tells you so.
+
+### What happens when a worker exits
+
+mandor's whole lifecycle model, in one table:
+
+| The worker… | mandor… |
+|---|---|
+| exits `0` (or an `expected_exit` code) | leaves it finished; the run continues |
+| fails, retries remain | retries it after backoff (200ms, doubling, capped) |
+| fails, retries exhausted | **stops the other workers gracefully and exits with its code** |
+| fails, but is `essential = false` | leaves it dead; the run continues |
+| is a `oneshot` and fails | aborts startup — dependents never start |
+| fails its health probe 3× | is stopped, then treated as any other failure |
+
+The default is `max_restarts = 0` — **don't retry, end the run**. That is
+deliberate: restarting is the orchestrator's job, and it can only do that job
+if mandor exits instead of quietly retrying forever. Set `-1` if you really
+want unlimited in-container retries, knowing nothing upstream will be told.
+
+You don't have to remember any of this — mandor prints the resolved plan at
+startup, so it shows up in `docker logs` on every deploy:
+
+```console
+[mandor] 3 worker(s) | a failed worker retries 3x, then the run ends
+[mandor]   migrate: init task — runs first, failure aborts startup
+[mandor]   api: health probe — 3 failures stop the worker
+[mandor]   metrics: essential=false — its failure will not end the run
+```
+
+A config with nothing unusual prints exactly one line.
 
 ### Surviving container restarts
 
@@ -173,7 +191,7 @@ Global settings sit at the top; anything specific to one worker goes in a
 `[worker.NAME]` section, where `NAME` is the basename of its command.
 
 ```toml
-restart = "on-failure"
+max_restarts = 3
 metrics_port = 9464
 psi_mem_pct = 80               # incident if container memory pressure sustains >80%
 env_file = ".env"              # KEY=VAL lines for all workers
@@ -203,7 +221,7 @@ max_lifetime = "12h"           # periodic recycle as a leak crutch
 start_after = "api"            # starts once api is up (ready or alive 1s)
 
 [worker.cron]
-restart = "never"              # per-worker override of the global policy
+expected_exit = "3"            # exit 3 means success for this worker only
 ```
 
 Signals (dumb-init parity): every worker runs in its own process group, so

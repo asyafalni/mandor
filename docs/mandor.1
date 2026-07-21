@@ -30,30 +30,33 @@ Each \fICMD\fR is one worker: a quoted command line tokenized by mandor (no
 shell required). Workers are named by the basename of their first token.
 .SH COMMON FLAGS
 .TP
-.BR \-\-restart= never|on\-failure|always
-Restart policy (default: never).
+.BR \-\-max\-restarts= N
+Retries for a \fIfailed\fR worker: 0 (default) does not retry and lets the
+failure end the run, \-1 retries forever. Clean exits are never retried.
 .TP
 .BR \-\-config= PATH
 Load a mandor.toml (default: ./mandor.toml if present).
 .TP
-.BR \-\-health= "\fINAME=CMD\fR"
-Liveness probe for a worker (exit 0 = healthy). Repeatable.
-.TP
 .BR \-\-metrics= PORT
 Serve Prometheus text metrics on 127.0.0.1:PORT.
+.TP
+.BR \-\-state\-dir= PATH
+State file and incident spool (or \fBMANDOR_STATE_DIR\fR).
 .PP
-Advanced flags (\fB--backoff-max\fR, \fB--stop-grace\fR,
-\fB--expected-exit\fR, \fB--max-restarts\fR, \fB--state-dir\fR,
-\fB--ready-fd\fR, \fB--on-incident\fR, \fB--photon\fR) and all TOML-only keys
-are documented in \fBdocs/CONFIG.md\fR.
+These four flags are the whole command line. Every other setting \(em probes,
+drain hooks, ordering, privilege drops, tuning \(em is a \fBmandor.toml\fR key,
+documented in \fBdocs/CONFIG.md\fR. Keys keep the old flag name without the
+dashes (\fB--stop-grace\fR became \fBstop_grace\fR).
 .SH SIGNALS
 TERM/INT start graceful shutdown (forwarded to worker process groups; a
 second signal or \fB--stop-grace\fR expiry escalates to KILL). HUP, QUIT,
 USR1, USR2, and WINCH are passed through to workers.
 .SH EXIT STATUS
-The worst worker exit code (128+N for signal deaths), honoring
-\fB--expected-exit\fR; the give-up, essential, or oneshot worker's code when
-those mechanisms trigger; 2 for a configuration or startup error.
+The failing worker's code once its retries are exhausted (this is the common
+case: every worker is essential unless it sets \fBessential = false\fR), or the
+oneshot worker's code when an init task fails; otherwise the worst worker exit
+code (128+N for signal deaths), honoring \fB--expected-exit\fR. 2 for a
+configuration or startup error.
 .SH ENVIRONMENT
 .TP
 .B MANDOR_STATE_DIR

@@ -51,11 +51,27 @@ printf '#!/bin/sh\nexit 7\n' >"$TMP/bin/flap"
 printf '#!/bin/sh\nwhile :; do sleep 1; done\n' >"$TMP/bin/steady"
 chmod +x "$TMP/bin/spam" "$TMP/bin/flap" "$TMP/bin/steady"
 
-"$MANDOR" --restart=on-failure --backoff-max=200ms \
-  --state-dir="$STATE" --metrics="$METRICS_PORT" \
-  --health="steady=/bin/true" --health-interval=5s \
-  "$TMP/bin/spam" "$TMP/bin/flap" "$TMP/bin/steady" \
-  >/dev/null 2>&1 &
+# A config file rather than flags: `flap` must be non-essential, otherwise its
+# first failure ends the run (every worker is essential by default since 1.3).
+# It also stops being retried once the restart-loop detector fires, which is
+# correct — by then it has already exercised the spawn/reap/incident paths, and
+# `spam` keeps the capture hot path saturated for the rest of the soak.
+cat > "$TMP/soak.toml" <<TOML
+max_restarts = -1
+backoff_max = "200ms"
+state_dir = "$STATE"
+metrics_port = $METRICS_PORT
+health_interval = "5s"
+workers = ["$TMP/bin/spam", "$TMP/bin/flap", "$TMP/bin/steady"]
+
+[worker.flap]
+essential = false
+
+[worker.steady]
+health = "/bin/true"
+TOML
+
+"$MANDOR" --config="$TMP/soak.toml" >/dev/null 2>&1 &
 mpid=$!
 
 sleep 3
