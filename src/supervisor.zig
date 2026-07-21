@@ -525,28 +525,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         if (now_sample >= next_sample_ms) {
             next_sample_ms = now_sample + sampler.interval_ms;
             sample_tick +%= 1;
-            const psi = sampler.readPsi(); // container-wide, read once per tick
-            const wall = wallMs();
-            for (workers, 0..) |*w, i| {
-                if (w.pid > 0) {
-                    sampler.sample(&w.stats, w.pid, now_sample, psi);
-                    const s = w.stats.at(w.stats.len - 1);
-                    cost.get(i).update(s.rss_kb, s.cpu_pct, s.fds, s.threads, sampler.interval_ms, wall);
-                    if (w.det.leakCheck(&w.stats, now_sample)) |info|
-                        incident.onLeak(state_dir, workers, w, info, now_sample);
-                    checkRecycle(w, now_sample);
-                }
-            }
-            // PSI stall is container-scoped: check once, attribute the
-            // incident to the largest consumer of the pressured resource.
-            if (stall_det.stallCheck(psi, cfg.psi_mem_pct, cfg.psi_cpu_pct, now_sample)) |res|
-                incident.onStall(state_dir, workers, res, psi, now_sample);
-            // Near-zero idle footprint: deaths flush state immediately, so
-            // the periodic freshness write only needs to run every 30 s.
-            if (sample_tick % 6 == 0) {
-                report.writeState(state_dir, workers, now_sample);
-                cost.save(state_dir);
-            }
+            runSamplerTick(workers, cfg, state_dir, &stall_det, sample_tick, now_sample);
         }
     }
 
@@ -750,6 +729,42 @@ fn expectedFor(w: *const spawner.Worker, cfg: *const cli.Config, code: u8) bool 
 /// first, then TERM, and the stop-grace deadline escalates to KILL. One place
 /// because three call sites (oneshot failure, unretried failure, and the
 /// give-up path) must behave identically.
+/// One sampler tick: /proc sampling, cost accounting, leak and recycle
+/// checks per worker, then the container-wide PSI stall check and the
+/// periodic state flush. Called only when a tick is actually due, so the
+/// loop's common path pays nothing for it.
+fn runSamplerTick(
+    workers: []spawner.Worker,
+    cfg: *const cli.Config,
+    state_dir: []const u8,
+    stall_det: *detector.StallState,
+    sample_tick: u32,
+    now: u64,
+) void {
+    const psi = sampler.readPsi(); // container-wide, read once per tick
+    const wall = wallMs();
+    for (workers, 0..) |*w, i| {
+        if (w.pid > 0) {
+            sampler.sample(&w.stats, w.pid, now, psi);
+            const s = w.stats.at(w.stats.len - 1);
+            cost.get(i).update(s.rss_kb, s.cpu_pct, s.fds, s.threads, sampler.interval_ms, wall);
+            if (w.det.leakCheck(&w.stats, now)) |info|
+                incident.onLeak(state_dir, workers, w, info, now);
+            checkRecycle(w, now);
+        }
+    }
+    // PSI stall is container-scoped: check once, attribute the
+    // incident to the largest consumer of the pressured resource.
+    if (stall_det.stallCheck(psi, cfg.psi_mem_pct, cfg.psi_cpu_pct, now)) |res|
+        incident.onStall(state_dir, workers, res, psi, now);
+    // Near-zero idle footprint: deaths flush state immediately, so
+    // the periodic freshness write only needs to run every 30 s.
+    if (sample_tick % 6 == 0) {
+        report.writeState(state_dir, workers, now);
+        cost.save(state_dir);
+    }
+}
+
 /// Reap, classify, and act on every worker death: restart with backoff,
 /// give up, or end the run. Lifted out of `run` because it is the loop's
 /// one genuinely separable decision — and because every terminal-state rule
