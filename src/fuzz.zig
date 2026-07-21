@@ -413,20 +413,58 @@ var samples: [8]sampler.Sample = undefined;
 /// The incident-bundle serializer — the contract photon and the premium agent
 /// parse. Epoch fields are calendar math on an arbitrary i64, and one of them
 /// (`history_first_epoch`) can arrive clamped to maxInt(i64) straight out of a
+/// Slice a random window out of the mutated text. Shared by every target that
+/// needs an arbitrary attacker-controlled string.
+const pick = struct {
+    fn s(r: std.Random, t: []const u8) []const u8 {
+        if (t.len == 0) return "";
+        const a = r.uintLessThan(usize, t.len);
+        return t[a..@min(t.len, a + r.uintLessThan(usize, 256) + 1)];
+    }
+};
+
+var fuzz_frames: [8]summarize.Frame = undefined;
+
+/// Every cause kind, not just "signal" -- each renders a different field set
+/// (exit_code vs signal number vs neither).
+fn fuzzCause(rnd: std.Random) spool.CauseInfo {
+    const kinds = [_][]const u8{ "exit", "signal", "oom", "restart-loop", "leak-suspect", "unhealthy" };
+    return .{
+        .kind = kinds[rnd.uintLessThan(usize, kinds.len)],
+        .exit_code = if (rnd.boolean()) rnd.int(u8) else null,
+        .sig_num = rnd.int(u8),
+    };
+}
+
+/// Populate frames and the exception fields. Frame function/file slices point
+/// into worker crash output in production, so they carry whatever a crashing
+/// process chose to print -- quotes, backslashes, control bytes.
+fn fuzzTrace(rnd: std.Random, text: []const u8) summarize.TraceInfo {
+    const langs = [_][]const u8{ "go", "rust", "python", "node", "java", "zig", "unknown" };
+    const n = rnd.uintLessThan(usize, fuzz_frames.len + 1);
+    for (fuzz_frames[0..n]) |*f| {
+        f.* = .{
+            .function = pick.s(rnd, text),
+            .file = pick.s(rnd, text),
+            .line = rnd.int(u32),
+            .in_app = rnd.boolean(),
+        };
+    }
+    return .{
+        .lang = langs[rnd.uintLessThan(usize, langs.len)],
+        .frames = fuzz_frames[0..n],
+        .raw = pick.s(rnd, text),
+        .exc_type = pick.s(rnd, text),
+        .exc_msg = pick.s(rnd, text),
+    };
+}
+
 /// corrupt history.json.
 fn bundleTarget(rnd: std.Random, text: []const u8) void {
     const epoch = [_]i64{
         0,                        1,            -1, std.math.maxInt(i64), std.math.minInt(i64),
         std.math.maxInt(i64) - 1, rnd.int(i64),
     };
-    const pick = struct {
-        fn s(r: std.Random, t: []const u8) []const u8 {
-            if (t.len == 0) return "";
-            const a = r.uintLessThan(usize, t.len);
-            return t[a..@min(t.len, a + r.uintLessThan(usize, 256) + 1)];
-        }
-    };
-
     for (&log_lines, 0..) |*l, i| l.* = .{
         .text = pick.s(rnd, text),
         .flags = @truncate(i),
@@ -456,9 +494,9 @@ fn bundleTarget(rnd: std.Random, text: []const u8) void {
         .build_id = pick.s(rnd, text),
         .limits_nofile = rnd.int(u64),
         .limits_core = rnd.int(u64),
-        .cause = .{ .kind = "signal", .sig_num = rnd.int(u8) },
+        .cause = fuzzCause(rnd),
         .cause_str = pick.s(rnd, text),
-        .trace = .{ .lang = "go", .raw = pick.s(rnd, text) },
+        .trace = fuzzTrace(rnd, text),
         .logs_tail = log_lines[0..rnd.uintLessThan(usize, log_lines.len + 1)],
         .logs_dropped = rnd.int(u32),
         .stats = samples[0..rnd.uintLessThan(usize, samples.len + 1)],

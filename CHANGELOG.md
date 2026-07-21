@@ -3,6 +3,28 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.11] - 2026-07-22
+
+### Testing
+- **Audited every fuzz target for arguments pinned to a constant** — the blind
+  spot that hid the 1.5.10 panic, where `traceTarget` passed an empty stats
+  slice on every iteration and made a whole function unreachable to the fuzzer.
+  `bundleTarget` had the same shape: `cause.kind` was always `"signal"`,
+  `trace.lang` always `"go"`, and `frames`, `exc_type` and `exc_msg` were never
+  populated at all, so `spool.serialize`'s frame loop never ran under fuzzing.
+  Frames matter most here — their `function`/`file` strings are slices into
+  worker crash output, so a crashing process controls them entirely.
+  All are now varied, and the `pick` helper was hoisted to file scope rather
+  than duplicated.
+- **No new defect surfaced.** The frame path already escapes `function` and
+  `file` via `appendJsonString`, and `formatHuman` already saturates its
+  timestamp arithmetic (`now_ms -| ts`). Six passes × 3,000 iterations clean on
+  the newly-reachable branches. Binary unchanged at 256,136 bytes — fuzz code
+  is test-only.
+- `cause.kind` and `trace.lang` are interpolated raw with `{s}` in
+  `spool.serialize`. Safe today because both are internal constants, never
+  worker-derived — recorded here so it stays a deliberate choice.
+
 ## [1.5.10] - 2026-07-22
 
 ### Fixed
