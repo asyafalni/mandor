@@ -286,53 +286,9 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     report.writeState(state_dir, workers, nowMs());
 
     while (true) {
-        var live: usize = 0;
-        var pending: usize = 0;
-        // Outstanding work that the container actually exists for. A
-        // non-essential worker is a sidecar: useful while the real workers
-        // run, not a reason to stay alive once they are all finished.
-        var essential_busy: usize = 0;
-        var next_deadline: u64 = 0;
-        for (workers, 0..) |*w, i| {
-            var busy = true;
-            if (w.pid != 0) {
-                live += 1;
-            } else if (waiting[i]) {
-                pending += 1;
-            } else if (!w.done and w.next_restart_ms != 0) {
-                pending += 1;
-                if (next_deadline == 0 or w.next_restart_ms < next_deadline)
-                    next_deadline = w.next_restart_ms;
-            } else if (!w.done and w.spawn_failed) {
-                // Spawn failed and the death path has not run yet: real work
-                // is outstanding, so the fleet is not finished. Counted here
-                // rather than added to the break condition below — an extra
-                // term there makes the compiler duplicate the loop body and
-                // costs ~6 KB.
-                pending += 1;
-            } else busy = false;
-            if (busy and w.essential) essential_busy += 1;
-        }
-        // `live` counts every worker, so a shutdown still drains sidecars
-        // before exiting; only the decision to *start* shutting down keys off
-        // the essential ones.
-        if (live == 0 and (sd.active or pending == 0)) break;
-        if (!sd.active and any_essential and essential_busy == 0) {
-            // Every essential worker has finished. Nothing the container is
-            // for is still running, so stop the sidecars gracefully and exit
-            // rather than idling forever behind a process that never ends.
-            //
-            // The exit code is the worst code among the *essential* workers.
-            // Sidecars are about to die from a TERM mandor is sending itself,
-            // and letting their 143 become the worst code would report a
-            // completely successful run as a failure.
-            var essential_code: u8 = 0;
-            for (workers) |*w| {
-                if (w.essential and w.final_code > essential_code) essential_code = w.final_code;
-            }
-            logmod.print("[mandor] all essential workers finished; stopping the rest\n", .{});
-            beginShutdown(&sd, workers, &waiting, envp, path_env, nowMs(), cfg.stop_grace_ms, essential_code);
-        }
+        const fleet = assessFleet(&sd, workers, &waiting, cfg, envp, path_env, any_essential);
+        if (fleet.finished) break;
+        const next_deadline = fleet.next_deadline;
 
         // Deferred starts: a dependency is "up" once ready (readiness fd) or
         // simply alive for 1 s; a permanently-dead dependency unblocks its
@@ -398,50 +354,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         else
             @intCast(@min(wake_at - now_for_timeout, 3_600_000));
 
-        const PollKind = enum { out, err, ready };
-        var pfds: [2 + 3 * cli.max_workers]posix.pollfd = undefined;
-        var owners: [2 + 3 * cli.max_workers]*spawner.Worker = undefined;
-        var kinds: [2 + 3 * cli.max_workers]PollKind = undefined;
-        pfds[0] = .{ .fd = sigs.fd, .events = posix.POLL.IN, .revents = 0 };
-        var nf: usize = 1;
-        var metrics_idx: usize = 0; // 0 = not in the set
-        if (metrics_server) |srv| {
-            pfds[nf] = .{ .fd = srv.fd, .events = posix.POLL.IN, .revents = 0 };
-            metrics_idx = nf;
-            nf += 1;
-        }
-        for (workers) |*w| {
-            if (w.out_r >= 0) {
-                pfds[nf] = .{ .fd = w.out_r, .events = posix.POLL.IN, .revents = 0 };
-                owners[nf] = w;
-                kinds[nf] = .out;
-                nf += 1;
-            }
-            if (w.err_r >= 0) {
-                pfds[nf] = .{ .fd = w.err_r, .events = posix.POLL.IN, .revents = 0 };
-                owners[nf] = w;
-                kinds[nf] = .err;
-                nf += 1;
-            }
-            if (w.ready_r >= 0) {
-                pfds[nf] = .{ .fd = w.ready_r, .events = posix.POLL.IN, .revents = 0 };
-                owners[nf] = w;
-                kinds[nf] = .ready;
-                nf += 1;
-            }
-        }
-        _ = posix.poll(pfds[0..nf], timeout) catch 0;
-
-        for (pfds[1..nf], 1..) |*pfd, i| {
-            if (pfd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) continue;
-            if (i == metrics_idx) {
-                metrics_server.?.onReadable(workers, incident.total);
-            } else switch (kinds[i]) {
-                .out => readPipe(owners[i], false),
-                .err => readPipe(owners[i], true),
-                .ready => readReady(owners[i]),
-            }
-        }
+        pumpIo(sigs.fd, workers, metrics_server, timeout);
 
         const ev = sigs.drain();
 
@@ -490,35 +403,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         }
 
         if (!sd.active) {
-            const now = nowMs();
-            for (workers, 0..) |*w, wi| {
-                if (w.done or w.pid != 0 or w.next_restart_ms == 0 or w.next_restart_ms > now)
-                    continue;
-                w.restarts += 1;
-                spawnWorker(w, envp, path_env, cfg.ready_fd);
-                if (w.spawn_failed) spawn_deaths = true;
-                // OTP rest_for_one (opt-in): a dependency's restart recycles
-                // its live dependents — planned, never counted as failure.
-                if (cfg.restart_dependents) {
-                    for (workers, 0..) |*dep_w, di| {
-                        if (dep_w.pid <= 0 or dep_w.recycling) continue;
-                        var cur = dep_of[di];
-                        var hops: usize = 0;
-                        while (cur) |c| : (hops += 1) {
-                            if (hops > workers.len) break;
-                            if (c == wi) {
-                                logmod.print("[mandor] restarting {s} with its dependency {s}\n", .{
-                                    dep_w.nameSlice(), w.nameSlice(),
-                                });
-                                dep_w.recycling = true;
-                                posix.kill(-dep_w.pid, .TERM) catch {};
-                                break;
-                            }
-                            cur = dep_of[c];
-                        }
-                    }
-                }
-            }
+            if (startDueRestarts(workers, &dep_of, cfg, envp, path_env)) spawn_deaths = true;
         }
 
         const now_sample = nowMs();
@@ -729,6 +614,183 @@ fn expectedFor(w: *const spawner.Worker, cfg: *const cli.Config, code: u8) bool 
 /// first, then TERM, and the stop-grace deadline escalates to KILL. One place
 /// because three call sites (oneshot failure, unretried failure, and the
 /// give-up path) must behave identically.
+/// One pass over the worker table: what is still running, what is still
+/// owed a start, when the next restart is due, and whether any *essential*
+/// work remains. Also starts the shutdown once every essential worker has
+/// finished — a sidecar is not a reason to keep the container alive.
+///
+/// The loop's `break` stays in the caller: control flow belongs at the
+/// loop, so this returns the decision rather than taking it.
+const Fleet = struct { finished: bool, next_deadline: u64 };
+
+fn assessFleet(
+    sd: *Shutdown,
+    workers: []spawner.Worker,
+    waiting: []bool,
+    cfg: *const cli.Config,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+    any_essential: bool,
+) Fleet {
+    var live: usize = 0;
+    var pending: usize = 0;
+    // Outstanding work that the container actually exists for. A
+    // non-essential worker is a sidecar: useful while the real workers
+    // run, not a reason to stay alive once they are all finished.
+    var essential_busy: usize = 0;
+    var next_deadline: u64 = 0;
+    for (workers, 0..) |*w, i| {
+        var busy = true;
+        if (w.pid != 0) {
+            live += 1;
+        } else if (waiting[i]) {
+            pending += 1;
+        } else if (!w.done and w.next_restart_ms != 0) {
+            pending += 1;
+            if (next_deadline == 0 or w.next_restart_ms < next_deadline)
+                next_deadline = w.next_restart_ms;
+        } else if (!w.done and w.spawn_failed) {
+            // Spawn failed and the death path has not run yet: real work
+            // is outstanding, so the fleet is not finished. Counted here
+            // rather than added to the break condition below — an extra
+            // term there makes the compiler duplicate the loop body and
+            // costs ~6 KB.
+            pending += 1;
+        } else busy = false;
+        if (busy and w.essential) essential_busy += 1;
+    }
+    // `live` counts every worker, so a shutdown still drains sidecars
+    // before exiting; only the decision to *start* shutting down keys off
+    // the essential ones.
+    // `live` counts every worker, so a shutdown still drains sidecars
+    // before finishing; only the decision to *start* shutting down keys
+    // off the essential ones.
+    if (live == 0 and (sd.active or pending == 0))
+        return .{ .finished = true, .next_deadline = next_deadline };
+    if (!sd.active and any_essential and essential_busy == 0) {
+        // Every essential worker has finished. Nothing the container is
+        // for is still running, so stop the sidecars gracefully and exit
+        // rather than idling forever behind a process that never ends.
+        //
+        // The exit code is the worst code among the *essential* workers.
+        // Sidecars are about to die from a TERM mandor is sending itself,
+        // and letting their 143 become the worst code would report a
+        // completely successful run as a failure.
+        var essential_code: u8 = 0;
+        for (workers) |*w| {
+            if (w.essential and w.final_code > essential_code) essential_code = w.final_code;
+        }
+        logmod.print("[mandor] all essential workers finished; stopping the rest\n", .{});
+        beginShutdown(sd, workers, waiting, envp, path_env, nowMs(), cfg.stop_grace_ms, essential_code);
+    }
+    return .{ .finished = false, .next_deadline = next_deadline };
+}
+
+/// Spawn every worker whose backoff has elapsed, then — with
+/// `restart_dependents` — recycle the live dependents of anything that
+/// just came back (OTP rest_for_one; a planned recycle, never a failure).
+///
+/// Returns true if any spawn failed, so the caller can run the death path:
+/// a spawn that never forked has no child to raise SIGCHLD.
+fn startDueRestarts(
+    workers: []spawner.Worker,
+    dep_of: []const ?u8,
+    cfg: *const cli.Config,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) bool {
+    var failed = false;
+    const now = nowMs();
+    for (workers, 0..) |*w, wi| {
+        if (w.done or w.pid != 0 or w.next_restart_ms == 0 or w.next_restart_ms > now)
+            continue;
+        w.restarts += 1;
+        spawnWorker(w, envp, path_env, cfg.ready_fd);
+        if (w.spawn_failed) failed = true;
+        // OTP rest_for_one (opt-in): a dependency's restart recycles
+        // its live dependents — planned, never counted as failure.
+        if (cfg.restart_dependents) {
+            for (workers, 0..) |*dep_w, di| {
+                if (dep_w.pid <= 0 or dep_w.recycling) continue;
+                var cur = dep_of[di];
+                var hops: usize = 0;
+                while (cur) |c| : (hops += 1) {
+                    if (hops > workers.len) break;
+                    if (c == wi) {
+                        logmod.print("[mandor] restarting {s} with its dependency {s}\n", .{
+                            dep_w.nameSlice(), w.nameSlice(),
+                        });
+                        dep_w.recycling = true;
+                        posix.kill(-dep_w.pid, .TERM) catch {};
+                        break;
+                    }
+                    cur = dep_of[c];
+                }
+            }
+        }
+    }
+    return failed;
+}
+
+/// Build the poll set — signalfd, the metrics listener, and every worker
+/// pipe — wait on it, then service whatever became readable.
+///
+/// The signalfd sits at index 0 and is polled here but drained by the
+/// caller, which needs the decoded events to drive the rest of the
+/// iteration. The three parallel arrays are sized for the worst case and
+/// live in this frame rather than the loop's.
+fn pumpIo(
+    sig_fd: i32,
+    workers: []spawner.Worker,
+    metrics_server: ?metrics.Server,
+    timeout: i32,
+) void {
+    const PollKind = enum { out, err, ready };
+    var pfds: [2 + 3 * cli.max_workers]posix.pollfd = undefined;
+    var owners: [2 + 3 * cli.max_workers]*spawner.Worker = undefined;
+    var kinds: [2 + 3 * cli.max_workers]PollKind = undefined;
+    pfds[0] = .{ .fd = sig_fd, .events = posix.POLL.IN, .revents = 0 };
+    var nf: usize = 1;
+    var metrics_idx: usize = 0; // 0 = not in the set
+    if (metrics_server) |srv| {
+        pfds[nf] = .{ .fd = srv.fd, .events = posix.POLL.IN, .revents = 0 };
+        metrics_idx = nf;
+        nf += 1;
+    }
+    for (workers) |*w| {
+        if (w.out_r >= 0) {
+            pfds[nf] = .{ .fd = w.out_r, .events = posix.POLL.IN, .revents = 0 };
+            owners[nf] = w;
+            kinds[nf] = .out;
+            nf += 1;
+        }
+        if (w.err_r >= 0) {
+            pfds[nf] = .{ .fd = w.err_r, .events = posix.POLL.IN, .revents = 0 };
+            owners[nf] = w;
+            kinds[nf] = .err;
+            nf += 1;
+        }
+        if (w.ready_r >= 0) {
+            pfds[nf] = .{ .fd = w.ready_r, .events = posix.POLL.IN, .revents = 0 };
+            owners[nf] = w;
+            kinds[nf] = .ready;
+            nf += 1;
+        }
+    }
+    _ = posix.poll(pfds[0..nf], timeout) catch 0;
+
+    for (pfds[1..nf], 1..) |*pfd, i| {
+        if (pfd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) continue;
+        if (i == metrics_idx) {
+            metrics_server.?.onReadable(workers, incident.total);
+        } else switch (kinds[i]) {
+            .out => readPipe(owners[i], false),
+            .err => readPipe(owners[i], true),
+            .ready => readReady(owners[i]),
+        }
+    }
+}
+
 /// One sampler tick: /proc sampling, cost accounting, leak and recycle
 /// checks per worker, then the container-wide PSI stall check and the
 /// periodic state flush. Called only when a tick is actually due, so the

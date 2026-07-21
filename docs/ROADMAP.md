@@ -171,7 +171,7 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 | 43 ✅ | Exit once all *essential* workers are done | XS | ● ● ● ○ | SHIPPED v1.4.0 — the loop-exit test asks it of essential workers only; sidecars are drained and the exit code is the essential outcome |
 | 44 ✅ | Per-worker `expected_exit` | XS | ● ● ○ ○ | SHIPPED v1.3.0 |
 | 45 | `relay.zig` has no test coverage | S | ● ● ● ○ | PARKED 2026-07-21 — zero fuzz targets, zero harness cases; parses two untrusted inputs |
-| 46 | `supervisor.run` is very large | M | ● ● ○ ○ | IN PROGRESS — steps 1–2 shipped (`Shutdown` struct, `handleDeaths`); `run` 451 → 344 lines |
+| 46 ✅ | `supervisor.run` is very large | M | ● ● ○ ○ | SHIPPED v1.5.0 — six steps; `run` 451 → 208 lines, binary −5,152 B, perf neutral |
 | 47 | Post-death group sweep can cut short a grandchild's own TERM handler | S | ● ● ○ ○ | PARKED 2026-07-21 — found via a flaky harness case; see below |
 
 ### #42 — `fork` failure permanently retires a worker

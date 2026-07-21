@@ -3,6 +3,34 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.0] - 2026-07-21
+
+### Changed
+- **`supervisor.run` split into named units.** It carried the poll loop, spawn
+  gating, the death path, health probes, the sampler tick and shutdown in one
+  451-line function — the function that must not panic, and where most of the
+  1.x defects lived. Six steps, each measured before and after:
+
+  | Step | Binary | `run` |
+  |---|---|---|
+  | v1.4.0 | 252,920 | 56,043 B / 451 lines |
+  | 1 — `Shutdown` struct | 251,896 | 55,011 |
+  | 2 — `handleDeaths` | 252,248 | 55,095 / 344 |
+  | 3 — `runSamplerTick` | 248,248 | 51,124 / 323 |
+  | 4 — `pumpIo` | 247,672 | 50,551 / 280 |
+  | 5 — `startDueRestarts` | 247,672 | 50,551 / 252 |
+  | 6 — `assessFleet` | **247,768** | **50,646 / 208** |
+
+  Net **−5,152 bytes** and **−243 lines** (54% shorter), perf neutral: the
+  200k-line capture gate measures 16 ms before and 17 ms after (ReleaseSafe,
+  minimum of 8 alternating runs).
+
+  The wins were not where intuition said. Moving 22 lines (`runSamplerTick`)
+  saved 4,000 bytes because `cost.update`, `incident.onLeak/onStall`,
+  `report.writeState` and `cost.save` were expanding directly into `run`;
+  moving 107 lines (`handleDeaths`) *cost* 352. Each step was kept or dropped
+  on measurement, not on how much code it moved.
+
 ## [1.4.0] - 2026-07-21
 
 ### Added
