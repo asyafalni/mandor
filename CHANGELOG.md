@@ -3,6 +3,33 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.9] - 2026-07-22
+
+### Fixed
+- **`history.json` was read with a single un-looped `read()`.** A short read
+  parsed as a *smaller* history rather than an error, quietly losing the
+  recurrence counts that answer "did the last fix hold?". Looped, and a file
+  that fills the buffer is ignored rather than half-restored — measured worst
+  case is 13,907 of 16,384 bytes, so a full buffer means the file was
+  truncated or tampered with, never legitimately that large.
+
+### Added
+- Boundary test for a full history table (64 entries, both build strings at
+  `max_build`, counters at maximum width): **13,907 of 16,384 bytes, 2,477
+  spare**. It fits, and the limit is now pinned rather than assumed — the same
+  check that caught the cost (1.5.7) and state (1.5.8) overflows.
+
+### Checked, no change needed
+- Every remaining un-looped `read()` was reviewed individually and is correct
+  in context: the relay HTTP response (only the status line is needed), the
+  metrics request (discarded, non-blocking), the capture drain (already
+  looped), the readiness byte (one-shot), `/proc` and cgroup snapshot files,
+  and the ELF header (a short read degrades to "no build-id", with tests).
+- Write paths refuse to `rename` after a partial write, so `state.json`,
+  `cost.json`, `history.json` and incident bundles cannot be committed
+  half-written. A state dir that becomes unwritable mid-run is reported, not
+  swallowed — verified by making a volume read-only between spawn and crash.
+
 ## [1.5.8] - 2026-07-22
 
 ### Fixed

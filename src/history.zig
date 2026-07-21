@@ -168,8 +168,20 @@ pub fn load(state_dir: []const u8) void {
     if (posix.errno(rc) != .SUCCESS) return;
     const fd: i32 = @intCast(rc);
     defer _ = linux.close(fd);
-    const got = linux.read(fd, &file_buf, file_buf.len);
-    if (posix.errno(got) != .SUCCESS) return;
+    // Looped: one read() may return short, and a partial history parses as a
+    // smaller history rather than an error — quietly losing recurrence counts,
+    // which is the data that answers "did the last fix hold?". A full buffer
+    // means the file is bigger than anything serialize() can produce (measured
+    // worst case 13,907 of 16,384), so it has been tampered with or truncated;
+    // ignore it rather than restore half of it.
+    var got: usize = 0;
+    while (got < file_buf.len) {
+        const r = linux.read(fd, file_buf[got..].ptr, file_buf.len - got);
+        if (posix.errno(r) != .SUCCESS) return;
+        if (r == 0) break;
+        got += r;
+    }
+    if (got == file_buf.len) return;
     loadFromText(file_buf[0..got]);
 }
 
@@ -197,6 +209,35 @@ pub fn save(state_dir: []const u8) void {
 }
 
 // ---------------------------------------------------------------- tests
+
+test "a full history table still serializes and fits the load buffer" {
+    // Worst case: every slot used, both build strings at max_build, and every
+    // counter near maximum width. serialize() returning null means save()
+    // writes nothing and recurrence history silently stops persisting.
+    n = 0;
+    for (0..max_entries) |i| _ = record(@intCast(i + 1), @intCast(i), "v1");
+    for (0..max_entries) |i| {
+        entries[i].sig = std.math.maxInt(u64);
+        entries[i].first_seen = std.math.maxInt(i64);
+        entries[i].last_seen = std.math.maxInt(i64);
+        entries[i].count = std.math.maxInt(u32);
+        entries[i].builds = std.math.maxInt(u32);
+        entries[i].first_build_len = max_build;
+        entries[i].last_build_len = max_build;
+        for (0..max_build) |j| {
+            entries[i].first_build[j] = 'a' + @as(u8, @intCast((i + j) % 26));
+            entries[i].last_build[j] = 'z' - @as(u8, @intCast((i + j) % 26));
+        }
+    }
+
+    var buf: [file_buf.len]u8 = undefined;
+    const json = serialize(&buf);
+    try std.testing.expect(json != null);
+    // ...and it must fit the buffer load() reads it back with, with room to
+    // tell "full file" apart from "truncated".
+    try std.testing.expect(json.?.len < file_buf.len);
+    n = 0;
+}
 
 test "record bumps counts and round-trips through text" {
     n = 0;
