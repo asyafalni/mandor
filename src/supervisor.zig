@@ -213,6 +213,10 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         break :blk srv;
     } else null;
 
+    // Set when a spawn fails: the death path must run even without a SIGCHLD,
+    // since no child was ever created to report one.
+    var spawn_deaths = false;
+
     for (workers, 0..) |*w, i| {
         if (dep_of[i] != null or (oneshot_count > 0 and !w.is_oneshot)) {
             waiting[i] = true;
@@ -222,6 +226,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             });
         } else {
             spawnWorker(w, envp, path_env, cfg.ready_fd);
+            if (w.spawn_failed) spawn_deaths = true;
         }
     }
     report.writeState(state_dir, workers, nowMs());
@@ -239,6 +244,13 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 pending += 1;
                 if (next_deadline == 0 or w.next_restart_ms < next_deadline)
                     next_deadline = w.next_restart_ms;
+            } else if (!w.done and w.spawn_failed) {
+                // Spawn failed and the death path has not run yet: real work
+                // is outstanding, so the fleet is not finished. Counted here
+                // rather than added to the break condition below — an extra
+                // term there makes the compiler duplicate the loop body and
+                // costs ~6 KB.
+                pending += 1;
             }
         }
         if (live == 0 and (shutting_down or pending == 0)) break;
@@ -264,6 +276,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                 if (ok) {
                     waiting[i] = false;
                     spawnWorker(w, envp, path_env, cfg.ready_fd);
+                    if (w.spawn_failed) spawn_deaths = true;
                 }
             }
         }
@@ -301,8 +314,8 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
             }
         }
         const now_for_timeout = nowMs();
-        const timeout: i32 = if (wake_at <= now_for_timeout)
-            0
+        const timeout: i32 = if (spawn_deaths or wake_at <= now_for_timeout)
+            0 // a pending spawn-death must be handled now, not one tick later
         else
             @intCast(@min(wake_at - now_for_timeout, 3_600_000));
 
@@ -379,7 +392,8 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
         }
         for (ev.pass[0..ev.pass_n]) |sig| forwardAll(workers, sig);
 
-        if (ev.chld) {
+        if (ev.chld or spawn_deaths) {
+            spawn_deaths = false;
             const reaped = reaper.drain(workers).reaped_workers;
             const now = nowMs();
             if (reaped > 0) report.writeState(state_dir, workers, now);
@@ -503,6 +517,7 @@ pub fn run(cfg: cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]c
                     continue;
                 w.restarts += 1;
                 spawnWorker(w, envp, path_env, cfg.ready_fd);
+                if (w.spawn_failed) spawn_deaths = true;
                 // OTP rest_for_one (opt-in): a dependency's restart recycles
                 // its live dependents — planned, never counted as failure.
                 if (cfg.restart_dependents) {
@@ -706,6 +721,8 @@ fn runHealth(
     }
 }
 
+/// On failure sets `w.spawn_failed` and stages a synthetic death; the caller
+/// must then let the death path run so it is handled like any other death.
 fn spawnWorker(
     w: *spawner.Worker,
     envp: [*:null]const ?[*:0]const u8,
@@ -713,15 +730,32 @@ fn spawnWorker(
     ready_fd: ?u8,
 ) void {
     spawner.spawn(w, envp, path_env, nowMs(), ready_fd) catch {
-        logmod.print("[mandor] fork failed for {s}\n", .{w.nameSlice()});
-        w.done = true;
-        w.final_code = 125;
+        // A failed spawn is reported as a death rather than handled here.
+        // Every terminal-state rule — restart policy and backoff, `essential`
+        // leader semantics, `oneshot` gating — lives on the death path, so
+        // retiring the worker here would silently bypass all of them: a
+        // transient EAGAIN would become permanent, an essential worker that
+        // never started would not stop the fleet, and a failed init task
+        // would read as a completed one and release its dependents.
+        w.pid = 0;
+        w.status = .{ .exited = spawn_fail_code };
+        w.final_code = spawn_fail_code;
+        w.spawn_failed = true;
         return;
     };
+    w.spawn_failed = false;
     logmod.print("[mandor] spawned {s} (pid {d})\n", .{ w.nameSlice(), w.pid });
 }
 
+/// Exit code stamped on a worker that could not be spawned at all.
+const spawn_fail_code: u8 = 125;
+
 fn logDeath(w: *const spawner.Worker) void {
+    if (w.spawn_failed) {
+        // It never ran, so "exited with code 125" would be a lie.
+        logmod.print("[mandor] {s} failed to start (fork failed)\n", .{w.nameSlice()});
+        return;
+    }
     switch (w.status) {
         .exited => |code| logmod.print("[mandor] {s} exited with code {d}\n", .{
             w.nameSlice(), code,

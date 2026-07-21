@@ -75,6 +75,10 @@ pub const Worker = struct {
     recycling: bool = false, // current death is planned, not a failure
     restart_override: ?cli.RestartPolicy = null,
     essential: bool = false, // leader semantics: its exit stops everything
+    /// This worker's last spawn failed outright (fork/exec setup), so it never
+    /// ran. Reported as a death so restart policy, `essential`, and `oneshot`
+    /// all apply — only the log wording differs.
+    spawn_failed: bool = false,
     color: u8 = 0, // ANSI 31..36 cycle for TTY prefixes
 
     // pre_stop drain hook (v0.13): runs before TERM on graceful shutdown.
@@ -124,6 +128,7 @@ fn resetWorker(w: *Worker) void {
     w.next_restart_ms = 0;
     w.final_code = 0;
     w.done = false;
+    w.spawn_failed = false;
     w.out_r = -1;
     w.err_r = -1;
     w.asm_out.len = 0;

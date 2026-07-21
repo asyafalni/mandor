@@ -49,6 +49,33 @@ Two footguns, both found the hard way on 30-minute runs:
   a long soak runs can corrupt that run. Snapshot it
   (`cp test/harness/soak.sh /tmp/soak.sh`) before a long session.
 
+### Spawn-failure behaviour
+
+A failed `fork` is impractical to trigger on demand (`ulimit -u` starves the
+test harness before it starves mandor), so these paths are verified by
+injection: add an early `return error.ForkFailed;` to `spawner.spawn` for one
+named worker, rebuild, and check the behaviour. Four cases, all of which must
+hold:
+
+| Setup | Expected |
+|---|---|
+| plain worker, `--restart=on-failure` | `failed to start` → `restarting in 200ms` → recovers when the injection clears |
+| plain worker, `--restart=never` | `failed to start`, no retry, exit 125 |
+| `essential = true` | `essential worker … stopping all`, fleet stops, exit 125 |
+| `oneshot = true` | `init task … failed, shutting down`, dependents never start |
+
+The reason they all matter: a failed spawn is routed through the *death* path
+precisely so restart policy, `essential`, and `oneshot` apply to it. Handling
+it at the spawn site would bypass all three — which is exactly the bug fixed in
+1.2.0, where a failed init task read as a *completed* one and released its
+dependents.
+
+If you touch this, also re-check the loop-exit accounting: a worker whose spawn
+failed is neither live nor pending until the death path runs, so it is counted
+via `w.spawn_failed` in the tally. Do **not** add a term to the `break`
+condition instead — an extra term there makes the compiler duplicate the loop
+body and costs ~6 KB of `.text` for identical behaviour.
+
 ### Fuzzing
 
 `src/fuzz.zig` mutation-fuzzes everything that consumes input mandor does not

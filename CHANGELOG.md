@@ -3,6 +3,40 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.2.0] - 2026-07-21
+
+### Fixed
+- **A worker that fails to spawn is now reported as a death, so every
+  terminal-state rule applies to it.** Previously the spawn-failure path set
+  `done` and returned, bypassing the restart policy, `essential`, and
+  `oneshot` — all three of which live on the death path. Three verified
+  defects, one root cause:
+
+  - A transient `fork` `EAGAIN` (pids-cgroup limit or `RLIMIT_NPROC` under
+    load) retired the worker **permanently** instead of retrying under the
+    restart policy and backoff.
+  - An **`essential`** worker that never started did **not** stop the fleet.
+    mandor kept running leaderless and never exited, so no orchestrator ever
+    restarted the container — silent degradation rather than a visible crash.
+  - A **`oneshot`** init task that never started read as a **completed** one
+    and released its dependents. Migrations never ran and the API served
+    against uninitialized state. This is the severe one: a failure silently
+    converted into a success.
+
+  All four behaviours are now verified by injection (see CONTRIBUTING):
+  on-failure retries and recovers, `never` does not retry, `essential` stops
+  the fleet, and a failed `oneshot` shuts down with its dependents unstarted.
+  Exit code 125 still marks a worker that could not be spawned, and the log
+  now says `failed to start (fork failed)` rather than reporting an exit that
+  never happened.
+
+### Notes
+- The loop-exit accounting counts a spawn-failed worker via `w.spawn_failed`
+  in the existing live/pending tally rather than adding a term to the `break`
+  condition. Both are correct; the latter makes the compiler duplicate the
+  loop body and cost ~6 KB of `.text`. Measured: +496 B this way versus
+  +6,528 B the naive way.
+
 ## [1.1.0] - 2026-07-20
 
 ### Changed — breaking (config only)

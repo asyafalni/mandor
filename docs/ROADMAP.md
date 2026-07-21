@@ -167,7 +167,7 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 
 | # | Item | Cx | Value | Notes |
 |---|------|----|-------|-------|
-| 42 | Route a failed spawn through the death path (fixes fork-retry, `essential`, `oneshot`) | S | ● ● ● ● | PARKED 2026-07-20 (user) — **3 verified defects**; a failed `oneshot` currently reads as SUCCESS. See below |
+| 42 ✅ | Route a failed spawn through the death path (fixes fork-retry, `essential`, `oneshot`) | S | ● ● ● ● | SHIPPED v1.2.0 — all 3 defects fixed by one structural change; +496 B. See below |
 | 43 | Exit once all *significant* workers are gone (OTP `all_significant`) | S | ● ● ● ○ | PARKED 2026-07-20 (user) — the one genuinely missing exit mode; semantics need thought |
 | 44 | Per-worker `expected_exit` | XS | ● ● ○ ○ | PARKED 2026-07-20 — currently global-only |
 
@@ -247,6 +247,21 @@ Fixing (1) by routing a failed spawn through the same path as a worker death
 fixes (2) and (3) for free. That is a strong argument against special-casing
 each check at the spawn site: the bug is the second terminal path, not the
 individual handlers.
+
+**SHIPPED v1.2.0** exactly that way. `spawnWorker` now stages a synthetic
+death (`status = exited(125)`, `spawn_failed = true`) instead of retiring the
+worker, and the death path runs even without a `SIGCHLD` — no child existed to
+send one. All four behaviours verified by injection: on-failure retries and
+recovers, `never` does not retry, `essential` stops the fleet, a failed
+`oneshot` shuts down with dependents unstarted.
+
+**Size lesson worth keeping.** The obvious formulation — adding `and
+!spawn_deaths` to the loop's `break` condition — cost **+6,528 B**, traced by
+symbol diff to `supervisor.run` itself: an extra term there makes the compiler
+duplicate the loop body. Counting the spawn-failed worker as *pending* in the
+existing live/pending tally is behaviourally identical and costs **+496 B**.
+When a small change grows `.text` disproportionately, `nm --print-size` on a
+`-Dstrip=false` build names the function responsible.
 
 **Why parked:** it changes restart semantics and the observable exit code 125.
 Not a crash — mandor stays alive either way — so it did not gate the 1.0.x
