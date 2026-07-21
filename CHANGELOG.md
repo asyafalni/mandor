@@ -3,6 +3,39 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.6] - 2026-07-21
+
+### Fixed
+- **The harness aborted at its first failure** (regression introduced in
+  1.5.2). The failure-name logging added there referenced `$MANDOR_FAILLOG`
+  unguarded while the script runs under `set -u`, so an unset variable killed
+  the run at the first `bad` call — every later case never executed and no
+  summary printed. The logging meant to make failures more visible was instead
+  hiding all but the first. Guarded with `${MANDOR_FAILLOG:-}`. It stayed
+  hidden because every run since was either green or had the variable exported.
+
+### Added
+- **Harness case 73: fd count must not grow across restarts.** Every spawn
+  makes three pipes; a read end outliving its worker would walk mandor into
+  `EMFILE`, and PID 1 hitting `EMFILE` takes the container down. Restarts stay
+  under the loop detector (5 deaths / 5 min) and the check compares the *floor*
+  of repeated samples, which is phase-independent — raw counts swing by 3 per
+  live worker depending on when you look. Result: the floor holds flat, so the
+  pipe lifecycle is confirmed correct rather than merely assumed.
+
+### Docs
+- `README`: the photon section still called the incident hook "upcoming" — both
+  `photon = "ip:port"` and `on_incident` ship today; the caveat is photon's
+  protobuf-only `/v1/logs`, now stated. Removed `--backoff-max` from a quick
+  start example — the flag moved to `mandor.toml` in 1.3.0, so the documented
+  command errored.
+- `docs/mandor.1`: SIGNALS and EXIT STATUS still cited `--stop-grace` and
+  `--expected-exit` as flags; both are TOML keys now.
+- Size claims normalized to the measured 248 KB across README, CONTRIBUTING
+  and the man page (they read 268 KB, 230 KB and 250 KB respectively).
+- `docs/INTEGRATION-PHOTON.md`: documented the 10s socket timeout and that any
+  2xx counts as accepted.
+
 ## [1.5.5] - 2026-07-21
 
 ### Fixed

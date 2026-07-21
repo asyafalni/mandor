@@ -1,4 +1,4 @@
-.TH MANDOR 1 "2026-07-18" "mandor" "User Commands"
+.TH MANDOR 1 "2026-07-21" "mandor" "User Commands"
 .SH NAME
 mandor \- the foreman for your containers: a tiny PID-1 process supervisor
 .SH SYNOPSIS
@@ -24,7 +24,7 @@ mandor \- the foreman for your containers: a tiny PID-1 process supervisor
 runs as PID 1 in a container, spawns worker processes, forwards signals,
 reaps zombies, restarts what crashes, and\(emwhen a worker dies\(emwrites a
 structured JSON incident bundle explaining what happened. It is a single
-static binary (~230 KB), fully offline unless a network feature is configured.
+static binary (~248 KB), fully offline unless a network feature is configured.
 .PP
 Each \fICMD\fR is one worker: a quoted command line tokenized by mandor (no
 shell required). Workers are named by the basename of their first token.
@@ -49,13 +49,13 @@ documented in \fBdocs/CONFIG.md\fR. Keys keep the old flag name without the
 dashes (\fB--stop-grace\fR became \fBstop_grace\fR).
 .SH SIGNALS
 TERM/INT start graceful shutdown (forwarded to worker process groups; a
-second signal or \fB--stop-grace\fR expiry escalates to KILL). HUP, QUIT,
+second signal or \fBstop_grace\fR expiry escalates to KILL). HUP, QUIT,
 USR1, USR2, and WINCH are passed through to workers.
 .SH EXIT STATUS
 The failing worker's code once its retries are exhausted (this is the common
 case: every worker is essential unless it sets \fBessential = false\fR), or the
 oneshot worker's code when an init task fails; otherwise the worst worker exit
-code (128+N for signal deaths), honoring \fB--expected-exit\fR. 2 for a
+code (128+N for signal deaths), honoring \fBexpected_exit\fR. 2 for a
 configuration or startup error.
 .SH ENVIRONMENT
 .TP

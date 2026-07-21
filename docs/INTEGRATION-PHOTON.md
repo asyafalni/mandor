@@ -66,6 +66,13 @@ and a bundle whose JSON string escapes are broken (`malformed JSON string
 escape`, which means the file was truncated mid-write or hand-edited). A bad
 `ip:port` exits 2 before any socket work; there is no name resolution.
 
+Delivery is bounded and any 2xx counts as accepted. Every blocking socket call
+times out after 10s: the relay is spawned fire-and-forget and never waited on,
+so a collector that accepts the connection and then stalls would otherwise
+strand one process per incident — and incidents fire per restart, so a crash
+loop would strand one per crash. A timeout says so explicitly rather than
+reporting a rejection. `202 Accepted` is treated as success, not failure.
+
 > **Status: still blocked. Re-verified 2026-07-21** against
 > `crates/photon-ingest/src/http.rs` on photon `main`. `decode_export_request`
 > is unchanged — `prost::Message::decode(body)`, protobuf only, and the handler

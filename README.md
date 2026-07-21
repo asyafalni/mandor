@@ -9,7 +9,7 @@
 
 [![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.16.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Static binary](https://img.shields.io/badge/binary-static%2C%20~268KB-success)
+![Static binary](https://img.shields.io/badge/binary-static%2C%20~248KB-success)
 ![No dependencies](https://img.shields.io/badge/dependencies-zero-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
@@ -40,7 +40,7 @@ $ mandor --max-restarts=3 -- "./api --port 8080" "./worker" "./cron-loop"
 | Crash summaries ("restart loop", "leak suspect") | ✅ | ❌ | ❌ |
 | Per-worker cost + right-sizing report | ✅ | ❌ | ❌ |
 | Release correlation ("did the fix hold?") | ✅ | ❌ | ❌ |
-| Size | **~268 KB** | ~50 KB | MBs + runtime |
+| Size | **~248 KB** | ~50 KB | MBs + runtime |
 | Network access required | **never** | never | varies |
 
 The `mandor` binary is fully offline and self-contained: no accounts, no
@@ -86,7 +86,7 @@ ENTRYPOINT ["/mandor", "--max-restarts=3", "/api", "/worker"]
 mandor "./api --port 8080" "./worker"
 
 # retry a failed worker 3 times (200ms → 30s backoff), then exit with its code
-mandor --max-restarts=3 --backoff-max=30s -- "./api" "./worker"
+mandor --max-restarts=3 -- "./api" "./worker"
 
 # what happened while I was away?
 mandor report            # live worker status
@@ -298,7 +298,11 @@ researched-but-parked work: [docs/ROADMAP.md](docs/ROADMAP.md).
 [photon](https://github.com/nevindra/photon) is an OTEL-native single-binary
 observability platform — and mandor's natural display layer: worker metrics
 via the Prometheus endpoint, worker logs via stdout collection, and incident
-bundles via the upcoming `on_incident` hook. Integration contract:
+bundles via the `photon = "ip:port"` key (or the generic `on_incident` hook
+for anything else). Both ship today; note that photon's `/v1/logs` currently
+decodes OTLP protobuf only while mandor sends OTLP/JSON, so the forward is
+built and tested on mandor's side but not yet ingested — status and the
+photon-side fix live in
 [docs/INTEGRATION-PHOTON.md](docs/INTEGRATION-PHOTON.md).
 
 ## Contributing

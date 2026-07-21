@@ -18,7 +18,11 @@ ok()   { pass=$((pass+1)); echo "ok   $1"; }
 bad()  {
   fail=$((fail+1)); echo "FAIL $1 — $2"
   FAILED_NAMES="$FAILED_NAMES$1\n"
-  [ -n "$MANDOR_FAILLOG" ] && printf '%s\t%s\n' "$1" "$2" >> "$MANDOR_FAILLOG"
+  # `${x:-}` matters: the script runs under `set -u`, so referencing an unset
+  # MANDOR_FAILLOG aborted the whole run at the first failure -- turning the
+  # logging meant to make failures visible into something that hid every case
+  # after the first one.
+  [ -n "${MANDOR_FAILLOG:-}" ] && printf '%s\t%s\n' "$1" "$2" >> "$MANDOR_FAILLOG"
   return 0
 }
 
@@ -990,6 +994,47 @@ relay_against accepted
 if [ $relay_rc -eq 0 ]; then
   ok "relay treats 202 Accepted as delivered"
 else bad "relay 202" "exit $relay_rc: $(head -2 "$TMP/resp_out")"; fi
+
+# 73. fd count must not grow across restarts. Every spawn makes three pipes
+# (stdout, stderr, readiness); a read end that outlived its worker would march
+# mandor into EMFILE during a crash loop -- and PID 1 hitting EMFILE takes the
+# container down.
+#
+# Restarts stay under the loop detector (5 deaths / 5 min) so the fleet is not
+# stopped mid-test, and the comparison uses the *floor* of repeated samples:
+# raw counts swing by 3 per live worker depending on where in the spawn/die
+# cycle a sample lands, but the between-restarts baseline is phase-independent,
+# so a per-restart leak shows up as that floor rising.
+cat > "$TMP/fd73.toml" <<TOML
+workers = ["sh -c 'sleep 0.2; exit 1'"]
+max_restarts = 4
+backoff_max = "400ms"
+TOML
+"$MANDOR" --config="$TMP/fd73.toml" >"$TMP/73" 2>&1 &
+mpid73=$!
+early_min=99999
+late_min=99999
+samples=0
+for i in $(seq 1 30); do
+  kill -0 $mpid73 2>/dev/null || break
+  c=$(ls /proc/$mpid73/fd 2>/dev/null | wc -l)
+  if [ "$c" -gt 0 ]; then
+    samples=$((samples+1))
+    if [ $i -le 10 ]; then
+      [ "$c" -lt "$early_min" ] && early_min=$c
+    else
+      [ "$c" -lt "$late_min" ] && late_min=$c
+    fi
+  fi
+  sleep 0.15
+done
+restarts73=$(grep -c "restarting sh" "$TMP/73" 2>/dev/null || true)
+kill -TERM $mpid73 2>/dev/null; wait $mpid73 2>/dev/null
+if [ "$samples" -lt 5 ] || [ "$early_min" -eq 99999 ] || [ "$late_min" -eq 99999 ]; then
+  bad "fd growth across restarts" "only $samples usable samples (harness setup)"
+elif [ "$late_min" -le "$((early_min + 1))" ]; then
+  ok "fd floor stays flat across restarts (early=$early_min late=$late_min, $restarts73 restarts)"
+else bad "fd growth across restarts" "floor rose $early_min -> $late_min over $restarts73 restarts"; fi
 
 echo
 if [ $fail -ne 0 ]; then

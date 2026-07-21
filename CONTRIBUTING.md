@@ -127,7 +127,7 @@ instruments zero PCs with it off), which is why the harness is in-repo.
 ## Ground rules
 
 - **Size is a feature.** The stripped ReleaseSafe binary must stay under
-  500 KB (CI gates it); it currently sits near ~230 KB. A new dependency or
+  500 KB (CI gates it); it currently sits near ~248 KB. A new dependency or
   a large `std` pull-in needs a very good story.
 - **PID 1 must not die.** No panics on the supervision path; every syscall
   error is handled. No allocations in the steady state (fixed buffers).
