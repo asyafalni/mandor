@@ -236,18 +236,16 @@ var incident_entries: [256]@import("spool.zig").DirEntry = undefined;
 /// `mandor report --incidents` — recall the spooled history (survives
 /// restarts when the state dir is a mounted volume).
 fn readIncidentFile(state_dir: []const u8, e: *const @import("spool.zig").DirEntry) ?[]const u8 {
-    const linux = std.os.linux;
     var path_buf: [640]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
         state_dir, e.name[0..e.name_len],
     }) catch return null;
-    const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
-    if (std.posix.errno(rc) != .SUCCESS) return null;
-    const fd: i32 = @intCast(rc);
-    defer _ = linux.close(fd);
-    const got = linux.read(fd, &report_read_buf, report_read_buf.len);
-    if (std.posix.errno(got) != .SUCCESS) return null;
-    return report_read_buf[0..got];
+    return @import("report.zig").readWhole(path.ptr, &report_read_buf) catch |err| {
+        if (err == error.TooLarge) {
+            logmod.print("[mandor] incident file is larger than {d}KB — refusing to print a truncated bundle\n", .{report_read_buf.len / 1024});
+        }
+        return null;
+    };
 }
 
 /// `mandor report --incidents [NAME] [--since=DUR]` lists history (survives
@@ -304,19 +302,15 @@ fn runIncidentList(state_dir: []const u8, filter: ?[]const u8, since_ms: ?u64, i
 }
 
 fn readSmallFile(path: []const u8, buf: []u8) ?[]const u8 {
-    const linux = std.os.linux;
     var path_buf: [512]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
-    const rc = linux.openat(linux.AT.FDCWD, path_z.ptr, .{}, 0);
-    if (std.posix.errno(rc) != .SUCCESS) return null;
-    const fd: i32 = @intCast(rc);
-    defer _ = linux.close(fd);
-    const n = linux.read(fd, buf.ptr, buf.len);
-    if (std.posix.errno(n) != .SUCCESS) return null;
-    return buf[0..n];
+    return @import("report.zig").readWhole(path_z.ptr, buf) catch null;
 }
 
-var report_read_buf: [256 * 1024]u8 = undefined;
+/// Must hold whatever `writeState` can produce (see report.state_buf_cap):
+/// a full worker table with long commands measures 271,280 bytes, so 256KB
+/// truncated state.json on read as well as on write.
+var report_read_buf: [640 * 1024]u8 = undefined;
 var report_out_buf: [64 * 1024]u8 = undefined;
 
 var cost_out_buf: [64 * 1024]u8 = undefined;

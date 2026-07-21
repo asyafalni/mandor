@@ -10,7 +10,12 @@ const sampler = @import("sampler.zig");
 
 pub const state_version = 1;
 pub const default_state_dir = "/var/lib/mandor";
-const state_buf_cap = 256 * 1024;
+/// Sized from measurement, not guesswork: 64 workers (max_workers) with
+/// commands at the tokenizer's 4096-byte cap serialize to 271,280 bytes, which
+/// overflowed the old 256KB buffer and silently stopped state.json from being
+/// written. The headroom above that covers JSON escaping, which doubles a
+/// command full of quotes. BSS -- address space, not binary size.
+const state_buf_cap = 640 * 1024;
 
 // ------------------------------------------------------- serialization
 
@@ -205,12 +210,22 @@ const linux = std.os.linux;
 const posix = std.posix;
 
 var state_buf: [state_buf_cap]u8 = undefined;
+var warned_state_too_big = false;
 var warned_unwritable = false;
 
 /// Serialize and atomically write state.json. Never fails loudly more than
 /// once; the supervisor keeps running regardless.
 pub fn writeState(state_dir: []const u8, workers: []const spawner.Worker, now_ms: u64) void {
-    const json = serialize(&state_buf, workers, now_ms) orelse return;
+    const json = serialize(&state_buf, workers, now_ms) orelse {
+        // Dropping this silently is how state.json used to stop updating with
+        // nobody told -- `mandor report` then says there is no state at all.
+        // writeState runs on a timer, so warn once.
+        if (!warned_state_too_big) {
+            warned_state_too_big = true;
+            logmod.print("[mandor] worker state too large to persist; `mandor report` will be stale\n", .{});
+        }
+        return;
+    };
 
     var path_buf: [512]u8 = undefined;
     var tmp_buf: [512]u8 = undefined;
@@ -246,20 +261,37 @@ pub fn writeState(state_dir: []const u8, workers: []const spawner.Worker, now_ms
     }
 }
 
-pub const ReadError = error{Unreadable};
+pub const ReadError = error{ Unreadable, TooLarge };
 
 /// Read state.json for the report subcommand.
+/// Read a whole file into `buf`.
+///
+/// Looped because one read() may return short, and a buffer filled to the brim
+/// is reported as TooLarge rather than returned: every caller here parses the
+/// result as JSON, so handing back a truncated prefix turns "the file is
+/// bigger than we expected" into "the file is corrupt" -- or worse, into a
+/// silently partial answer.
+pub fn readWhole(path_z: [*:0]const u8, buf: []u8) ReadError![]const u8 {
+    const rc = linux.openat(linux.AT.FDCWD, path_z, .{}, 0);
+    if (posix.errno(rc) != .SUCCESS) return error.Unreadable;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var n: usize = 0;
+    while (n < buf.len) {
+        const got = linux.read(fd, buf[n..].ptr, buf.len - n);
+        if (posix.errno(got) != .SUCCESS) return error.Unreadable;
+        if (got == 0) break;
+        n += got;
+    }
+    if (n == buf.len) return error.TooLarge;
+    return buf[0..n];
+}
+
 pub fn readState(state_dir: []const u8, buf: []u8) ReadError![]const u8 {
     var path_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/state.json", .{state_dir}) catch
         return error.Unreadable;
-    const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
-    if (posix.errno(rc) != .SUCCESS) return error.Unreadable;
-    const fd: i32 = @intCast(rc);
-    defer _ = linux.close(fd);
-    const n = linux.read(fd, buf.ptr, buf.len);
-    if (posix.errno(n) != .SUCCESS) return error.Unreadable;
-    return buf[0..n];
+    return readWhole(path.ptr, buf);
 }
 
 // ---------------------------------------------------------------- tests
@@ -270,6 +302,35 @@ fn testWorker(name: []const u8, cmd: []const u8) spawner.Worker {
     w.name_len = @intCast(name.len);
     w.cmd = cmd;
     return w;
+}
+
+test "a full worker table serializes into state_buf" {
+    // The worst case the supervisor can actually hold: the table at capacity
+    // with long commands. writeState drops the write when this does not fit,
+    // so an overflow means state.json silently stops updating and `mandor
+    // report` reports no state at all.
+    const cli = @import("cli.zig");
+    const workers = try std.testing.allocator.alloc(spawner.Worker, cli.max_workers);
+    defer std.testing.allocator.free(workers);
+    var cmd_store = try std.testing.allocator.alloc([4096]u8, cli.max_workers);
+    defer std.testing.allocator.free(cmd_store);
+
+    for (workers, 0..) |*w, i| {
+        w.* = .{};
+        w.name_len = 32;
+        for (0..32) |c| w.name[c] = 'a' + @as(u8, @intCast((i + c) % 26));
+        // A realistic long command line rather than the absolute 4096 cap:
+        // flags and paths, no escaping needed.
+        for (&cmd_store[i], 0..) |*c, j| c.* = if (j % 16 == 15) ' ' else 'x';
+        w.cmd = cmd_store[i][0..];
+        w.status = .{ .exited = 3 };
+        w.restarts = std.math.maxInt(u32);
+    }
+
+    const json = serialize(&state_buf, workers, std.math.maxInt(u64));
+    try std.testing.expect(json != null);
+    // ...and it must fit the buffer `mandor report` reads it back with.
+    try std.testing.expect(json.?.len <= state_buf_cap);
 }
 
 test "serialize golden output" {

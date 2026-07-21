@@ -3,6 +3,29 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.8] - 2026-07-22
+
+### Fixed
+- **`state.json` silently stopped being written on a full worker table.**
+  64 workers with commands at the tokenizer's 4096-byte cap serialize to
+  **271,280 bytes** against a 256KB `state_buf`. `writeState` does
+  `serialize(...) orelse return`, so past that point the file simply stopped
+  updating and `mandor report` said there was no state at all — the supervisor
+  running fine, its own reporting blind. Both the write and read buffers are
+  now sized from that measurement (640KB, BSS), and a write that still cannot
+  fit warns once instead of vanishing.
+- **Three readers could return a silently truncated file.** `readState`,
+  `readIncidentFile` and `readSmallFile` each used a single un-looped `read()`
+  with no overflow check — the same shape as the relay bug (1.5.2) and the cost
+  bug (1.5.7). `readIncidentFile` printed its result as raw JSON for
+  `--incident=N`, so an oversized bundle was emitted as a truncated document
+  with nothing saying so. All three now share one `readWhole` helper that loops
+  and reports `TooLarge` rather than handing back a prefix.
+
+### Added
+- Boundary test serializing a full worker table with maximum-length commands.
+  It fails on the old buffer and passes on the new.
+
 ## [1.5.7] - 2026-07-22
 
 ### Fixed
