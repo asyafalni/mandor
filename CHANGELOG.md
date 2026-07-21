@@ -3,6 +3,28 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.7] - 2026-07-22
+
+### Fixed
+- **Cost accounting silently stopped persisting on larger fleets.** Each worker
+  profile serializes three 32-bucket `u32` histograms plus ten wide counters;
+  a full 64-worker table measures **90,003 bytes** against a 64KB `io_buf`. Past
+  roughly 46 workers `serialize()` returned null, `save()` returned without
+  writing, and `mandor report --cost` quietly reported stale or empty
+  accounting — no error, no partial file, nothing in the log. The buffer is now
+  sized from that measurement (160KB, BSS — address space, not binary size),
+  and a write that still cannot fit says so once instead of vanishing.
+- **`cost.json` was read with a single un-looped `read()`** and no truncation
+  check — the same shape as the relay bug fixed in 1.5.2. A short read or an
+  oversized file silently reset counters instead of restoring them. Reads are
+  looped, and a file too large to hold is ignored with a message rather than
+  parsed in part.
+
+### Added
+- Boundary test at full worker-table capacity, worst-case counter widths. It
+  fails on the old buffer and passes on the new, so the limit is pinned rather
+  than assumed.
+
 ## [1.5.6] - 2026-07-21
 
 ### Fixed

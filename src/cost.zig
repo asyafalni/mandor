@@ -192,11 +192,19 @@ pub fn formatHuman(out: []u8, text: []const u8) []const u8 {
 const linux = std.os.linux;
 const posix = std.posix;
 const cli = @import("cli.zig");
+const log = @import("log.zig");
+
+var warned_too_big = false;
 
 var profiles: [cli.max_workers]Profile = undefined;
 var names: [cli.max_workers][]const u8 = undefined;
 var n_profiles: usize = 0;
-var io_buf: [64 * 1024]u8 = undefined;
+/// Sized from the worst case the supervisor can actually reach: a full worker
+/// table (64) with names at name_cap and every counter near maximum width
+/// measures 90,003 bytes -- three 32-bucket u32 histograms plus ten wide
+/// counters per worker. 64KB silently lost cost data past ~46 workers. BSS, so
+/// it costs address space rather than binary size.
+var io_buf: [160 * 1024]u8 = undefined;
 
 pub fn get(idx: usize) *Profile {
     return &profiles[idx];
@@ -301,15 +309,35 @@ pub fn readState(state_dir: []const u8) ?[]const u8 {
     if (posix.errno(rc) != .SUCCESS) return null;
     const fd: i32 = @intCast(rc);
     defer _ = linux.close(fd);
-    const got = linux.read(fd, &io_buf, io_buf.len);
-    if (posix.errno(got) != .SUCCESS) return null;
-    return io_buf[0..got];
+    // Loop: one read() may return short, and a buffer filled to the brim
+    // means the file is larger than we can hold -- parsing a truncated
+    // cost.json would silently reset counters rather than restore them.
+    var n: usize = 0;
+    while (n < io_buf.len) {
+        const got = linux.read(fd, io_buf[n..].ptr, io_buf.len - n);
+        if (posix.errno(got) != .SUCCESS) return null;
+        if (got == 0) break;
+        n += got;
+    }
+    if (n == io_buf.len) {
+        log.print("[mandor] cost.json larger than {d}KB — ignoring it rather than restoring partial counters\n", .{io_buf.len / 1024});
+        return null;
+    }
+    return io_buf[0..n];
 }
 
 pub fn save(state_dir: []const u8) void {
     // serialize() fills io_buf; nothing else touches it before the write, so
     // write directly — no second buffer.
-    const json = serialize() orelse return;
+    const json = serialize() orelse {
+        // Dropping the write silently is how cost accounting used to stop
+        // without anyone noticing. Say it once -- save() runs on a timer.
+        if (!warned_too_big) {
+            warned_too_big = true;
+            log.print("[mandor] cost profile too large to persist; cost report will be incomplete\n", .{});
+        }
+        return;
+    };
     var path_buf: [512]u8 = undefined;
     var tmp_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/cost.json", .{state_dir}) catch return;
@@ -367,6 +395,43 @@ test "maxed-out counters from a corrupt reload summarize without trapping" {
     const s = p.summary();
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), p.idle_n + 0);
     try std.testing.expect(s.duty_pct <= 100);
+}
+
+test "a full worker table still serializes and round-trips" {
+    // Worst case the supervisor can actually reach: the table at capacity,
+    // names at name_cap, and every counter near maximum width. save() drops
+    // the write when serialize() does not fit, so an overflow here means cost
+    // accounting silently stops persisting -- no error, no partial file.
+    var name_store: [cli.max_workers][32]u8 = undefined;
+    var name_slices: [cli.max_workers][]const u8 = undefined;
+    for (&name_store, 0..) |*nb, i| {
+        for (nb, 0..) |*c, j| c.* = 'a' + @as(u8, @intCast((i + j) % 26));
+        name_slices[i] = nb[0..];
+    }
+    init("/nonexistent-state-dir-for-test", &name_slices);
+    try std.testing.expectEqual(@as(usize, cli.max_workers), n_profiles);
+    for (0..n_profiles) |i| {
+        const p = &profiles[i];
+        p.peak_rss_kb = std.math.maxInt(u64);
+        p.peak_cpu_pct = std.math.maxInt(u16);
+        p.peak_fds = std.math.maxInt(u16);
+        p.peak_threads = std.math.maxInt(u16);
+        p.idle_n = std.math.maxInt(u32);
+        p.active_n = std.math.maxInt(u32);
+        p.core_ms = std.math.maxInt(u64);
+        p.rss_kb_ms = std.math.maxInt(u64);
+        p.first_ms = std.math.maxInt(u64);
+        p.last_ms = std.math.maxInt(u64);
+        p.rss_idle = .{std.math.maxInt(u32)} ** buckets;
+        p.rss_active = .{std.math.maxInt(u32)} ** buckets;
+        p.cpu_active = .{std.math.maxInt(u32)} ** buckets;
+    }
+
+    const json = serialize();
+    try std.testing.expect(json != null);
+    // ...and it must still fit the buffer readState() will load it back with.
+    try std.testing.expect(json.?.len <= io_buf.len);
+    n_profiles = 0;
 }
 
 test "serialize then re-init round-trips accumulators" {
