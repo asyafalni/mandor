@@ -3,6 +3,31 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.3.1] - 2026-07-21
+
+### Fixed
+- **Abandoning a non-essential worker was silent.** Once a worker marked
+  `essential = false` hit a restart loop, mandor stopped retrying it and said
+  nothing — the log showed a routine exit line and then silence, with no way
+  to tell that mandor had given up. `essential = false` opts a worker out of
+  *ending the run*, not out of being reported. It now says so:
+  `bad is in a restart loop, not restarting it (essential = false)`.
+- **Three fuzz seeds were not valid inputs, so their targets fuzzed an early
+  error instead of the parser.** `cli_seed` still listed flags 1.3 moved to
+  TOML; `config_seed` still used the removed `restart` key; and `report_seed`
+  had no `ts_ms`, which `report.formatHuman` requires — that last one had been
+  fuzzing nothing since 1.0.0. All three are fixed.
+
+### Added
+- **A seed-validity guard** (`seed valid: …` tests). Every fuzz seed must
+  parse successfully and populate what the target needs. This failure mode has
+  now bitten three times — the `history.json` seed through 1.0.0, and two more
+  found here — and it is invisible by construction: a broken seed makes the
+  suite *greener*, not redder. The guard makes it loud.
+- Harness cases for the non-essential give-up message, and for recycling not
+  tripping essential-by-default (a planned restart must never read as a
+  failure now that any failure can end the run).
+
 ## [1.3.0] - 2026-07-21
 
 Lifecycle simplification. mandor now defaults to **giving up** rather than

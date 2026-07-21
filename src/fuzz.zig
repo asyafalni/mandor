@@ -47,7 +47,7 @@ const corpus = [_][]const u8{
 
 /// A config that exercises every key, used as the TOML seed.
 const config_seed =
-    \\restart = "on-failure"
+    \\max_restarts = 3
     \\metrics_port = 9464
     \\state_dir = "/var/lib/mandor"
     \\stop_grace = "10s"
@@ -68,7 +68,8 @@ const config_seed =
     \\
     \\[worker.worker]
     \\start_after = "api"
-    \\restart = "never"
+    \\expected_exit = "3"
+    \\essential = false
     \\
 ;
 
@@ -81,7 +82,13 @@ const history_seed = "{\"v\":2,\"entries\":[" ++
     "{\"sig\":\"00000000deadbeef\",\"first\":1700000000,\"last\":1700009999,\"count\":3,\"builds\":2,\"fb\":\"v1.0.0\",\"lb\":\"v1.0.1\"}," ++
     "{\"sig\":\"ffffffffffffffff\",\"first\":1,\"last\":2,\"count\":1,\"builds\":0,\"fb\":\"\",\"lb\":\"\"}]}";
 const cost_seed = "{\"v\":1,\"workers\":[{\"name\":\"api\",\"obs\":600,\"rss\":[1,2,3],\"cpu\":[4,5,6]}]}";
-const report_seed = "{\"v\":1,\"now\":1000,\"workers\":[{\"name\":\"api\",\"pid\":42,\"state\":\"running\",\"restarts\":3,\"rss_kb\":2048,\"cpu_pct\":12}]}";
+// Must match report.serialize: `formatHuman` bails immediately without a
+// `ts_ms` field, which is how this seed silently fuzzed an early return from
+// 1.0.0 until the seed-validity guard caught it.
+const report_seed = "{\"v\":1,\"ts_ms\":1000000,\"workers\":[" ++
+    "{\"name\":\"api\",\"cmd\":\"./api\",\"state\":\"running\",\"note\":\"\",\"health\":\"ok\"," ++
+    "\"code\":0,\"pid\":42,\"restarts\":3,\"stats\":[" ++
+    "{\"t_ms\":999000,\"rss_kb\":2048,\"cpu_pct\":12,\"fds\":9,\"threads\":4}]}]}";
 
 // --------------------------------------------------------------- mutation
 
@@ -341,11 +348,12 @@ fn cliTarget(text: []const u8) void {
     cli.parse(arg_slots[0..n], &cmd_storage, &parsed) catch {};
 }
 
+// Only flags the CLI still has — the advanced ones moved to mandor.toml in
+// 1.3, and a seed containing one would error on that argument and fuzz
+// nothing beyond it. `seedsReachTheParser` below enforces that.
 const cli_seed =
-    "--max-restarts=3 --backoff-max=30s --stop-grace=10s --metrics=9464 " ++
-    "--health=api=/bin/check --expected-exit=143,129 --max-restarts=5 " ++
-    "--ready-fd=3 --state-dir=/var/lib/mandor --incident=2 -- " ++
-    "'./api --port 8080' \"./worker -v\"";
+    "--max-restarts=3 --metrics=9464 --state-dir=/var/lib/mandor " ++
+    "--config=/etc/mandor.toml -- './api --port 8080' \"./worker -v\"";
 
 fn ignoreLine(_: void, _: []const u8, _: u8) void {}
 
@@ -491,6 +499,47 @@ var buf: [max_input]u8 = undefined;
 
 fn prng() std.Random.DefaultPrng {
     return std.Random.DefaultPrng.init(std.testing.random_seed);
+}
+
+// A seed that fails to parse fuzzes an early return and reports green
+// forever. That has now happened twice: the history.json seed used the wrong
+// shape through the 1.0.0 release (hiding a live PID-1 crash), and the cli
+// seed still listed flags that 1.3 moved to mandor.toml. This test is the
+// guard — it asserts every seed is a *valid* input, so the mutator starts
+// from something that actually reaches the code under test.
+test "seed valid: cli args" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    var slots: [24][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, cli_seed, " ");
+    while (it.next()) |a| {
+        if (n == slots.len) break;
+        slots[n] = a;
+        n += 1;
+    }
+    var cli_out: cli.Config = undefined;
+    try cli.parse(slots[0..n], &storage, &cli_out);
+}
+
+test "seed valid: toml parses and populates per-worker settings" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    var file_out: config.FileConfig = undefined;
+    try config.parse(config_seed, &storage, &file_out);
+    try std.testing.expect(file_out.commands.len > 0);
+    try std.testing.expect(file_out.env_pairs_n > 0);
+    try std.testing.expect(file_out.not_essential_n > 0);
+    try std.testing.expect(file_out.expected_pairs_n > 0);
+}
+
+test "seed valid: history, /proc and state files" {
+    // Round-trip rather than exposing an entry count publicly.
+    history.loadFromText(history_seed);
+    const round = history.serialize(&fmt_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, round, "\"sig\":\"") != null);
+
+    try std.testing.expect(sampler.parseStat(stat_seed) != null);
+    try std.testing.expect(sampler.parsePsiAvg60(psi_seed) > 0);
+    try std.testing.expect(report.formatHuman(&fmt_buf, report_seed, 1_000_000, null) != null);
 }
 
 test "fuzz: trace parsers survive mutated crash output" {

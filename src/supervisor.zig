@@ -522,11 +522,14 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                     w.done = true;
                 }
                 // A failure that will not be retried ends the run, propagating
-                // the worker's code, so the layer above is signalled. Only a
-                // worker marked `essential = false` is exempt.
-                if (w.done and !clean and w.essential and !shutting_down) {
-                    // One format string; the reason is composed first. Three
-                    // separate formats cost three copies of std.fmt.
+                // the worker's code, so the layer above is signalled. A worker
+                // marked `essential = false` is exempt — but mandor still says
+                // it has stopped trying, because silently abandoning a worker
+                // is the same invisible degradation this release exists to
+                // remove; it is only the *scope* that the opt-out changes.
+                if (w.done and !clean and !shutting_down) {
+                    // One format string; the varying parts are composed first.
+                    // Separate formats each cost their own copy of std.fmt.
                     var why_buf: [48]u8 = undefined;
                     const why: []const u8 = if (loop_detected)
                         "is in a restart loop"
@@ -536,8 +539,13 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                         }) catch "failed"
                     else
                         "failed";
-                    logmod.print("[mandor] {s} {s}, stopping all\n", .{ w.nameSlice(), why });
-                    beginShutdown(workers, &waiting, envp, path_env, &shutting_down, &shutdown_deadline_ms, &give_up_code, now, cfg.stop_grace_ms, w.final_code);
+                    const what: []const u8 = if (w.essential)
+                        "stopping all"
+                    else
+                        "not restarting it (essential = false)";
+                    logmod.print("[mandor] {s} {s}, {s}\n", .{ w.nameSlice(), why, what });
+                    if (w.essential)
+                        beginShutdown(workers, &waiting, envp, path_env, &shutting_down, &shutdown_deadline_ms, &give_up_code, now, cfg.stop_grace_ms, w.final_code);
                 }
             }
         }

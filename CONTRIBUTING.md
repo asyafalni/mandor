@@ -104,12 +104,16 @@ learned the hard way:
   mandor's own persisted state: `history.json` and `cost.json` survive
   restarts, so a corrupt file can seed a counter at its maximum and the next
   increment traps. Watch mixed widths too — `u32 + u32` stays `u32`.
-- **A seed must match the real serialized format byte-for-byte in shape.** The
-  `history.json` seed once used `"sig":123` while the loader keys off
-  `{"sig":"` plus a fixed 16-digit hex field. It matched nothing, so that
-  target fuzzed an early return and reported green for a release while a live
-  crash sat behind it. If you add a target, confirm the seed actually reaches
-  the parsing code.
+- **A seed must be a valid input, matching the real format byte-for-byte in
+  shape.** This has bitten three times: the `history.json` seed used
+  `"sig":123` while the loader keys off `{"sig":"` plus a fixed 16-hex-digit
+  field; `report_seed` lacked the `ts_ms` that `formatHuman` requires; and
+  `cli_seed` kept flags that a release had moved to TOML. Each made its target
+  fuzz an early error while reporting green — a broken seed makes the suite
+  *greener*, never redder, which is why it hides so well. The `seed valid: …`
+  tests are the guard: **if you add or change a seed, assert it parses and
+  populates what the target reads.** Changing a config format or removing a
+  flag means revisiting the seeds.
 
 And a rule for the harness itself: **do not trust a green fuzzer.** Revert a
 known fix and check the harness catches it. That check is what upgraded the

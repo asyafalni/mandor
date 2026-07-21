@@ -725,6 +725,42 @@ if grep -q "1 worker(s) | a failure ends the run (max_restarts=0)" "$TMP/59"; th
   ok "startup plan states the lifecycle in one line"
 else bad "startup plan" "$(head -2 "$TMP/59")"; fi
 
+# 61. abandoning a non-essential worker must be announced. It opted out of
+# ending the run, not out of being reported — silently ceasing to restart it
+# is the same invisible degradation everywhere else in this release removes.
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\nexit 1\n' >"$TMP/bin/bad"; printf '#!/bin/sh\nsleep 300\n' >"$TMP/bin/live"
+chmod +x "$TMP/bin/bad" "$TMP/bin/live"
+cat > "$TMP/ne.toml" <<TOML
+max_restarts = -1
+backoff_max = "200ms"
+workers = ["$TMP/bin/bad", "$TMP/bin/live"]
+[worker.bad]
+essential = false
+TOML
+timeout 15 "$MANDOR" --config="$TMP/ne.toml" >"$TMP/61" 2>&1
+c=$?
+if [ $c -eq 124 ] && grep -q "bad is in a restart loop, not restarting it (essential = false)" "$TMP/61"; then
+  ok "abandoning a non-essential worker is announced, run continues"
+else bad "non-essential give-up" "exit $c: $(grep -E 'restart loop|stopping' "$TMP/61" | tail -1)"; fi
+
+# 62. recycling is a planned restart, not a failure — it must not trip
+# essential-by-default and take the container down.
+printf '#!/bin/sh\nA=$(head -c 2000000 /dev/zero | tr \\0 x)\nsleep 30\n' >"$TMP/bin/hog"
+chmod +x "$TMP/bin/hog"
+cat > "$TMP/rc.toml" <<TOML
+max_restarts = -1
+workers = ["$TMP/bin/hog"]
+[worker.hog]
+max_rss_mb = 1
+TOML
+timeout 14 "$MANDOR" --config="$TMP/rc.toml" >"$TMP/62" 2>&1
+c=$?
+n=$(grep -c "recycling hog" "$TMP/62")
+if [ $c -eq 124 ] && [ "$n" -ge 1 ] && ! grep -q "stopping all" "$TMP/62"; then
+  ok "recycling does not trip essential-by-default ($n recycles)"
+else bad "recycle vs essential" "exit $c, recycles $n: $(grep stopping "$TMP/62" | head -1)"; fi
+
 echo
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]
