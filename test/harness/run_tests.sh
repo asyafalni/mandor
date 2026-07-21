@@ -10,8 +10,17 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 pass=0 fail=0
 
+FAILED_NAMES=""
 ok()   { pass=$((pass+1)); echo "ok   $1"; }
-bad()  { fail=$((fail+1)); echo "FAIL $1 — $2"; }
+# Record the name as well as printing it. A failure that scrolls past, or
+# gets cut by a `tail`, is a failure nobody can diagnose afterwards --
+# which is exactly how one transient here went unexplained.
+bad()  {
+  fail=$((fail+1)); echo "FAIL $1 — $2"
+  FAILED_NAMES="$FAILED_NAMES$1\n"
+  [ -n "$MANDOR_FAILLOG" ] && printf '%s\t%s\n' "$1" "$2" >> "$MANDOR_FAILLOG"
+  return 0
+}
 
 # Poll up to ~5s for a pid to disappear (lifecycle assertions are eventual,
 # not instantaneous — a fixed sleep races under a loaded CI runner).
@@ -797,6 +806,101 @@ c=$?
 if [ $c -eq 124 ]; then ok "a fleet with no essential worker keeps supervising"
 else bad "no-essential fleet" "exit $c (expected 124)"; fi
 
+# 65. relay ships a real incident to a listening socket, and what lands there
+# is valid JSON with the verdict escaped exactly once. This is the case that
+# would have caught the double-escape: verdict is stored already-escaped, so
+# escaping it again put literal backslashes in the operator's incident text.
+cat > "$TMP/b65.json" <<'JSON'
+{"v":7,"name":"api","kind":"signal","release":"api@1.4.2","verdict":"go panic: said \"boom\" in main.crash"}
+JSON
+# A real listener rather than `nc`: `nc -q N` quits N seconds after EOF on
+# *stdin*, which in a script is immediate, so it would tear itself down
+# whether or not relay had connected yet. This binds an ephemeral port (no
+# collisions), publishes it as a readiness signal (no fixed sleep), reads
+# exactly Content-Length bytes (no short capture), and answers 200 so relay's
+# success path is exercised too.
+cat > "$TMP/listen65.py" <<'PY'
+import socket, sys
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(1)
+srv.settimeout(20)
+with open(sys.argv[1], "w") as f:
+    f.write(str(srv.getsockname()[1]))
+conn, _ = srv.accept()
+buf = b""
+while True:
+    head, sep, body = buf.partition(b"\r\n\r\n")
+    if sep:
+        clen = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                clen = int(line.split(b":", 1)[1])
+        if len(body) >= clen:
+            break
+    chunk = conn.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+conn.close()
+sys.stdout.buffer.write(buf.partition(b"\r\n\r\n")[2])
+PY
+rm -f "$TMP/65port"
+python3 "$TMP/listen65.py" "$TMP/65port" > "$TMP/65body" 2>"$TMP/65lerr" &
+lpid=$!
+for _ in $(seq 1 100); do [ -s "$TMP/65port" ] && break; sleep 0.1; done
+p65=$(cat "$TMP/65port" 2>/dev/null)
+if [ -z "$p65" ]; then
+  bad "relay otlp json" "listener never bound (harness setup): $(head -2 "$TMP/65lerr")"
+else
+"$MANDOR" relay "$TMP/b65.json" "127.0.0.1:$p65" >"$TMP/65out" 2>&1; rc65=$?
+wait $lpid 2>/dev/null
+verdict=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1], "rb"))
+lr = d["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]
+print(lr["body"]["stringValue"])
+' "$TMP/65body" 2>"$TMP/65err")
+if [ "$verdict" = 'go panic: said "boom" in main.crash' ] && [ $rc65 -eq 0 ]; then
+  ok "relay ships valid OTLP JSON with the verdict escaped once"
+else bad "relay otlp json" "rc=$rc65 got [$verdict]; $(head -2 "$TMP/65err")"; fi
+fi
+
+# 66. an oversize bundle is refused loudly, not shipped truncated. Nothing
+# unit-testable reaches readFile, so this is the only cover for that path.
+python3 -c '
+import sys
+pad = "x" * (300 * 1024)
+sys.stdout.write("{\"v\":7,\"name\":\"api\",\"verdict\":\"" + pad + "\"}")
+' > "$TMP/b66.json"
+"$MANDOR" relay "$TMP/b66.json" 127.0.0.1:19466 >"$TMP/66" 2>&1
+c=$?
+if [ $c -ne 0 ] && grep -q "refusing to ship a truncated incident" "$TMP/66"; then
+  ok "oversize bundle is refused, not silently truncated"
+else bad "oversize bundle" "exit $c: $(head -2 "$TMP/66")"; fi
+
+# 67. a hand-edited bundle with a broken escape is refused rather than
+# splicing invalid JSON into the payload photon stores.
+printf '%s' '{"v":7,"name":"a\qb","verdict":"x"}' > "$TMP/b67.json"
+"$MANDOR" relay "$TMP/b67.json" 127.0.0.1:19467 >"$TMP/67" 2>&1
+c=$?
+if [ $c -ne 0 ] && grep -q "malformed JSON string escape" "$TMP/67"; then
+  ok "bundle with a broken escape is refused"
+else bad "malformed bundle" "exit $c: $(head -2 "$TMP/67")"; fi
+
+# 68. a bad endpoint is rejected before any socket work, with its own code.
+"$MANDOR" relay "$TMP/b65.json" "not-an-ip:4318" >"$TMP/68" 2>&1
+c=$?
+if [ $c -eq 2 ] && grep -q "want ip:port" "$TMP/68"; then
+  ok "bad photon endpoint is rejected with exit 2"
+else bad "bad endpoint" "exit $c: $(head -2 "$TMP/68")"; fi
+
 echo
+if [ $fail -ne 0 ]; then
+  echo "failing cases:"
+  printf "$FAILED_NAMES" | sed 's/^/  - /'
+fi
 echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

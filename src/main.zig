@@ -376,6 +376,10 @@ test {
     _ = @import("caps.zig");
     _ = @import("cost.zig");
     _ = @import("fuzz.zig");
+    // relay.zig is only @imported inside a subcommand branch, so it never
+    // reaches the test graph on its own — which is exactly why it shipped
+    // with no coverage. Reference it explicitly.
+    _ = @import("relay.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

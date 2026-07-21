@@ -170,7 +170,7 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 | 42 ✅ | Route a failed spawn through the death path (fixes fork-retry, `essential`, `oneshot`) | S | ● ● ● ● | SHIPPED v1.2.0 — all 3 defects fixed by one structural change; +496 B. See below |
 | 43 ✅ | Exit once all *essential* workers are done | XS | ● ● ● ○ | SHIPPED v1.4.0 — the loop-exit test asks it of essential workers only; sidecars are drained and the exit code is the essential outcome |
 | 44 ✅ | Per-worker `expected_exit` | XS | ● ● ○ ○ | SHIPPED v1.3.0 |
-| 45 | `relay.zig` has no test coverage | S | ● ● ● ○ | PARKED 2026-07-21 — zero fuzz targets, zero harness cases; parses two untrusted inputs |
+| 45 ✅ | `relay.zig` has no test coverage | S | ● ● ● ○ | SHIPPED v1.5.2 — root cause was test-graph invisibility: `relay.zig` is only `@import`ed inside a subcommand branch, so it never reached `zig build test`. Now referenced explicitly: 7 unit tests + 3 fuzz targets + 4 harness cases against a real socket. Found 3 real bugs — verdict double-escaping, silent 256KB truncation, a silent send failure. +1616 bytes. |
 | 46 ✅ | `supervisor.run` is very large | M | ● ● ○ ○ | SHIPPED v1.5.0 — six steps; `run` 451 → 208 lines, binary −5,152 B, perf neutral |
 | 47 ✅ | Post-death group sweep can cut short a grandchild's own TERM handler | S | ● ● ○ ○ | SHIPPED v1.5.1 — sweep is now conditional on supervising-vs-shutting-down; `Worker.pgid` outlives the reap so stop-grace still reaches orphaned groups. Case 13 now 6/6 under the load that failed it ~1-in-5. +160 bytes. |
 

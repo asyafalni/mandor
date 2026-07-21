@@ -59,6 +59,13 @@ the CLI too. Auth: set `PHOTON_TOKEN` in the environment and the relay sends
 `Authorization: Bearer …`. The generic `on_incident` hook remains for custom
 tooling and the premium sidecar.
 
+The relay refuses rather than ships a payload it cannot vouch for, and says
+which on stderr: a bundle over 256KB (`refusing to ship a truncated
+incident` — a clipped incident stored forever is worse than a missing one),
+and a bundle whose JSON string escapes are broken (`malformed JSON string
+escape`, which means the file was truncated mid-write or hand-edited). A bad
+`ip:port` exits 2 before any socket work; there is no name resolution.
+
 > **Status: still blocked. Re-verified 2026-07-21** against
 > `crates/photon-ingest/src/http.rs` on photon `main`. `decode_export_request`
 > is unchanged — `prost::Message::decode(body)`, protobuf only, and the handler

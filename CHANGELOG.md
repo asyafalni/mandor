@@ -3,6 +3,46 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.2] - 2026-07-21
+
+### Fixed
+- **Incident verdicts reached photon with literal backslashes.** `relay` scans
+  values out of a bundle that the spool writer already escaped, then escaped
+  them a second time — so an incident reading `go panic: said "boom"` shipped
+  as `said \"boom\"`. Scanned values are now copied through as the JSON source
+  they already are, and validated on the way: a bundle with a broken escape is
+  refused rather than spliced into the payload. (The whole-bundle copy is still
+  escaped — that one really is raw JSON embedded as a string.)
+- **`relay` silently truncated any bundle at 256KB.** One un-looped `read()`
+  with no size check, so an oversize or short-read bundle shipped clipped and
+  photon stored it with nobody the wiser. Reads are looped and an oversize
+  bundle is now refused loudly.
+- **A too-large HTTP request failed with no message at all** — `bufPrint`'s
+  error returned exit 1 and printed nothing.
+
+### Added
+- **`relay` has test coverage.** It had none: `relay.zig` is only `@import`ed
+  inside a subcommand branch, so it never entered the test graph — the module
+  was invisible to `zig build test` rather than merely untested. It is now
+  referenced explicitly, with 7 unit tests (endpoint parsing, escape-aware
+  string scanning, severity mapping, refusal paths), 3 fuzz targets over a
+  validated seed bundle, and 4 harness cases that POST to a real socket and
+  parse what lands there. Each fix was mutation-tested: reverting it makes a
+  named test fail.
+- **The harness names its failing cases** in a `failing cases:` block at the
+  end of a run, and in `$MANDOR_FAILLOG` when set. A transient failure here was
+  briefly unexplainable because the only record of *which* case failed was one
+  line in the middle of the output, and the run had been piped through `tail`.
+
+### Test
+- **Harness case 65 was itself racy** (introduced above, caught before release).
+  It listened with `nc -q 1`, which means "quit 1s after EOF on *stdin*" — and
+  in a script stdin is at EOF immediately, so the listener tore itself down
+  whether or not relay had connected. Under load the capture came back empty.
+  Replaced with a listener that binds an ephemeral port, publishes it as a
+  readiness signal, reads exactly `Content-Length` bytes and answers 200 (so
+  relay's success path is covered too). 12/12 clean under CPU+I/O load.
+
 ## [1.5.1] - 2026-07-21
 
 ### Fixed

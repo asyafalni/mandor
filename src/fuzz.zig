@@ -31,6 +31,7 @@ const capture = @import("capture.zig");
 const cli = @import("cli.zig");
 const ring = @import("ring.zig");
 const backoff = @import("backoff.zig");
+const relay = @import("relay.zig");
 
 /// Real crash output — the seeds worth mutating. Doubles as the fixture set
 /// CLAUDE.md calls for.
@@ -507,6 +508,34 @@ fn prng() std.Random.DefaultPrng {
 // seed still listed flags that 1.3 moved to mandor.toml. This test is the
 // guard — it asserts every seed is a *valid* input, so the mutator starts
 // from something that actually reaches the code under test.
+/// A realistic incident bundle, shaped like what `spool` actually writes:
+/// escaped quotes in the verdict, a nested trace, and the keys relay scans
+/// for. Kept valid on purpose — a seed that fails to build is a seed that
+/// fuzzes an early return and makes the suite greener, not stronger.
+const relay_seed =
+    "{\"v\":7,\"ts\":\"2026-07-17T22:47:03Z\",\"name\":\"api\",\"kind\":\"signal\"," ++
+    "\"release\":\"api@1.4.2\",\"pid\":42,\"restarts\":3," ++
+    "\"trace\":{\"lang\":\"go\",\"frames\":[\"main.crash\"]}," ++
+    "\"verdict\":\"go panic: said \\\"boom\\\" in main.crash\"}";
+
+/// relay re-parses a bundle it did not write: the file outlives mandor, sits
+/// on disk between runs, and may be truncated or hand-edited. It must either
+/// emit a well-formed record or refuse — never splice broken JSON into the
+/// payload it ships.
+fn relayTarget(bytes: []const u8) void {
+    const body = relay.buildOtlp(bytes) catch return;
+    // Whatever came out must survive as a JSON string body: it must never end
+    // mid-escape, which is what a spliced-in truncated value would produce.
+    var i: usize = 0;
+    var ends_mid_escape = false;
+    while (i < body.len) : (i += 1) {
+        if (body[i] != '\\') continue;
+        i += 1;
+        ends_mid_escape = i >= body.len;
+    }
+    std.debug.assert(!ends_mid_escape);
+}
+
 test "seed valid: cli args" {
     var storage: [cli.max_workers][]const u8 = undefined;
     var slots: [24][]const u8 = undefined;
@@ -626,6 +655,34 @@ test "fuzz: bundle serializer survives adversarial input" {
     for (0..iterations) |i| {
         const seed = corpus[i % corpus.len];
         bundleTarget(rnd, mutate(rnd, seed, &buf));
+    }
+}
+
+test "seed valid: relay bundle" {
+    // Guards the trap named above: prove the seed really builds a record
+    // before spending iterations mutating it.
+    const body = try relay.buildOtlp(relay_seed);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stringValue\":\"api\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "api@1.4.2") != null);
+    // ...and that the verdict arrived singly-escaped, not doubled.
+    const head = body[0..std.mem.indexOf(u8, body, "mandor.bundle").?];
+    try std.testing.expect(std.mem.indexOf(u8, head, "said \\\"boom\\\"") != null);
+}
+
+test "fuzz: relay bundle scanner survives a mutated incident file" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |_| relayTarget(mutate(rnd, relay_seed, &buf));
+}
+
+test "fuzz: photon endpoint parser survives garbage" {
+    var p = prng();
+    const rnd = p.random();
+    const seeds = [_][]const u8{ "127.0.0.1:4318", "255.255.255.255:65535", "0.0.0.0:1" };
+    for (0..iterations) |i| {
+        const spec = mutate(rnd, seeds[i % seeds.len], &buf);
+        // No crash, and a success must round-trip through the octet rule.
+        if (relay.parseHostPort(spec)) |hp| std.debug.assert(hp.port <= 65535);
     }
 }
 
