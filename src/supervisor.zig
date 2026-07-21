@@ -241,13 +241,10 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         _ = incident.setPhoton(endpoint);
         logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
     }
-    var give_up_code: ?u8 = null;
 
     var waiting: [cli.max_workers]bool = .{false} ** cli.max_workers;
 
-    var shutting_down = false;
-    var kill_escalated = false;
-    var shutdown_deadline_ms: u64 = 0;
+    var sd: Shutdown = .{};
     const run_start_ms = nowMs();
     var next_sample_ms: u64 = run_start_ms + sampler.interval_ms;
     var sample_tick: u32 = 0;
@@ -319,8 +316,8 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // `live` counts every worker, so a shutdown still drains sidecars
         // before exiting; only the decision to *start* shutting down keys off
         // the essential ones.
-        if (live == 0 and (shutting_down or pending == 0)) break;
-        if (!shutting_down and any_essential and essential_busy == 0) {
+        if (live == 0 and (sd.active or pending == 0)) break;
+        if (!sd.active and any_essential and essential_busy == 0) {
             // Every essential worker has finished. Nothing the container is
             // for is still running, so stop the sidecars gracefully and exit
             // rather than idling forever behind a process that never ends.
@@ -334,13 +331,13 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                 if (w.essential and w.final_code > essential_code) essential_code = w.final_code;
             }
             logmod.print("[mandor] all essential workers finished; stopping the rest\n", .{});
-            beginShutdown(workers, &waiting, envp, path_env, &shutting_down, &shutdown_deadline_ms, &give_up_code, nowMs(), cfg.stop_grace_ms, essential_code);
+            beginShutdown(&sd, workers, &waiting, envp, path_env, nowMs(), cfg.stop_grace_ms, essential_code);
         }
 
         // Deferred starts: a dependency is "up" once ready (readiness fd) or
         // simply alive for 1 s; a permanently-dead dependency unblocks its
         // dependents rather than deadlocking them.
-        if (!shutting_down) {
+        if (!sd.active) {
             const now_dep = nowMs();
             for (workers, 0..) |*w, i| {
                 if (!waiting[i]) continue;
@@ -365,12 +362,12 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
 
         // Before computing the poll timeout so first probes schedule
         // immediately after a (re)spawn.
-        if (!shutting_down) runHealth(cfg, workers, state_dir, envp, path_env);
+        if (!sd.active) runHealth(cfg, workers, state_dir, envp, path_env);
 
         var wake_at: u64 = next_sample_ms;
-        if (!shutting_down and next_deadline != 0 and next_deadline < wake_at)
+        if (!sd.active and next_deadline != 0 and next_deadline < wake_at)
             wake_at = next_deadline;
-        if (!shutting_down) {
+        if (!sd.active) {
             for (workers) |*w| {
                 if (!w.has_health or w.pid == 0) continue;
                 if (w.health_pid != 0) {
@@ -381,10 +378,10 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                 }
             }
         }
-        if (shutting_down and !kill_escalated and shutdown_deadline_ms != 0 and
-            shutdown_deadline_ms < wake_at)
-            wake_at = shutdown_deadline_ms;
-        if (!shutting_down) {
+        if (sd.active and !sd.killed and sd.deadline_ms != 0 and
+            sd.deadline_ms < wake_at)
+            wake_at = sd.deadline_ms;
+        if (!sd.active) {
             for (0..workers.len) |i| {
                 if (!waiting[i]) continue;
                 const di = dep_of[i] orelse continue; // oneshot-gated: chld-driven
@@ -449,9 +446,9 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         const ev = sigs.drain();
 
         if (ev.term_or_int) |sig| {
-            if (!shutting_down) {
-                shutting_down = true;
-                shutdown_deadline_ms = nowMs() + cfg.stop_grace_ms;
+            if (!sd.active) {
+                sd.active = true;
+                sd.deadline_ms = nowMs() + cfg.stop_grace_ms;
                 logmod.print("[mandor] SIG{t} received, forwarding to workers\n", .{sig});
                 stopWorkers(workers, envp, path_env, sig);
                 for (workers, 0..) |*w, i| {
@@ -459,16 +456,16 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                     waiting[i] = false;
                     if (w.pid == 0) w.done = true;
                 }
-            } else if (!kill_escalated) {
-                kill_escalated = true;
+            } else if (!sd.killed) {
+                sd.killed = true;
                 logmod.print("[mandor] second signal, sending SIGKILL\n", .{});
                 killAll(workers);
             }
         }
-        if (shutting_down and !kill_escalated and shutdown_deadline_ms != 0 and
-            nowMs() >= shutdown_deadline_ms)
+        if (sd.active and !sd.killed and sd.deadline_ms != 0 and
+            nowMs() >= sd.deadline_ms)
         {
-            kill_escalated = true;
+            sd.killed = true;
             logmod.print("[mandor] stop-grace expired, sending SIGKILL\n", .{});
             killAll(workers);
         }
@@ -514,7 +511,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                 closePipes(w);
                 logDeath(w);
                 var loop_detected = false;
-                if (!shutting_down and !clean) {
+                if (!sd.active and !clean) {
                     w.det.recordDeath(now);
                     incident.onDeath(state_dir, workers, w, now, oom_hit);
                     if (w.det.restartLoopTriggered(now)) |count| {
@@ -528,13 +525,13 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                     w.done = true;
                     if (clean) {
                         logmod.print("[mandor] init task {s} completed\n", .{w.nameSlice()});
-                    } else if (!shutting_down) {
+                    } else if (!sd.active) {
                         logmod.print("[mandor] init task {s} failed, shutting down\n", .{w.nameSlice()});
-                        beginShutdown(workers, &waiting, envp, path_env, &shutting_down, &shutdown_deadline_ms, &give_up_code, now, cfg.stop_grace_ms, w.final_code);
+                        beginShutdown(&sd, workers, &waiting, envp, path_env, now, cfg.stop_grace_ms, w.final_code);
                     }
                     continue;
                 }
-                if (!shutting_down and was_recycle) {
+                if (!sd.active and was_recycle) {
                     // planned recycle: always come back, immediately
                     w.next_restart_ms = now;
                     continue;
@@ -543,7 +540,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                 // finished. A detected restart loop stops retrying too: the
                 // fail-streak resets after 10s of uptime, so a worker crashing
                 // every 11s would otherwise retry forever and never signal.
-                if (!shutting_down and !clean and !loop_detected and
+                if (!sd.active and !clean and !loop_detected and
                     retriesLeft(cfg.max_restarts, w.fail_streak))
                 {
                     w.cur_delay_ms = backoff.next(w.cur_delay_ms, now -| w.last_start_ms, cfg.backoff_max_ms);
@@ -560,7 +557,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                 // it has stopped trying, because silently abandoning a worker
                 // is the same invisible degradation this release exists to
                 // remove; it is only the *scope* that the opt-out changes.
-                if (w.done and !clean and !shutting_down) {
+                if (w.done and !clean and !sd.active) {
                     // One format string; the varying parts are composed first.
                     // Separate formats each cost their own copy of std.fmt.
                     var why_buf: [48]u8 = undefined;
@@ -578,14 +575,14 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                         "not restarting it (essential = false)";
                     logmod.print("[mandor] {s} {s}, {s}\n", .{ w.nameSlice(), why, what });
                     if (w.essential)
-                        beginShutdown(workers, &waiting, envp, path_env, &shutting_down, &shutdown_deadline_ms, &give_up_code, now, cfg.stop_grace_ms, w.final_code);
+                        beginShutdown(&sd, workers, &waiting, envp, path_env, now, cfg.stop_grace_ms, w.final_code);
                 }
             }
         }
 
         // preStop ordering: a finished drain hook (recorded by the reaper
         // just above) releases its worker's TERM in the same iteration.
-        if (shutting_down) {
+        if (sd.active) {
             for (workers) |*w| {
                 if (w.prestop_done and w.pid > 0) {
                     w.prestop_done = false;
@@ -596,7 +593,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
             }
         }
 
-        if (!shutting_down) {
+        if (!sd.active) {
             const now = nowMs();
             for (workers, 0..) |*w, wi| {
                 if (w.done or w.pid != 0 or w.next_restart_ms == 0 or w.next_restart_ms > now)
@@ -665,7 +662,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     for (workers) |*w| worst = @max(worst, w.final_code);
     // On give-up, report the flapping worker's code — not the TERM fallout
     // from shutting its siblings down.
-    return give_up_code orelse worst;
+    return sd.code orelse worst;
 }
 
 /// Planned recycling (pm2 max_memory_restart heritage): thresholds crossed
@@ -857,24 +854,34 @@ fn expectedFor(w: *const spawner.Worker, cfg: *const cli.Config, code: u8) bool 
 /// first, then TERM, and the stop-grace deadline escalates to KILL. One place
 /// because three call sites (oneshot failure, unretried failure, and the
 /// give-up path) must behave identically.
+/// Mutable shutdown state. One struct because it is one decision: the paths
+/// that can end a run (oneshot failure, unretried failure, all-essential-done,
+/// an external signal) all need the same four fields, and passing them
+/// separately gave every one of them a ten-parameter call.
+const Shutdown = struct {
+    active: bool = false,
+    deadline_ms: u64 = 0,
+    /// Forced exit code, or null to leave the normal worst-code rule alone.
+    code: ?u8 = null,
+    killed: bool = false,
+};
+
+/// Start a graceful fleet shutdown: pre_stop hooks run first, then TERM, and
+/// the stop-grace deadline escalates to KILL. One place because every call
+/// site must behave identically.
 fn beginShutdown(
+    sd: *Shutdown,
     workers: []spawner.Worker,
     waiting: []bool,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
-    shutting_down: *bool,
-    deadline_ms: *u64,
-    give_up_code: *?u8,
     now: u64,
     grace_ms: u64,
-    /// Exit code to force, or null to leave the normal worst-code rule alone
-    /// (used when the run ends because everything finished, not because
-    /// something failed).
     code: ?u8,
 ) void {
-    if (code) |c| give_up_code.* = c;
-    shutting_down.* = true;
-    deadline_ms.* = now + grace_ms;
+    if (code) |c| sd.code = c;
+    sd.active = true;
+    sd.deadline_ms = now + grace_ms;
     stopWorkers(workers, envp, path_env, .TERM);
     for (workers, 0..) |*other, oi| {
         other.next_restart_ms = 0;
