@@ -168,8 +168,10 @@ immutable-infra; config hot-reload (SIGHUP) — same immutable-infra objection
 | # | Item | Cx | Value | Notes |
 |---|------|----|-------|-------|
 | 42 ✅ | Route a failed spawn through the death path (fixes fork-retry, `essential`, `oneshot`) | S | ● ● ● ● | SHIPPED v1.2.0 — all 3 defects fixed by one structural change; +496 B. See below |
-| 43 | Exit once all *significant* workers are gone (OTP `all_significant`) | S | ● ● ● ○ | PARKED 2026-07-20 (user) — the one genuinely missing exit mode; semantics need thought |
-| 44 | Per-worker `expected_exit` | XS | ● ● ○ ○ | PARKED 2026-07-20 — currently global-only |
+| 43 | Exit once all *essential* workers are done | XS | ● ● ● ○ | PARKED, **re-scoped 2026-07-21** — 1.3 answered every open question; now a one-condition change. Still reproducible |
+| 44 ✅ | Per-worker `expected_exit` | XS | ● ● ○ ○ | SHIPPED v1.3.0 |
+| 45 | `relay.zig` has no test coverage | S | ● ● ● ○ | PARKED 2026-07-21 — zero fuzz targets, zero harness cases; parses two untrusted inputs |
+| 46 | `supervisor.run` is very large | M | ● ● ○ ○ | PARKED 2026-07-21 — dominates the size profile and is hard to review |
 
 ### #42 — `fork` failure permanently retires a worker
 
@@ -298,22 +300,57 @@ while at least one of api/worker lives; exit once none do, ignoring sidecars."
 This is OTP 24's `auto_shutdown = all_significant`, and it is the one exit mode
 mandor genuinely lacks.
 
-**Open questions to settle before building:**
+**Re-scoped 2026-07-21 — v1.3 answered every open question.** The four
+concerns below were the reason this was parked; the lifecycle rework resolved
+all of them as a side effect, and what is left is a one-condition change.
 
-- **Which flag marks "significant"?** Reusing `essential` would overload it
-  with two different meanings (any-exits-stops vs all-exited-stops). A separate
-  per-worker flag is clearer but adds a knob — and the simplicity budget says
-  every knob must earn itself.
-- **Which exit code?** With `essential` the leader's code propagates. With N
-  significant workers gone at different times and codes, "worst code" (the
-  existing rule) is the obvious answer but should be stated explicitly.
-- **Interaction with `max_restarts` give-up.** A worker that gave up is
-  permanently dead — does that count as "gone" for this purpose? Almost
-  certainly yes, but it needs to be written down.
-- **Is the default safe?** Changing the default exit condition would be
-  breaking; this should be opt-in.
+| Was open | Answered by 1.3 |
+|---|---|
+| Which flag marks "significant"? | **`essential`** — it now defaults to `true`, so "significant" and "essential" are the same set. No new knob. |
+| Which exit code? | A *failing* essential worker already ends the run with its code. This case is all-essential-workers-*finished*, so the existing worst-code rule applies. |
+| Does a `max_restarts` give-up count as gone? | Moot — an exhausted essential worker already ends the run immediately. |
+| Is the default safe? | Yes. When every worker is essential (the default), "all essential done" is identical to "all done". It only differs once a worker opts out with `essential = false` — which is exactly the sidecar case this targets. |
 
-### #44 — per-worker `expected_exit`
+**Still reproducible on 1.3.1** (`job` exits 0, `sidecar` has
+`essential = false` and never exits): mandor idles indefinitely with no real
+work left.
+
+**Remaining work:** the loop-exit test currently asks "is any worker still
+live or pending"; it should ask that of *essential* workers only. Non-essential
+workers then get TERM'd through the normal graceful shutdown. One condition
+plus a harness case — the design thinking is done.
+
+### #45 — `relay.zig` has no test coverage
+
+The photon bridge (`mandor relay`, run via the `photon = "ip:port"` key) has
+**zero fuzz targets and zero harness cases**, yet it parses two inputs it does
+not control: the `ip:port` config value (`parseHostPort`) and the incident
+bundle read back off disk (`scanStr`, `buildOtlp`).
+
+One inconsistency to check while adding coverage: in `buildOtlp`, `verdict` and
+the embedded `bundle` go through `apEscaped`, but `name` and `release` are
+interpolated into the OTLP JSON with a bare `{s}`. Values reach it already
+escaped (the bundle was written with `appendJsonString`), so it is probably
+fine in practice — but "probably fine by accident" is what the fuzzer is for,
+especially on a corrupt or truncated bundle.
+
+Add the targets to `src/fuzz.zig` with a seed generated from a **real** bundle,
+not hand-written — see the seed-validity rule.
+
+### #46 — `supervisor.run` is very large
+
+The v1.3 size investigation showed `run` dominating the named-symbol profile,
+and it is the function every lifecycle change has to be threaded through. It
+now carries the poll loop, spawn gating, the death path, health probes, the
+sampler tick and shutdown. Splitting the death path and the health path into
+their own functions would help reviewability, and possibly `.text` too, since
+several `std.fmt` instantiations get inlined into it.
+
+Not urgent, and worth doing only alongside a change that already touches the
+loop — a pure refactor of PID 1's core for its own sake carries more risk than
+it removes.
+
+### #44 — per-worker `expected_exit` (SHIPPED v1.3.0)
 
 `expected_exit` is global today, so "exit 2 is fine for `cron` but a failure
 for `api`" is inexpressible. Small and mechanical; slots naturally into
@@ -330,9 +367,9 @@ v0.20). No feature backlog remains.
 **v1.0 fuzz-hardening: done (v1.0.0).** `src/fuzz.zig` mutation-fuzzes the
 whole untrusted-input surface — the six trace parsers, the worker ELF header,
 `mandor.toml`, `/proc` + cgroup text, and mandor's own state files — seeded
-from real crash output in `test/fixtures/`. Across three passes (v1.0.0,
-v1.0.1, v1.0.2) it grew to 12 targets and found **seven** PID-1-fatal traps
-plus a Prometheus label-injection bug and a backoff-cap violation; all fixed
+from real crash output in `test/fixtures/`. It now runs **13 targets** and has
+found **seven** PID-1-fatal traps plus a Prometheus label-injection bug and a
+backoff-cap violation across the v1.0.x passes; all fixed
 and pinned by regression tests. Every one was an integer overflow on a value
 read from an untrusted or persisted source — a malformed worker ELF, a corrupt
 pressure file, a corrupt `history.json` or `cost.json`, `/proc` tick counts,
@@ -360,6 +397,23 @@ discipline used on the fuzzer. Paired with four integration cases for
 hostile environments (corrupt, truncated, and garbage state files; a
 read-only state dir), since bookkeeping failures must never outrank keeping
 PID 1 alive.
+
+**Lifecycle simplification: done (v1.3.0).** `restart` and
+`restart_on_unhealthy` are gone, `max_restarts` is the only retry knob with an
+intuitive encoding (`0` = don't retry, the default; `-1` = forever),
+`essential` defaults to `true` so a failure that exhausts retries always
+reaches the orchestrator, and the CLI is down to four flags with everything
+else a `mandor.toml` key. Per-worker `expected_exit` (#44) shipped alongside as
+the escape valve that makes essential-by-default safe.
+
+**The recurring bug shape, worth remembering:** nearly every real defect found
+in 1.x has been *mandor knowing something is wrong and not saying so* — a
+retired worker, a bypassed `essential`, a failed init task reading as success,
+a hung worker killed and reported as a clean shutdown, an abandoned
+non-essential worker. The design rule that falls out of it is in CLAUDE.md:
+**never absorb a failure the orchestrator should see.** The same shape showed
+up in the test suite itself, where a fuzz seed that fails to parse makes the
+suite greener rather than redder (three occurrences; now guarded).
 
 Remaining non-feature work: a benchmark page vs tini/dumb-init/s6/supervisord,
 distribution (aports/apt/AUR, announcement), and the premium sidecar
