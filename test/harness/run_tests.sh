@@ -897,6 +897,41 @@ if [ $c -eq 2 ] && grep -q "want ip:port" "$TMP/68"; then
   ok "bad photon endpoint is rejected with exit 2"
 else bad "bad endpoint" "exit $c: $(head -2 "$TMP/68")"; fi
 
+# 69. a peer that accepts the connection and then never answers must not wedge
+# relay. It is spawned fire-and-forget and never waited on, so an unbounded
+# read strands the process for the life of the container -- and incidents fire
+# per restart, so a crash loop would strand one stuck relay per crash.
+cat > "$TMP/blackhole69.py" <<'PY'
+import socket, sys, time
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(1)
+with open(sys.argv[1], "w") as f:
+    f.write(str(srv.getsockname()[1]))
+conn, _ = srv.accept()   # accept, then deliberately never respond
+time.sleep(120)
+PY
+rm -f "$TMP/69port"
+python3 "$TMP/blackhole69.py" "$TMP/69port" >/dev/null 2>&1 &
+bh69=$!
+for _ in $(seq 1 100); do [ -s "$TMP/69port" ] && break; sleep 0.1; done
+p69=$(cat "$TMP/69port" 2>/dev/null)
+if [ -z "$p69" ]; then
+  bad "relay timeout" "blackhole listener never bound (harness setup)"
+else
+# Allow well over the internal timeout so a pass means relay gave up on its
+# own, not that `timeout` killed it.
+timeout 40 "$MANDOR" relay "$TMP/b65.json" "127.0.0.1:$p69" >"$TMP/69" 2>&1
+c=$?
+kill $bh69 2>/dev/null; wait $bh69 2>/dev/null
+if [ $c -eq 124 ]; then
+  bad "relay timeout" "relay hung on a non-responding peer (unbounded socket read)"
+elif [ $c -ne 0 ] && grep -q "never answered" "$TMP/69"; then
+  ok "relay gives up on a peer that never answers"
+else bad "relay timeout" "exit $c: $(head -2 "$TMP/69")"; fi
+fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

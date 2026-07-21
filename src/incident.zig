@@ -122,8 +122,14 @@ fn writeTermLog(name: []const u8, cause_str: []const u8, verdict: []const u8) vo
     const fd: i32 = @intCast(rc);
     defer _ = linux.close(fd);
     var buf: [1024]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "mandor: {s} {s} — {s}\n", .{ name, cause_str, verdict }) catch return;
-    _ = linux.write(fd, msg.ptr, @min(msg.len, 4096));
+    // The open above already truncated the file, so bailing out here would
+    // leave `kubectl describe pod` showing an empty termination message —
+    // strictly worse than the verdict being short. Not reachable today
+    // (name <= 32, verdict <= 256), but the destructive open makes silence
+    // the wrong failure mode to leave lying around.
+    const msg = std.fmt.bufPrint(&buf, "mandor: {s} {s} — {s}\n", .{ name, cause_str, verdict }) catch
+        std.fmt.bufPrint(&buf, "mandor: {s} {s}\n", .{ name, cause_str }) catch "mandor: incident\n";
+    _ = linux.write(fd, msg.ptr, msg.len);
 }
 
 pub fn initSnapshot(state_dir: []const u8, environ: [:null]const ?[*:0]const u8) void {

@@ -3,6 +3,33 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.3] - 2026-07-21
+
+### Fixed
+- **`mandor relay` could hang forever on a peer that never answers.** The
+  socket had no timeouts at all, and relay is spawned fire-and-forget — forked,
+  exec'd, never waited on. A collector that accepts the TCP connection and then
+  stalls (a hung ingest, a half-open connection through a firewall, an LB that
+  accepts and never forwards) wedged `read()` permanently. Because incidents
+  fire *per restart*, a crash loop against such a peer stranded one hung relay
+  per crash, without bound, exactly while the container was already failing.
+  `SO_RCVTIMEO`/`SO_SNDTIMEO` now bound every blocking call at 10s.
+  Reproduced with a listener that accepts and sleeps: relay hung until killed;
+  it now exits in ~11s saying so. Pinned by harness case 69.
+- **A signal landing mid-send was reported as a delivery failure.** `write()`
+  returning `EINTR` printed "send failed" and gave up; it now retries.
+- **A timed-out send or read is named as such** instead of being folded into
+  "rejected the payload (no response)", which pointed at the wrong cause.
+
+### Hardened (latent, not reachable today)
+- `writeTermLog` opens `/dev/termination-log` with `TRUNC` and then bailed out
+  if the message exceeded 1024 bytes — which would leave `kubectl describe pod`
+  showing an *empty* termination message rather than a long one. Current bounds
+  (`name` <= 32, `verdict` <= 256) put the maximum near 325 bytes, so it is not
+  reachable; it now degrades to a short form rather than silence, because the
+  destructive open makes silence the wrong failure mode to leave in place.
+  Also dropped a dead `@min(msg.len, 4096)` — `msg` cannot exceed 1024.
+
 ## [1.5.2] - 2026-07-21
 
 ### Fixed

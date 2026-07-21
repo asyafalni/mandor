@@ -9,6 +9,11 @@ const linux = std.os.linux;
 const posix = std.posix;
 const spawner = @import("spawner.zig");
 
+/// Wall-clock ceiling on each blocking socket call. Generous enough that a
+/// merely slow collector still succeeds, short enough that a hung one cannot
+/// strand a process for the life of the container.
+const relay_timeout_s = 10;
+
 var file_buf: [256 * 1024]u8 = undefined;
 var body_buf: [320 * 1024]u8 = undefined;
 var req_buf: [321 * 1024]u8 = undefined;
@@ -202,6 +207,15 @@ fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
     }
     const fd: i32 = @intCast(rc);
     defer _ = linux.close(fd);
+    // Bound every blocking call. relay is spawned fire-and-forget and is never
+    // waited on, so a peer that accepts the connection and then never answers
+    // wedges this process forever — and incidents fire *per restart*, so a
+    // crash loop against a stalled photon would strand one stuck relay per
+    // crash. Timeouts turn that into a reported failure instead.
+    const tv = linux.timeval{ .sec = relay_timeout_s, .usec = 0 };
+    const tvp: [*]const u8 = @ptrCast(&tv);
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, tvp, @sizeOf(linux.timeval));
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, tvp, @sizeOf(linux.timeval));
     var addr: linux.sockaddr.in = .{
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, host),
@@ -225,14 +239,27 @@ fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
     var off: usize = 0;
     while (off < req.len) {
         const n = linux.write(fd, req.ptr + off, req.len - off);
-        if (posix.errno(n) != .SUCCESS) {
-            err("send failed");
-            return 1;
+        switch (posix.errno(n)) {
+            .SUCCESS => {},
+            // A signal landing mid-send is not a delivery failure; retry.
+            .INTR => continue,
+            .AGAIN => {
+                err("send timed out — photon accepted the connection but stopped reading");
+                return 1;
+            },
+            else => {
+                err("send failed");
+                return 1;
+            },
         }
         off += n;
     }
     var resp: [128]u8 = undefined;
     const got = linux.read(fd, &resp, resp.len);
+    if (posix.errno(got) == .AGAIN) {
+        err("photon accepted the connection but never answered (timed out) — see docs/INTEGRATION-PHOTON.md");
+        return 1;
+    }
     if (posix.errno(got) == .SUCCESS and got > 12 and std.mem.eql(u8, resp[9..12], "200")) return 0;
     // Echo the status line: "did not accept the payload" alone gives the
     // operator nothing to act on, and the most likely cause is a receiver that
