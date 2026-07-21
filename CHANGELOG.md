@@ -3,6 +3,41 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.10] - 2026-07-22
+
+### Fixed
+- **PID 1 could panic while diagnosing an fd leak.** `statsAnomaly` compared
+  `last.fds >= first.fds * 4` on `u16` values, so `first.fds * 4` overflowed
+  once a worker held 16,384 or more fds. mandor ships **ReleaseSafe**, where
+  integer overflow is a panic — on the incident path, violating the project's
+  hardest rule (no panics while supervising). PID 1 dying takes the container
+  with it.
+
+  The trigger is the branch's own purpose: this is the fd-leak detector, so a
+  leak severe enough to matter is precisely what crashed it — mandor would die
+  at the moment it was about to explain why the worker was dying. Widened to
+  `u32` before multiplying.
+
+  Reproduced standalone (`thread panic: integer overflow`) before fixing, and
+  mutation-tested after: restoring the `u16` multiply crashes both the new
+  regression test and the fuzz target.
+
+### Added
+- **`diagnose` is now fuzzed with real stats.** `traceTarget` passed `&.{}` for
+  the sample slice on every iteration, which made every branch of
+  `statsAnomaly` unreachable to the fuzzer — that blind spot is how the
+  overflow survived a full fuzzing pass. Samples are now derived from the
+  mutated bytes, including the extremes `/proc` can report.
+- Regression test covering a severe fd leak plus an all-extremes sample set,
+  both killed and not.
+
+### Checked, no change needed
+- `countFds` already clamps with `@min(count, maxInt(u16))`, so the fd count
+  saturates rather than wrapping. Note the consequence: at a saturated 65,535
+  the 4x-growth branch can no longer fire, so an extreme leak is reported by
+  the RSS/other checks rather than the fd one. Inherent to the clamp, not
+  worth extra width.
+
 ## [1.5.9] - 2026-07-22
 
 ### Fixed

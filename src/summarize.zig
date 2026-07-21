@@ -274,7 +274,12 @@ fn statsAnomaly(stats: []const sampler.Sample, killed: bool, buf: *[96]u8) ?[]co
                 (last.rss_kb - first.rss_kb) / 1024,
             }) catch null;
         }
-        if (first.fds > 0 and last.fds >= first.fds * 4 and last.fds > 64) {
+        // Widen before multiplying: `fds` is u16, so `first.fds * 4` overflows
+        // once first.fds >= 16384 — and ReleaseSafe turns that into a panic on
+        // the incident path, killing PID 1 and the container with it. The
+        // trigger is the condition this very branch exists to detect: a severe
+        // fd leak is exactly what pushes fds past 16k.
+        if (first.fds > 0 and @as(u32, last.fds) >= @as(u32, first.fds) * 4 and last.fds > 64) {
             return std.fmt.bufPrint(buf, "fd count climbing ({d} open)", .{last.fds}) catch null;
         }
     }
@@ -363,6 +368,34 @@ pub fn verdictLeak(buf: []u8, growth_mb: u64, minutes: u64) []const u8 {
 }
 
 // ---------------------------------------------------------------- tests
+
+test "statsAnomaly does not overflow on a severe fd leak" {
+    // fds is u16, so `first.fds * 4` overflowed once first.fds >= 16384 and
+    // ReleaseSafe turned that into a panic -- on the incident path, in the
+    // branch whose whole job is spotting an fd leak. A leak bad enough to
+    // matter was the thing that crashed PID 1.
+    var buf: [96]u8 = undefined;
+    const samples = [_]sampler.Sample{
+        .{ .t_ms = 0, .rss_kb = 1024, .cpu_pct = 1, .fds = 16384, .threads = 2 },
+        .{ .t_ms = 1, .rss_kb = 1024, .cpu_pct = 1, .fds = 30000, .threads = 2 },
+        .{ .t_ms = 2, .rss_kb = 1024, .cpu_pct = 1, .fds = 60000, .threads = 2 },
+        .{ .t_ms = 3, .rss_kb = 1024, .cpu_pct = 1, .fds = 65535, .threads = 2 },
+    };
+    _ = statsAnomaly(&samples, false, &buf);
+
+    // Every extreme at once, both killed and not.
+    const maxed = [_]sampler.Sample{
+        .{
+            .t_ms = std.math.maxInt(u64),
+            .rss_kb = std.math.maxInt(u64),
+            .cpu_pct = std.math.maxInt(u16),
+            .fds = std.math.maxInt(u16),
+            .threads = std.math.maxInt(u16),
+        },
+    } ** 4;
+    _ = statsAnomaly(&maxed, true, &buf);
+    _ = statsAnomaly(&maxed, false, &buf);
+}
 
 test "compactor collapses repeats digit-insensitively, keeps order" {
     var c: Compactor(8, 64) = .{};

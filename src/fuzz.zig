@@ -232,7 +232,24 @@ var compactor: summarize.Compactor(32, 128) = .{};
 fn traceTarget(text: []const u8) void {
     const lines = splitLines(text);
     const trace = summarize.extractTrace(lines, &trace_storage);
-    _ = summarize.diagnose(&diag_buf, "signal:SIGSEGV", trace, lines, &.{}, 42, true);
+    // Stats used to be passed as `&.{}` here, which made every branch of
+    // statsAnomaly unreachable to the fuzzer -- that is how a u16 overflow in
+    // the fd-leak check survived. Derive samples from the mutated bytes so the
+    // path is exercised with the extremes /proc can hand back.
+    var stat_samples: [8]sampler.Sample = undefined;
+    for (&stat_samples, 0..) |*sm, i| {
+        const b = if (text.len > 0) text[(i * 7) % text.len] else 0;
+        const wide = @as(u16, b) | (@as(u16, b) << 8);
+        sm.* = .{
+            .t_ms = @as(u64, b) *| 1000,
+            .rss_kb = @as(u64, wide) *| 4096,
+            .cpu_pct = wide,
+            .fds = wide,
+            .threads = wide,
+        };
+    }
+    _ = summarize.diagnose(&diag_buf, "signal:SIGSEGV", trace, lines, &stat_samples, 42, true);
+    _ = summarize.diagnose(&diag_buf, "exit:1", trace, lines, stat_samples[0..1], 0, false);
     _ = summarize.firstErrorLine(lines);
     _ = summarize.signature("exit", "api", summarize.firstErrorLine(lines));
     compactor.reset();
