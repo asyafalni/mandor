@@ -257,7 +257,7 @@ fn runIncidentList(state_dir: []const u8, filter: ?[]const u8, since_ms: ?u64, i
     const report = @import("report.zig");
     const supervisor = @import("supervisor.zig");
     const cutoff_ms: u64 = if (since_ms) |s| supervisor.wallMs() -| s else 0;
-    const n = spool.listIncidents(state_dir, &incident_entries);
+    const n = spool.listIncidents(state_dir, &incident_entries, .newest);
     if (n == 0) {
         logmod.print("[mandor] no incidents in {s}/incidents\n", .{state_dir});
         return 0;

@@ -3,6 +3,26 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.5] - 2026-07-21
+
+### Fixed
+- **Incident pruning could neither see nor count the files it needed to
+  delete.** `listIncidents` keeps the *newest* entries when a directory holds
+  more files than its output buffer — correct for `report --incidents`,
+  backwards for `prune`, which needs the oldest precisely because those are the
+  ones it removes. `prune` also sized the deletion from the *listed* count
+  rather than the real total. With 300 incidents against a 200 cap and a
+  216-entry buffer, one prune deleted 16 files and left 284 — and the 16 it
+  deleted were recent incidents from inside the newest window, while the truly
+  ancient files were never visible to it at all. The retained end is now
+  selectable (`Keep.newest` / `Keep.oldest`), the directory is counted before
+  deleting, and the oldest are removed a window at a time until the cap is met.
+  Same scenario now lands on exactly 200, in one pass.
+
+  Reachable on a persistent volume seeded by an older build, a shared state
+  dir, or a lowered `max_incidents` — anywhere the directory can start out
+  larger than one listing window.
+
 ## [1.5.4] - 2026-07-21
 
 ### Fixed

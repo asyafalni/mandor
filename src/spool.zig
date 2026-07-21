@@ -334,8 +334,14 @@ pub fn write(state_dir: []const u8, in: BundleInput) ?[]const u8 {
 
 pub const DirEntry = struct { key: u64, name: [64]u8, name_len: u8 };
 
+/// Which end to retain when the directory holds more files than `out`.
+/// Reporting wants the newest; pruning wants the oldest, because those are
+/// the ones it is about to delete. Getting this backwards makes prune blind
+/// to exactly the files it exists to remove.
+pub const Keep = enum { newest, oldest };
+
 /// List incident files sorted oldest-first by their epoch-ms prefix.
-pub fn listIncidents(state_dir: []const u8, out: []DirEntry) usize {
+pub fn listIncidents(state_dir: []const u8, out: []DirEntry, keep: Keep) usize {
     var dir_buf: [512]u8 = undefined;
     const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}/incidents", .{state_dir}) catch return 0;
     const rc = linux.openat(linux.AT.FDCWD, dir_z.ptr, .{ .DIRECTORY = true }, 0);
@@ -365,15 +371,23 @@ pub fn listIncidents(state_dir: []const u8, out: []DirEntry) usize {
                 out[n].name_len = @intCast(name.len);
                 n += 1;
             } else {
-                // keep the newest: replace the oldest entry if this is newer
-                var oldest: usize = 0;
+                // Full: evict the entry at the end we are not keeping.
+                var victim: usize = 0;
                 for (out[0..n], 0..) |e, j| {
-                    if (e.key < out[oldest].key) oldest = j;
+                    const worse = switch (keep) {
+                        .newest => e.key < out[victim].key,
+                        .oldest => e.key > out[victim].key,
+                    };
+                    if (worse) victim = j;
                 }
-                if (key > out[oldest].key) {
-                    out[oldest].key = key;
-                    @memcpy(out[oldest].name[0..name.len], name);
-                    out[oldest].name_len = @intCast(name.len);
+                const better = switch (keep) {
+                    .newest => key > out[victim].key,
+                    .oldest => key < out[victim].key,
+                };
+                if (better) {
+                    out[victim].key = key;
+                    @memcpy(out[victim].name[0..name.len], name);
+                    out[victim].name_len = @intCast(name.len);
                 }
             }
         }
@@ -391,20 +405,114 @@ pub fn listIncidents(state_dir: []const u8, out: []DirEntry) usize {
 
 var prune_entries: [max_incidents + 16]DirEntry = undefined;
 
+/// Count incident files without storing them. prune needs the real total: a
+/// listing capped at the buffer size would under-count, and the deletion is
+/// sized from how far over the cap the directory actually is.
+fn countIncidents(state_dir: []const u8) usize {
+    var dir_buf: [512]u8 = undefined;
+    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}/incidents", .{state_dir}) catch return 0;
+    const rc = linux.openat(linux.AT.FDCWD, dir_z.ptr, .{ .DIRECTORY = true }, 0);
+    if (posix.errno(rc) != .SUCCESS) return 0;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var n: usize = 0;
+    var buf: [8192]u8 align(8) = undefined;
+    while (true) {
+        const got = linux.getdents64(fd, &buf, buf.len);
+        if (posix.errno(got) != .SUCCESS or got == 0) break;
+        var off: usize = 0;
+        while (off < got) {
+            const ent: *const linux.dirent64 = @ptrCast(@alignCast(&buf[off]));
+            off += ent.reclen;
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.name)));
+            if (name.len == 0 or name[0] < '0' or name[0] > '9' or name.len > 63) continue;
+            n += 1;
+        }
+    }
+    return n;
+}
+
 /// Delete oldest incidents beyond max_incidents (persistent-volume hygiene).
+///
+/// A directory can hold more incidents than one listing window: a persistent
+/// volume seeded by an older build, a shared state dir, or a lowered
+/// max_incidents. So the total is counted first and the oldest are removed a
+/// window at a time until the cap is met -- rather than deleting
+/// `listed - cap`, which under-counts whenever the listing is full.
 fn prune(state_dir: []const u8) void {
-    const n = listIncidents(state_dir, &prune_entries);
-    if (n <= max_incidents) return;
-    for (prune_entries[0 .. n - max_incidents]) |*e| {
-        var path_buf: [640]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
-            state_dir, e.name[0..e.name_len],
-        }) catch continue;
-        _ = linux.unlinkat(linux.AT.FDCWD, p.ptr, 0);
+    var total = countIncidents(state_dir);
+    if (total <= max_incidents) return;
+    var guard: usize = 0;
+    while (total > max_incidents and guard < 64) : (guard += 1) {
+        const n = listIncidents(state_dir, &prune_entries, .oldest);
+        if (n == 0) return;
+        const del = @min(total - max_incidents, n);
+        var done: usize = 0;
+        for (prune_entries[0..del]) |*e| {
+            var path_buf: [640]u8 = undefined;
+            const p = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
+                state_dir, e.name[0..e.name_len],
+            }) catch continue;
+            if (posix.errno(linux.unlinkat(linux.AT.FDCWD, p.ptr, 0)) == .SUCCESS) done += 1;
+        }
+        if (done == 0) return; // cannot make progress (read-only volume)
+        total -= done;
     }
 }
 
 // ---------------------------------------------------------------- tests
+
+test "prune keeps the newest incidents even when the dir overflows the listing buffer" {
+    // Build a dir with far more incidents than prune_entries holds. This is
+    // reachable on a persistent volume seeded by an older build, a shared
+    // state dir, or a lowered max_incidents -- and the failure is perverse:
+    // the *recent* incidents get deleted while ancient ones become immortal.
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/mandor-prune-{d}", .{linux.getpid()});
+    var inc_buf: [160]u8 = undefined;
+    const inc = try std.fmt.bufPrintZ(&inc_buf, "{s}/incidents", .{dir});
+    _ = linux.mkdirat(linux.AT.FDCWD, dir.ptr, 0o755);
+    _ = linux.mkdirat(linux.AT.FDCWD, inc.ptr, 0o755);
+
+    const total = max_incidents + 100; // comfortably past the listing buffer
+    const first_key: u64 = 1_000_000;
+    for (0..total) |i| {
+        var name_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&name_buf, "{s}/{d}-api.json", .{ inc, first_key + i });
+        const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+        }, 0o644);
+        if (posix.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+    }
+    defer {
+        var after_buf: [max_incidents + 200]DirEntry = undefined;
+        const left = listIncidents(dir, &after_buf, .newest);
+        for (after_buf[0..left]) |*e| {
+            var pb: [256]u8 = undefined;
+            const pp = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ inc, e.name[0..e.name_len] }) catch continue;
+            _ = linux.unlinkat(linux.AT.FDCWD, pp.ptr, 0);
+        }
+        _ = linux.unlinkat(linux.AT.FDCWD, inc.ptr, linux.AT.REMOVEDIR);
+        _ = linux.unlinkat(linux.AT.FDCWD, dir.ptr, linux.AT.REMOVEDIR);
+    }
+
+    prune(dir);
+
+    var after: [max_incidents + 200]DirEntry = undefined;
+    const n = listIncidents(dir, &after, .newest);
+    try std.testing.expect(n <= max_incidents);
+    // The newest incident must survive -- deleting recent incidents while
+    // keeping ancient ones is the specific inversion this guards.
+    var newest: u64 = 0;
+    for (after[0..n]) |*e| newest = @max(newest, e.key);
+    try std.testing.expectEqual(first_key + total - 1, newest);
+    // ...and the very oldest must be gone.
+    var oldest: u64 = std.math.maxInt(u64);
+    for (after[0..n]) |*e| oldest = @min(oldest, e.key);
+    try std.testing.expect(oldest > first_key);
+}
 
 test "iso8601 known dates" {
     var buf: [20]u8 = undefined;
