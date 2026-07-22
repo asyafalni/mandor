@@ -70,7 +70,15 @@ which on stderr: a bundle over 256KB (`refusing to ship a truncated
 incident` — a clipped incident stored forever is worse than a missing one),
 and a bundle whose JSON string escapes are broken (`malformed JSON string
 escape`, which means the file was truncated mid-write or hand-edited). A bad
-`ip:port` exits 2 before any socket work; there is no name resolution.
+endpoint exits 2 before any socket work.
+
+The endpoint may be `ip:port` **or** `hostname:port` — names go through
+`/etc/hosts` first, then DNS, which is what makes `photon = "photon:4318"`
+work under compose and Kubernetes. mandor is libc-free, so there is no
+`getaddrinfo`: the query is ~90 lines over UDP, with std's pure `DnsResponse`
+parser doing the answer walk and name decompression. `search` domains from
+`resolv.conf` are not applied — a bare name that resolves only through a search
+suffix will not be found.
 
 Delivery is bounded and any 2xx counts as accepted. Every blocking socket call
 times out after 10s: the relay is spawned fire-and-forget and never waited on,
@@ -110,19 +118,20 @@ reporting a rejection. `202 Accepted` is treated as success, not failure.
 > `PHOTON_TOKEN` redacted in the captured env. Reproduce with
 > `bash test/photon/e2e.sh`.
 >
-> **Two limitations the live run exposed**, neither visible from reading code:
+> **Two limitations the live run exposed — both fixed in v1.6.2**, and neither
+> was visible from reading the code:
 >
-> 1. **`photon = "hostname:4318"` is rejected** — the key takes a literal
->    `ip:port` and mandor does no name resolution. In compose or Kubernetes you
->    address a service by *name*, which is what the deployment sketch below
->    implies, so that sketch does not work as written. Use an IP, or resolve the
->    name yourself and pass it in.
-> 2. **The relay is fire-and-forget and mandor exits immediately when a fatal
->    crash ends the run** — so the container can be torn down before delivery
->    finishes. It works when mandor keeps supervising (restarts, or other live
->    workers); a single-worker container that dies on first crash may lose the
->    forward. Nothing reports this, because from mandor's side the spawn
->    succeeded.
+> 1. **`photon = "hostname:4318"` used to be rejected**, because the key took a
+>    literal `ip:port`. compose and Kubernetes address services by *name*, which
+>    is exactly what the deployment sketch below shows — so that sketch could
+>    not be written as documented. mandor now resolves names via `/etc/hosts`
+>    then DNS. Known limit: `search` domains in `resolv.conf` are not applied,
+>    so a bare name that only resolves through a search suffix will fail.
+> 2. **A forward could be killed mid-flight.** The relay is a detached child and
+>    mandor exits as soon as a fatal crash ends the run — as PID 1, that took
+>    the relay with it, losing the incident that explained the crash. Nothing
+>    reported it, because the spawn itself had succeeded. Shutdown now waits up
+>    to 2s for in-flight forwards and says so if any are still running.
 
 **Historical note (2026-07-18 → 2026-07-22):** the original recon framed this
 as a photon-side gap and specced an afternoon of Rust to add OTLP/JSON ingest

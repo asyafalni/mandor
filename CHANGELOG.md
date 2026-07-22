@@ -3,6 +3,50 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.6.2] - 2026-07-22
+
+Both limitations the 1.6.1 end-to-end run exposed, fixed — and both were in
+mandor, not photon.
+
+### Added
+- **`photon` accepts a hostname, not just an IP.** compose and Kubernetes
+  address services by name, so `photon = "photon:4318"` — exactly what the
+  deployment sketch documents — was rejected outright before this. New
+  `src/resolve.zig` resolves via `/etc/hosts` then DNS.
+
+  No dependency was added. mandor is libc-free so there is no `getaddrinfo`,
+  and std's own resolver (`std.Io.net.HostName.lookup`) dispatches through the
+  `std.Io` vtable, which would mean adopting an event loop and allocator this
+  binary does not have. What std *does* provide standalone is the part worth
+  not rewriting: `DnsResponse` is a pure parser — no I/O, no allocator — so it
+  does the answer walk and name decompression, and the ~90 lines here are the
+  easy half (hosts file, `resolv.conf`, one UDP A query).
+
+  Two libraries were evaluated and rejected: **zio** has real DNS but is a
+  17,000-line async runtime whose `dns/` imports its `net`/`time`/`common`
+  modules, so it is not cherry-pickable; **zig-network** resolves through
+  `getaddrinfo` behind `builtin.link_libc`, which a libc-free static binary
+  cannot use.
+
+  Known limit: `search` domains from `resolv.conf` are not applied, so a bare
+  name that resolves only through a search suffix will not be found.
+  Cost: +3,584 bytes.
+
+### Fixed
+- **An incident forward could be killed mid-flight.** `on_incident` and
+  `photon` spawn detached children, and mandor exits as soon as a fatal crash
+  ends the run — as PID 1 that took the relay down with it, losing the very
+  incident that explained the crash. Nothing reported it, because from mandor's
+  side the spawn had succeeded. `spawnDetached` now returns the pid, live
+  forwards are tracked, and shutdown waits up to 2s for them, saying so if any
+  are still running. Bounded on purpose: supervision outranks bookkeeping, so a
+  wedged hook costs a moment rather than hanging PID 1. Cost: +1,360 bytes.
+
+### Verified
+- `test/photon/e2e.sh` now addresses photon **by container name** — the case
+  that failed with "invalid photon endpoint" — and passes 5/5 end to end.
+  144/144 unit, 73/73 harness, 6/6 container. 259,056 → 264,000 bytes.
+
 ## [1.6.1] - 2026-07-22
 
 ### Verified

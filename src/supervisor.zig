@@ -416,6 +416,21 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
 
     report.writeState(state_dir, workers, nowMs());
     cost.save(state_dir);
+
+    // An incident forward is a detached child, and mandor is PID 1 in a
+    // container: exiting now kills whatever is still shipping the very
+    // incident that explains this crash. Give them a moment — bounded, because
+    // supervision outranks bookkeeping and a wedged hook must not hang PID 1.
+    // Long enough for a relay to finish a local round trip (resolve, connect,
+    // POST); short enough that a wedged hook costs a moment, not the container.
+    const forward_drain_ms: u64 = 2000;
+    const stranded = incident.drainForwards(forward_drain_ms);
+    if (stranded > 0) {
+        logmod.print("[mandor] {d} incident forward(s) still running after {d}ms; exiting anyway\n", .{
+            stranded, forward_drain_ms,
+        });
+    }
+
     emitDigest(workers, run_start_ms);
 
     var worst: u8 = 0;

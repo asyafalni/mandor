@@ -71,7 +71,7 @@ fn fireHook(bundle_path: []const u8) void {
     hook_path_buf[bundle_path.len] = 0;
     hook_argv[hook_argc] = @ptrCast(&hook_path_buf);
     hook_argv[hook_argc + 1] = null;
-    spawner.spawnDetached(@ptrCast(&hook_argv), snap_environ.ptr, snap_path_env);
+    noteForward(spawner.spawnDetached(@ptrCast(&hook_argv), snap_environ.ptr, snap_path_env));
 }
 
 // photon auto-forward: enabled ONLY by the `photon` config key — mandor
@@ -98,7 +98,73 @@ fn firePhoton(bundle_path: []const u8) void {
         @ptrCast(&hook_path_buf),
         @ptrCast(&photon_endpoint_buf),
     };
-    spawner.spawnDetached(&argv, snap_environ.ptr, snap_path_env);
+    noteForward(spawner.spawnDetached(&argv, snap_environ.ptr, snap_path_env));
+}
+
+// ------------------------------------------------- in-flight forwards
+//
+// `on_incident` and `photon` run as detached children. mandor is PID 1 in a
+// container, so exiting while one is still talking to a collector kills it and
+// the incident explaining the crash is lost -- silently, because the spawn
+// itself succeeded. Remember the live ones and give them a moment at shutdown.
+
+const max_forwards = 16;
+var forward_pids: [max_forwards]i32 = .{0} ** max_forwards;
+
+fn noteForward(pid: i32) void {
+    if (pid <= 0) return;
+    for (&forward_pids) |*slot| {
+        if (slot.* == 0) {
+            slot.* = pid;
+            return;
+        }
+    }
+    // Table full: a crash loop outrunning its forwards. Drop the oldest rather
+    // than grow -- the newest incident is the one worth waiting for.
+    forward_pids[0] = pid;
+}
+
+/// Reap any forward that has already finished. Called from the supervision
+/// loop so finished children do not sit as zombies between incidents.
+pub fn reapForwards() void {
+    for (&forward_pids) |*slot| {
+        if (slot.* == 0) continue;
+        var st: u32 = undefined;
+        const rc = linux.waitpid(slot.*, &st, linux.W.NOHANG);
+        if (std.posix.errno(rc) == .SUCCESS and rc != 0) slot.* = 0;
+    }
+}
+
+/// Wait up to `budget_ms` for in-flight forwards before mandor exits.
+///
+/// Best-effort by design: supervision outranks bookkeeping, so a hook that
+/// never returns costs the budget and no more. Returns how many were still
+/// running when the budget ran out.
+pub fn drainForwards(budget_ms: u64) usize {
+    var waited: u64 = 0;
+    while (waited < budget_ms) {
+        var live: usize = 0;
+        for (&forward_pids) |*slot| {
+            if (slot.* == 0) continue;
+            var st: u32 = undefined;
+            const rc = linux.waitpid(slot.*, &st, linux.W.NOHANG);
+            if (std.posix.errno(rc) == .SUCCESS and rc != 0) {
+                slot.* = 0;
+            } else {
+                live += 1;
+            }
+        }
+        if (live == 0) return 0;
+        const step: u64 = 20;
+        var ts = linux.timespec{ .sec = 0, .nsec = @intCast(step * 1_000_000) };
+        _ = linux.nanosleep(&ts, &ts);
+        waited += step;
+    }
+    var still: usize = 0;
+    for (forward_pids) |pid| {
+        if (pid != 0) still += 1;
+    }
+    return still;
 }
 
 fn writeBundle(state_dir: []const u8, in: spool.BundleInput) void {

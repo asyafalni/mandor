@@ -8,6 +8,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const spawner = @import("spawner.zig");
+const resolve = @import("resolve.zig");
 
 /// Wall-clock ceiling on each blocking socket call. Generous enough that a
 /// merely slow collector still succeeds, short enough that a hung one cannot
@@ -80,19 +81,11 @@ fn readFile(path: [*:0]const u8) ReadError![]const u8 {
     return file_buf[0..n];
 }
 
-pub fn parseHostPort(spec: []const u8) ?struct { host: u32, port: u16 } {
-    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return null;
-    const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return null;
-    var host: u32 = 0;
-    var it = std.mem.splitScalar(u8, spec[0..colon], '.');
-    var octets: usize = 0;
-    while (it.next()) |o| : (octets += 1) {
-        if (octets == 4) return null;
-        const v = std.fmt.parseInt(u8, o, 10) catch return null;
-        host = (host << 8) | v;
-    }
-    if (octets != 4) return null;
-    return .{ .host = host, .port = port };
+/// `ip:port` or `hostname:port`. Names go through `/etc/hosts` then DNS —
+/// compose and Kubernetes address services by name, so an IP-only endpoint
+/// made the documented deployment impossible to write.
+pub fn parseHostPort(spec: []const u8) ?resolve.HostPort {
+    return resolve.resolve(spec);
 }
 
 fn scanStr(chunk: []const u8, comptime key: []const u8) ?[]const u8 {
@@ -491,17 +484,20 @@ test "parseHostPort accepts and rejects" {
     try testing.expectEqual(@as(u32, 0xffffffff), parseHostPort("255.255.255.255:1").?.host);
     try testing.expectEqual(@as(u16, 65535), parseHostPort("0.0.0.0:65535").?.port);
 
-    // Every rejection path: no port, too few/many octets, out-of-range octet
-    // and port, non-numeric, and a hostname (there is no resolver here).
+    // Structural rejections: no port, out-of-range port, empty. Bad *octets*
+    // are no longer rejected outright — "256.0.0.1" is not a dotted quad, so
+    // it is treated as a name and looked up, which is what lets
+    // `photon = "photon:4318"` work at all.
     try testing.expect(parseHostPort("127.0.0.1") == null);
-    try testing.expect(parseHostPort("127.0.0:4318") == null);
-    try testing.expect(parseHostPort("1.2.3.4.5:4318") == null);
-    try testing.expect(parseHostPort("256.0.0.1:4318") == null);
     try testing.expect(parseHostPort("127.0.0.1:65536") == null);
     try testing.expect(parseHostPort("127.0.0.1:") == null);
-    try testing.expect(parseHostPort("localhost:4318") == null);
     try testing.expect(parseHostPort("") == null);
     try testing.expect(parseHostPort(":") == null);
+    try testing.expect(parseHostPort(":4318") == null);
+
+    // Name resolution itself is tested in resolve.zig, where the parsing is
+    // pure. Exercising it here would depend on the machine's /etc/hosts and
+    // could put a real 3s DNS query in the unit-test path.
 }
 
 test "scanStr walks escapes and stops at the real closing quote" {

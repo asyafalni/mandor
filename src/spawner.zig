@@ -586,18 +586,22 @@ fn execChild(
 
 /// Fire-and-forget child (incident hooks): inherits stdio, own signal mask
 /// restored; reaped later as an ordinary orphan.
+/// Fork+exec a side process (incident hook, photon relay). Returns its pid so
+/// the caller can wait for it at shutdown -- mandor is PID 1 in a container,
+/// so exiting while one is mid-flight kills it. 0 means the fork failed.
 pub fn spawnDetached(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
-) void {
+) i32 {
     const rc = linux.fork();
-    if (posix.errno(rc) != .SUCCESS) return;
+    if (posix.errno(rc) != .SUCCESS) return 0;
     if (rc == 0) {
         const empty = posix.sigemptyset();
         posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
         execArgv(argv, envp, path_env);
     }
+    return @intCast(rc);
 }
 
 /// exec with PATH candidates; never returns (127 on total failure).

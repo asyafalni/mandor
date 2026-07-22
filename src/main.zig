@@ -374,6 +374,7 @@ test {
     // reaches the test graph on its own — which is exactly why it shipped
     // with no coverage. Reference it explicitly.
     _ = @import("relay.zig");
+    _ = @import("resolve.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

@@ -89,15 +89,10 @@ ok "photon is up"
 # the documented integration (one config key), not a hand-run relay.
 APPDIR="$HERE/app"
 cp "$HERE/mandor" "$APPDIR/mandor"
-# mandor's `photon` key takes a literal ip:port and does no name resolution, so
-# the container name cannot be used here. Resolve it to an address instead.
-PHOTON_IP=$("$ENGINE" inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PHOTON" 2>/dev/null | tr -d '\r')
-if [ -z "$PHOTON_IP" ]; then
-  PHOTON_IP=$("$ENGINE" inspect -f '{{.NetworkSettings.IPAddress}}' "$PHOTON" 2>/dev/null | tr -d '\r')
-fi
-if [ -z "$PHOTON_IP" ]; then bad "photon address" "could not resolve container IP"; exit 1; fi
-echo "     photon at $PHOTON_IP:4318"
-sed "s/PHOTON_HOST/$PHOTON_IP/" "$APPDIR/mandor.toml.in" > "$APPDIR/mandor.toml"
+# Address photon by container NAME, not IP. compose and Kubernetes resolve
+# services by name, and mandor rejected that outright until it learned to
+# resolve -- so this line is the regression test for that fix.
+sed "s/PHOTON_HOST/$PHOTON/" "$APPDIR/mandor.toml.in" > "$APPDIR/mandor.toml"
 if ! "$ENGINE" build -t "$APP_IMAGE" "$APPDIR" >"$HERE/appbuild.log" 2>&1; then
   bad "app image" "build failed: $(tail -3 "$HERE/appbuild.log")"
   exit 1
