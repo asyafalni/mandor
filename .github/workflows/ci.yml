@@ -96,6 +96,44 @@ jobs:
             fi
           done
 
+      # The absolute ceiling only fires when the budget is already blown. Size
+      # is lost gradually -- mandor grew 5.4% in one session with every
+      # individual step looking reasonable -- so compare against the previous
+      # commit and make growth an explicit decision rather than a default.
+      #
+      # Escape hatch: put [size] in the commit message when the growth is
+      # intended. The point is to force a sentence of justification, not to
+      # forbid growth.
+      - name: Size delta vs previous commit
+        run: |
+          allow=2048
+          new=$(stat -c%s zig-out/x64/bin/mandor)
+          prev_sha=$(git rev-parse HEAD~1 2>/dev/null || true)
+          if [ -z "$prev_sha" ]; then
+            echo "no parent commit; skipping delta check (size ${new})"
+            exit 0
+          fi
+          git worktree add -q /tmp/prev "$prev_sha" 2>/dev/null || {
+            echo "could not check out parent; skipping delta check"; exit 0; }
+          if (cd /tmp/prev && zig build -Dtarget=x86_64-linux-musl \
+                -Doptimize=ReleaseSafe -p zig-out/x64 >/dev/null 2>&1); then
+            old=$(stat -c%s /tmp/prev/zig-out/x64/bin/mandor)
+            delta=$((new - old))
+            echo "size ${old} -> ${new} (${delta} bytes)"
+            if [ "$delta" -gt "$allow" ]; then
+              if git log -1 --format=%B | grep -q '\[size\]'; then
+                echo "::notice::+${delta} bytes, acknowledged by [size] in the commit message"
+              else
+                echo "::error::binary grew ${delta} bytes (allowance ${allow}). If intended, say why in the commit message and include [size]."
+                git worktree remove --force /tmp/prev 2>/dev/null || true
+                exit 1
+              fi
+            fi
+          else
+            echo "parent did not build; skipping delta check"
+          fi
+          git worktree remove --force /tmp/prev 2>/dev/null || true
+
       - name: Upload binary for distro matrix
         uses: actions/upload-artifact@v4
         with:

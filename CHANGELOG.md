@@ -3,6 +3,42 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.6.3] - 2026-07-22
+
+A pass against the project motto — *push the stability to the sky, light like a
+feather, fast like the flash* — measuring each term instead of assuming it.
+
+### Removed
+- **`validJsonSource` was dead code**, left behind when 1.6.0 replaced it with
+  `unescape` (which validates while decoding). Nothing but its own test called
+  it, so the suite carried a test that could never fail for a reason anyone
+  cares about.
+
+  Verified before deleting, because "unreferenced" and "unneeded" are different
+  claims: whole-repo grep found no call site; the malformed-bundle refusal
+  still fires with the same message; a valid bundle is still accepted; and a
+  mutation that breaks `unescape`'s refusal makes
+  `buildOtlp refuses a bundle with a broken escape` fail. The check is
+  load-bearing — it just lives in one place now instead of two.
+
+  1,171 bytes of source. The stripped binary is unchanged at 264,000, since
+  Zig's lazy compilation already excluded it: the cost was a misleading test,
+  not size.
+
+### CI
+- **Size *delta* gate.** The 500 KB ceiling only fires once the budget is
+  already blown, which is too late to argue about any single change. mandor
+  grew 5.4% in one session (250,456 → 264,000) with every individual step
+  looking reasonable. CI now compares against the previous commit and fails on
+  more than 2 KB of growth unless the commit message says `[size]` — the point
+  being to force a sentence of justification, not to forbid growth.
+
+### Known gap
+- *"Fast like the flash"* remains the one motto term with no evidence. CI has a
+  capture perf gate so the hot path cannot silently regress, but nothing
+  measures mandor against tini, dumb-init, s6 or supervisord. Stability and
+  size are verified; speed is still an assertion.
+
 ## [1.6.2] - 2026-07-22
 
 Both limitations the 1.6.1 end-to-end run exposed, fixed — and both were in

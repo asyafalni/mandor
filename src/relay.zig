@@ -172,35 +172,6 @@ fn unescape(s: []const u8) ?[]const u8 {
     return unesc_buf[start..unesc_pos];
 }
 
-/// Is this already-escaped JSON string source well-formed?
-///
-/// Values from `scanStr` are *source* text the spool writer already escaped.
-/// The protobuf payload carries them verbatim — lengths are explicit, so
-/// there is no escaping and no injection risk — which makes this purely a
-/// corruption check: a trailing backslash, a bad `\u`, or a raw control byte
-/// means the bundle was truncated mid-write or hand-edited, and shipping it
-/// would file a damaged incident rather than report a real one.
-fn validJsonSource(s: []const u8) bool {
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        const c = s[i];
-        if (c < 0x20) return false; // raw control char — should have been escaped
-        if (c != '\\') continue;
-        i += 1;
-        if (i >= s.len) return false; // trailing backslash
-        switch (s[i]) {
-            '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {},
-            'u' => {
-                if (i + 4 >= s.len) return false;
-                for (s[i + 1 ..][0..4]) |h| if (!std.ascii.isHex(h)) return false;
-                i += 4;
-            },
-            else => return false,
-        }
-    }
-    return true;
-}
-
 // ------------------------------------------------------- protobuf encoding
 //
 // OTLP/HTTP requires servers to accept protobuf; JSON support is optional in
@@ -646,12 +617,6 @@ test "buildOtlp refuses a bundle with a broken escape" {
     try testing.expectError(error.Malformed, buildOtlp("{\"name\":\"a\\qb\"}"));
     try testing.expectError(error.Malformed, buildOtlp("{\"name\":\"a\\u00zz\"}"));
     try testing.expectError(error.Malformed, buildOtlp("{\"name\":\"a\\u01\"}"));
-}
-
-test "validJsonSource accepts every legal escape" {
-    try testing.expect(validJsonSource("plain \\\" \\\\ \\/ \\b \\f \\n \\r \\t \\u00e9"));
-    try testing.expect(!validJsonSource("trailing \\"));
-    try testing.expect(!validJsonSource("raw \x01 control"));
 }
 
 test "buildOtlp rejects a bundle too large for the body buffer" {
