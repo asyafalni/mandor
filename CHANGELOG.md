@@ -3,6 +3,74 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.6.0] - 2026-07-22
+
+### Changed
+- **The relay now sends OTLP protobuf instead of OTLP/JSON.** `photon =
+  "ip:port"` had never delivered an incident: photon's `/v1/logs` decodes
+  protobuf only, and mandor sent JSON. For months this was recorded as a
+  photon-side gap awaiting a fix. That framing was wrong — OTLP/HTTP makes
+  **protobuf the mandatory encoding** and JSON the optional one, so mandor was
+  sending an encoding a server *may* support while photon accepted the one it
+  *must*. mandor was the side that could change.
+
+  Switching is the better default independently of photon: a protobuf relay
+  works with any conformant collector, including the many that never
+  implemented JSON. Previously mandor worked with neither.
+
+  The encoder is hand-rolled (~120 lines of varints and length-delimited
+  fields), so the no-dependency rule holds. Field numbers come from
+  `opentelemetry-proto` rather than memory — `time_unix_nano` is `fixed64`,
+  not a varint, exactly the kind of detail that silently corrupts a payload.
+  Sizes are computed bottom-up in one pass and written in a second, because
+  protobuf puts a nested message's length before its bytes and mandor has no
+  allocator to build-then-measure in.
+
+  `Content-Type` is now `application/x-protobuf`. The JSON assembly helpers
+  (`ap`, `apEscaped`) are deleted.
+
+### Fixed
+- **Scanned fields are now JSON-*decoded* before being sent.** `scanStr`
+  returns escaped source text; a JSON payload could carry that verbatim because
+  the consumer unescapes it, but a protobuf string field holds raw bytes.
+  Shipping the source would have put literal backslashes in front of the
+  operator — the 1.5.2 double-escape bug arriving from the opposite direction.
+  Caught by harness case 65 during this change, not after it.
+
+### Testing
+- Unit tests decode the payload the way photon's `mapping.rs` does
+  (`resource_logs → resource/scope_logs → log_records`), so wrong field numbers
+  or wire types fail here rather than at ingest.
+- The relay fuzz target's old invariant ("the body never ends mid-escape")
+  described JSON and fired on the first mutated input. Replaced with a stronger
+  one: the payload must *parse*, with every declared length inside its parent —
+  the failure mode a hand-rolled encoder actually has.
+- Harness case 65 decodes real OTLP protobuf off a socket with a ~25-line
+  reader (no protobuf library), asserting content-type, severity, attribute key
+  and that the verdict survived verbatim.
+- **New `test/photon/e2e.sh`**: crashes a worker, relays the bundle, then
+  queries it back through photon's own API. `/api/search` sits behind a signed
+  session cookie, so it bootstraps a user via `/api/setup` and logs in —
+  without that the query 401s and looks like an ingest failure.
+
+### Not verified
+The live handshake against a running photon is **unconfirmed**. Building
+photon's image needs roughly 10–15 GB of layer headroom and this machine had
+under 7 GB free; the build exhausted the disk and took the container VM with
+it. mandor's half is verified by two independent decoders and matches photon's
+mapping layer, but nobody has yet watched an incident land in a real photon.
+`test/photon/e2e.sh` is written and waiting for a machine with the space.
+
+## [1.5.15] - 2026-07-22
+
+### Docs
+- Re-verified the photon OTLP gap against a fresh clone of `main` (`c393269`)
+  rather than a CDN-cached raw fetch, after photon shipped v1.4.0. photon had
+  moved on — new commits, a release — but the ingest gap was untouched: every
+  `application/json` in the repo is in `photon-alerts` or `photon-api`, none in
+  `photon-ingest`, and no `pbjson`/`with-serde` dependency had been added. That
+  investigation is what prompted the encoding switch in 1.6.0.
+
 ## [1.5.14] - 2026-07-22
 
 ### CI

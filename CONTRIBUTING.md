@@ -47,6 +47,19 @@ CI runs this as its own `pid1` job. The existing `distros` job runs the harness
 still an ordinary process — only making mandor the ENTRYPOINT exercises orphan
 reparenting and process-group signalling as init.
 
+### photon end-to-end
+
+```console
+git clone https://github.com/nevindra/photon && (cd photon && podman build -t photon:latest .)
+bash test/photon/e2e.sh
+```
+
+Everything else verifies mandor's half of the OTLP contract against a listener
+we wrote, which only proves the bytes match *our reading* of photon. This runs
+the real collector: crash a worker, let the relay ship the incident, then query
+it back through photon's own API. It skips unless `photon:latest` is built
+locally, since compiling photon is a multi-minute Rust build.
+
 ### Soak
 
 ```console

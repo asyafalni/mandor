@@ -52,12 +52,18 @@ photon = "127.0.0.1:4318"   # that's the whole integration
 ```
 
 One config key. When set, mandor forwards every incident bundle to photon's
-OTLP/HTTP logs endpoint by fire-and-forget re-exec of its own invisible
-`mandor relay` subcommand — the supervision path never touches a socket,
-and without the key mandor is fully offline. `--photon=ip:port` works on
-the CLI too. Auth: set `PHOTON_TOKEN` in the environment and the relay sends
-`Authorization: Bearer …`. The generic `on_incident` hook remains for custom
-tooling and the premium sidecar.
+OTLP/HTTP logs endpoint as **OTLP protobuf** (`application/x-protobuf`), by
+fire-and-forget re-exec of its own invisible `mandor relay` subcommand — the
+supervision path never touches a socket, and without the key mandor is fully
+offline. `--photon=ip:port` works on the CLI too. Auth: set `PHOTON_TOKEN` in
+the environment and the relay sends `Authorization: Bearer …`. The generic
+`on_incident` hook remains for custom tooling and the premium sidecar.
+
+Protobuf rather than JSON because OTLP/HTTP makes protobuf the mandatory
+encoding and JSON the optional one: the relay therefore works with any
+conformant collector, not just those that implemented both. The encoder is
+hand-rolled (~120 lines of varints and length-delimited fields) so the
+no-dependency rule holds.
 
 The relay refuses rather than ships a payload it cannot vouch for, and says
 which on stderr: a bundle over 256KB (`refusing to ship a truncated
@@ -73,37 +79,33 @@ strand one process per incident — and incidents fire per restart, so a crash
 loop would strand one per crash. A timeout says so explicitly rather than
 reporting a rejection. `202 Accepted` is treated as success, not failure.
 
-> **Status: still blocked. Re-verified 2026-07-22** against a fresh clone of
-> photon `main` (`c393269`), after photon shipped v1.4.0 on 2026-07-21. photon
-> has moved on — new commits, a release — but this gap is untouched:
+> **Status: unblocked as of mandor v1.6.0 — mandor now sends OTLP protobuf.**
 >
-> - `ingest_logs` takes `headers: HeaderMap` yet calls `decode_export_request`
->   unconditionally (`http.rs:77`); `Content-Type` is never consulted for the
->   body format. `trace_http.rs` is the same.
-> - Repo-wide, every `application/json` occurrence is in `photon-alerts`
->   (outbound webhooks) or `photon-api` (REST responses). **Zero** in
->   `photon-ingest`.
-> - No `pbjson` / `with-serde` dependency has been added.
+> For three months this said "blocked, the fix is photon-side". It was the
+> wrong conclusion: photon accepts what the OTLP/HTTP spec makes mandatory
+> (`application/x-protobuf`), and mandor was sending the encoding servers may
+> optionally support. mandor was the side that could change, and changing it
+> is the better default anyway — a protobuf relay works with photon **and**
+> with every collector that never implemented JSON, which is most of them.
 >
-> photon's README describing it as "OTEL-native" refers to the protobuf
-> receivers; it does not imply OTLP/JSON.
+> Verified against a fresh clone of photon `main` (`c393269`, after v1.4.0 on
+> 2026-07-21): `ingest_logs` calls `decode_export_request` — protobuf — and
+> `mapping.rs` reads `resource_logs → resource/scope_logs → log_records`, with
+> `service.name` arriving via resource attributes. That is exactly the shape
+> `relay.zig` now emits, checked by two independent decoders (a Zig reader in
+> the unit tests, a Python one in harness case 65 reading off a real socket).
 >
-> The v1.4.0 release publishes `photon-agent-linux-x86_64` only, not the ingest
-> server, so an end-to-end run of the pair means building photon-ingest from
-> Rust source. Source inspection is used instead because the outcome is not in
-> doubt — the decode error is legible in the handler.
->
-> So `photon = "ip:port"` still fails on every incident: mandor POSTs OTLP/JSON
-> and photon returns a protobuf decode error. The failure is *visible* — the
-> relay inherits mandor's stderr, so `photon rejected the payload …` plus the
-> HTTP status line lands in `docker logs` — but nothing is ingested. Nothing
-> regressed; this has never worked end to end. The fix is photon-side and
-> specified in `docs/photon-contrib/otlp-json-ingest-spec.md`.
+> **Not yet confirmed end to end.** photon's release publishes
+> `photon-agent-linux-x86_64` only, not the ingest server, so running the pair
+> means building `photon-ingest` from Rust source. mandor's half is verified;
+> the handshake against a live photon is not.
 
-**Original photon-side gap (2026-07-18 recon):** photon's `/v1/logs` decodes
-protobuf only; mandor sends OTLP/JSON (which the OTLP spec requires servers
-to accept). The exact, afternoon-sized fix for photon is specced in
-[docs/photon-contrib/otlp-json-ingest-spec.md](photon-contrib/otlp-json-ingest-spec.md).
+**Historical note (2026-07-18 → 2026-07-22):** the original recon framed this
+as a photon-side gap and specced an afternoon of Rust to add OTLP/JSON ingest
+([docs/photon-contrib/otlp-json-ingest-spec.md](photon-contrib/otlp-json-ingest-spec.md)).
+That spec is still valid and still worth doing — the OTLP spec does require
+servers to accept JSON — but it is no longer a prerequisite for this
+integration, and mandor no longer waits on it.
 
 **Proposed OTLP mapping** (for the shim / photon-side importer):
 

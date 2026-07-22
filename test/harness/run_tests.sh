@@ -811,9 +811,12 @@ if [ $c -eq 124 ]; then ok "a fleet with no essential worker keeps supervising"
 else bad "no-essential fleet" "exit $c (expected 124)"; fi
 
 # 65. relay ships a real incident to a listening socket, and what lands there
-# is valid JSON with the verdict escaped exactly once. This is the case that
-# would have caught the double-escape: verdict is stored already-escaped, so
-# escaping it again put literal backslashes in the operator's incident text.
+# is a decodable OTLP protobuf record whose verdict survived verbatim.
+#
+# photon's /v1/logs decodes protobuf only, so this asserts the wire format the
+# collector actually accepts -- and, because protobuf never escapes, that the
+# verdict arrives exactly as the operator wrote it (the 1.5.2 double-escape
+# bug restated for the new encoding).
 cat > "$TMP/b65.json" <<'JSON'
 {"v":7,"name":"api","kind":"signal","release":"api@1.4.2","verdict":"go panic: said \"boom\" in main.crash"}
 JSON
@@ -834,13 +837,17 @@ with open(sys.argv[1], "w") as f:
     f.write(str(srv.getsockname()[1]))
 conn, _ = srv.accept()
 buf = b""
+ctype = b""
 while True:
     head, sep, body = buf.partition(b"\r\n\r\n")
     if sep:
         clen = 0
         for line in head.split(b"\r\n"):
-            if line.lower().startswith(b"content-length:"):
+            low = line.lower()
+            if low.startswith(b"content-length:"):
                 clen = int(line.split(b":", 1)[1])
+            elif low.startswith(b"content-type:"):
+                ctype = line.split(b":", 1)[1].strip()
         if len(body) >= clen:
             break
     chunk = conn.recv(65536)
@@ -849,27 +856,82 @@ while True:
     buf += chunk
 conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 conn.close()
+sys.stderr.write(ctype.decode() + "\n")
 sys.stdout.buffer.write(buf.partition(b"\r\n\r\n")[2])
 PY
+# Minimal OTLP protobuf reader: varint keys, three wire types. No protobuf
+# library, matching mandor's own no-dependency stance.
+cat > "$TMP/decode65.py" <<'PY'
+import sys
+
+def fields(b):
+    i = 0
+    while i < len(b):
+        key = 0; shift = 0
+        while True:
+            c = b[i]; i += 1
+            key |= (c & 0x7F) << shift
+            if not c & 0x80: break
+            shift += 7
+        num, wire = key >> 3, key & 7
+        if wire == 0:
+            v = 0; shift = 0
+            while True:
+                c = b[i]; i += 1
+                v |= (c & 0x7F) << shift
+                if not c & 0x80: break
+                shift += 7
+            yield num, v
+        elif wire == 1:
+            yield num, int.from_bytes(b[i:i+8], "little"); i += 8
+        elif wire == 2:
+            n = 0; shift = 0
+            while True:
+                c = b[i]; i += 1
+                n |= (c & 0x7F) << shift
+                if not c & 0x80: break
+                shift += 7
+            yield num, b[i:i+n]; i += n
+        else:
+            raise ValueError("bad wire type %d" % wire)
+
+def get(b, num):
+    for n, v in fields(b):
+        if n == num: return v
+    raise KeyError(num)
+
+body = open(sys.argv[1], "rb").read()
+rl = get(body, 1)          # resource_logs
+sl = get(rl, 2)            # scope_logs
+rec = get(sl, 2)           # log_records
+print("severity=" + get(rec, 3).decode())
+print("verdict=" + get(get(rec, 5), 1).decode())     # body -> AnyValue.string_value
+kv = get(rec, 6)                                     # attributes
+print("attrkey=" + get(kv, 1).decode())
+print("bundle_len=%d" % len(get(get(kv, 2), 1)))
+print("time_set=%s" % (get(rec, 1) > 0))
+PY
 rm -f "$TMP/65port"
-python3 "$TMP/listen65.py" "$TMP/65port" > "$TMP/65body" 2>"$TMP/65lerr" &
+python3 "$TMP/listen65.py" "$TMP/65port" > "$TMP/65body" 2>"$TMP/65ctype" &
 lpid=$!
 for _ in $(seq 1 100); do [ -s "$TMP/65port" ] && break; sleep 0.1; done
 p65=$(cat "$TMP/65port" 2>/dev/null)
 if [ -z "$p65" ]; then
-  bad "relay otlp json" "listener never bound (harness setup): $(head -2 "$TMP/65lerr")"
+  bad "relay otlp protobuf" "listener never bound (harness setup)"
 else
 "$MANDOR" relay "$TMP/b65.json" "127.0.0.1:$p65" >"$TMP/65out" 2>&1; rc65=$?
 wait $lpid 2>/dev/null
-verdict=$(python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1], "rb"))
-lr = d["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]
-print(lr["body"]["stringValue"])
-' "$TMP/65body" 2>"$TMP/65err")
-if [ "$verdict" = 'go panic: said "boom" in main.crash' ] && [ $rc65 -eq 0 ]; then
-  ok "relay ships valid OTLP JSON with the verdict escaped once"
-else bad "relay otlp json" "rc=$rc65 got [$verdict]; $(head -2 "$TMP/65err")"; fi
+dec=$(python3 "$TMP/decode65.py" "$TMP/65body" 2>"$TMP/65err")
+ctype=$(cat "$TMP/65ctype" 2>/dev/null)
+verdict=$(echo "$dec" | sed -n 's/^verdict=//p')
+sev=$(echo "$dec" | sed -n 's/^severity=//p')
+akey=$(echo "$dec" | sed -n 's/^attrkey=//p')
+if [ "$verdict" = 'go panic: said "boom" in main.crash' ] && [ "$sev" = "ERROR" ] \
+   && [ "$akey" = "mandor.bundle" ] && [ "$rc65" -eq 0 ] \
+   && [ "$ctype" = "application/x-protobuf" ]; then
+  ok "relay ships decodable OTLP protobuf (verdict verbatim, correct content-type)"
+else bad "relay otlp protobuf" \
+  "rc=$rc65 ctype=[$ctype] sev=[$sev] key=[$akey] verdict=[$verdict]; $(head -2 "$TMP/65err")"; fi
 fi
 
 # 66. an oversize bundle is refused loudly, not shipped truncated. Nothing

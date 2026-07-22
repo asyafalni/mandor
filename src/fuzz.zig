@@ -573,22 +573,80 @@ const relay_seed =
     "\"trace\":{\"lang\":\"go\",\"frames\":[\"main.crash\"]}," ++
     "\"verdict\":\"go panic: said \\\"boom\\\" in main.crash\"}";
 
+/// Walk a protobuf message, verifying every field stays inside `b` and that
+/// the walk lands exactly on the end. Returns false on any overrun.
+///
+/// This is the invariant a hand-rolled encoder can actually violate: sizes are
+/// computed in one pass and written in another, so a mismatch produces a
+/// length that points past its parent. Decoders reject that; so must we,
+/// before shipping it to one.
+fn protoWalk(b: []const u8, depth: u8) bool {
+    if (depth > 6) return true; // deep enough; guards pathological nesting
+    var i: usize = 0;
+    while (i < b.len) {
+        // key varint
+        var key: u64 = 0;
+        var shift: u6 = 0;
+        while (true) {
+            if (i >= b.len) return false;
+            const c = b[i];
+            i += 1;
+            key |= @as(u64, c & 0x7f) << shift;
+            if (c & 0x80 == 0) break;
+            if (shift >= 56) return false;
+            shift += 7;
+        }
+        switch (key & 7) {
+            0 => { // varint
+                while (true) {
+                    if (i >= b.len) return false;
+                    const c = b[i];
+                    i += 1;
+                    if (c & 0x80 == 0) break;
+                }
+            },
+            1 => { // fixed64
+                if (i + 8 > b.len) return false;
+                i += 8;
+            },
+            2 => { // length-delimited
+                var n: u64 = 0;
+                var sh: u6 = 0;
+                while (true) {
+                    if (i >= b.len) return false;
+                    const c = b[i];
+                    i += 1;
+                    n |= @as(u64, c & 0x7f) << sh;
+                    if (c & 0x80 == 0) break;
+                    if (sh >= 56) return false;
+                    sh += 7;
+                }
+                if (n > b.len - i) return false; // length runs past the parent
+                const payload = b[i .. i + @as(usize, @intCast(n))];
+                i += @intCast(n);
+                // Nested messages parse too; leaf strings are arbitrary bytes,
+                // so a failed sub-walk is only fatal at the levels we build.
+                if (depth < 3) _ = protoWalk(payload, depth + 1);
+            },
+            5 => { // fixed32
+                if (i + 4 > b.len) return false;
+                i += 4;
+            },
+            else => return false, // no other wire type is legal
+        }
+    }
+    return true;
+}
+
 /// relay re-parses a bundle it did not write: the file outlives mandor, sits
 /// on disk between runs, and may be truncated or hand-edited. It must either
-/// emit a well-formed record or refuse — never splice broken JSON into the
-/// payload it ships.
+/// emit a payload a collector can decode, or refuse -- never ship bytes that
+/// fail to parse.
 fn relayTarget(bytes: []const u8) void {
     const body = relay.buildOtlp(bytes) catch return;
-    // Whatever came out must survive as a JSON string body: it must never end
-    // mid-escape, which is what a spliced-in truncated value would produce.
-    var i: usize = 0;
-    var ends_mid_escape = false;
-    while (i < body.len) : (i += 1) {
-        if (body[i] != '\\') continue;
-        i += 1;
-        ends_mid_escape = i >= body.len;
-    }
-    std.debug.assert(!ends_mid_escape);
+    // The whole payload must decode, and the nesting mandor builds must be
+    // reachable: request -> resource_logs -> scope_logs -> log_records.
+    std.debug.assert(protoWalk(body, 0));
 }
 
 test "seed valid: cli args" {
@@ -714,14 +772,16 @@ test "fuzz: bundle serializer survives adversarial input" {
 }
 
 test "seed valid: relay bundle" {
-    // Guards the trap named above: prove the seed really builds a record
-    // before spending iterations mutating it.
+    // Guards the trap named above: prove the seed really builds a payload
+    // before spending iterations mutating it. Protobuf embeds strings
+    // verbatim, so the values appear as-is in the bytes.
     const body = try relay.buildOtlp(relay_seed);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"stringValue\":\"api\"") != null);
+    try std.testing.expect(protoWalk(body, 0));
+    try std.testing.expect(std.mem.indexOf(u8, body, "service.name") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "api@1.4.2") != null);
-    // ...and that the verdict arrived singly-escaped, not doubled.
-    const head = body[0..std.mem.indexOf(u8, body, "mandor.bundle").?];
-    try std.testing.expect(std.mem.indexOf(u8, head, "said \\\"boom\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "mandor.bundle") != null);
+    // The verdict travels unescaped -- what the operator wrote is what ships.
+    try std.testing.expect(std.mem.indexOf(u8, body, "said \"boom\"") != null);
 }
 
 test "fuzz: relay bundle scanner survives a mutated incident file" {

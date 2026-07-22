@@ -110,36 +110,84 @@ fn scanStr(chunk: []const u8, comptime key: []const u8) ?[]const u8 {
     return null;
 }
 
-fn ap(pos: *usize, comptime fmt: []const u8, args: anytype) bool {
-    const out = std.fmt.bufPrint(body_buf[pos.*..], fmt, args) catch return false;
-    pos.* += out.len;
-    return true;
-}
+/// Scratch for decoded field text. Unescaping only ever shrinks, so this is
+/// sized for the three scanned fields at their source lengths.
+var unesc_buf: [4 * 1024]u8 = undefined;
+var unesc_pos: usize = 0;
 
-fn apEscaped(pos: *usize, s: []const u8) bool {
-    for (s) |c| {
-        const ok = switch (c) {
-            '"' => ap(pos, "\\\"", .{}),
-            '\\' => ap(pos, "\\\\", .{}),
-            0x00...0x1f => ap(pos, "\\u{x:0>4}", .{c}),
-            else => ap(pos, "{c}", .{c}),
-        };
-        if (!ok) return false;
-    }
-    return true;
-}
-
-/// Copy already-escaped JSON string source through verbatim, rejecting
-/// anything that would not survive as the body of a JSON string.
+/// Decode JSON string source into the bytes it denotes.
 ///
-/// Values from `scanStr` are *source* text — the spool writer already escaped
-/// them — so running them through `apEscaped` would escape a second time and
-/// show the operator a literal `\"` where the incident said `"`. Passing them
-/// through raw is correct, but only if they really are well-formed: a bundle
-/// on disk outlives mandor and nothing stops it being edited or half-written,
-/// so a bad escape must be refused rather than splice broken JSON into the
-/// payload.
-fn apJsonSource(pos: *usize, s: []const u8) bool {
+/// `scanStr` hands back *source* text — the spool writer escaped it. A JSON
+/// payload could carry that verbatim because the consumer unescapes it, but a
+/// protobuf string field holds raw bytes: shipping the source would put
+/// literal backslashes in front of the operator, which is the 1.5.2
+/// double-escape bug arriving from the other direction. Returns null if the
+/// text is malformed or does not fit.
+fn unescape(s: []const u8) ?[]const u8 {
+    const start = unesc_pos;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (unesc_pos >= unesc_buf.len) return null;
+        const c = s[i];
+        if (c < 0x20) return null; // raw control byte: source was corrupt
+        if (c != '\\') {
+            unesc_buf[unesc_pos] = c;
+            unesc_pos += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= s.len) return null; // trailing backslash
+        const e = s[i];
+        const lit: u8 = switch (e) {
+            '"' => '"',
+            '\\' => '\\',
+            '/' => '/',
+            'b' => 0x08,
+            'f' => 0x0c,
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => {
+                if (i + 4 >= s.len) return null;
+                var cp: u21 = 0;
+                for (s[i + 1 ..][0..4]) |h| {
+                    const d: u8 = switch (h) {
+                        '0'...'9' => h - '0',
+                        'a'...'f' => h - 'a' + 10,
+                        'A'...'F' => h - 'A' + 10,
+                        else => return null,
+                    };
+                    cp = cp * 16 + d;
+                }
+                i += 4;
+                // Lone surrogates are not encodable; the spool writer only
+                // emits \u for control chars, so treat anything else as
+                // corruption rather than guess.
+                if (cp >= 0xd800 and cp <= 0xdfff) return null;
+                var utf8: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &utf8) catch return null;
+                if (unesc_pos + n > unesc_buf.len) return null;
+                @memcpy(unesc_buf[unesc_pos..][0..n], utf8[0..n]);
+                unesc_pos += n;
+                continue;
+            },
+            else => return null, // not a legal JSON escape
+        };
+        unesc_buf[unesc_pos] = lit;
+        unesc_pos += 1;
+    }
+    return unesc_buf[start..unesc_pos];
+}
+
+/// Is this already-escaped JSON string source well-formed?
+///
+/// Values from `scanStr` are *source* text the spool writer already escaped.
+/// The protobuf payload carries them verbatim — lengths are explicit, so
+/// there is no escaping and no injection risk — which makes this purely a
+/// corruption check: a trailing backslash, a bad `\u`, or a raw control byte
+/// means the bundle was truncated mid-write or hand-edited, and shipping it
+/// would file a damaged incident rather than report a real one.
+fn validJsonSource(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         const c = s[i];
@@ -157,11 +205,102 @@ fn apJsonSource(pos: *usize, s: []const u8) bool {
             else => return false,
         }
     }
-    if (pos.* +| s.len > body_buf.len) return false;
-    @memcpy(body_buf[pos.*..][0..s.len], s);
-    pos.* += s.len;
     return true;
 }
+
+// ------------------------------------------------------- protobuf encoding
+//
+// OTLP/HTTP requires servers to accept protobuf; JSON support is optional in
+// practice and many collectors (photon included) never implemented it. Encoding
+// by hand keeps the no-dependency rule: the wire format is varints plus
+// length-delimited fields, and mandor already hand-rolls its JSON.
+//
+// Field numbers are from opentelemetry-proto (logs/v1, common/v1, resource/v1).
+// All are <= 15, so every tag fits in one byte.
+
+const wire_varint: u8 = 0;
+const wire_fixed64: u8 = 1;
+const wire_len: u8 = 2;
+
+fn tagByte(comptime field: u8, comptime wire: u8) u8 {
+    return (field << 3) | wire;
+}
+
+fn varintLen(v: u64) usize {
+    var n: usize = 1;
+    var x = v >> 7;
+    while (x != 0) : (x >>= 7) n += 1;
+    return n;
+}
+
+/// Bytes taken by `tag + length + payload` for a length-delimited field.
+fn delimLen(payload: usize) usize {
+    return 1 + varintLen(payload) + payload;
+}
+
+const Writer = struct {
+    buf: []u8,
+    pos: usize = 0,
+
+    fn byte(self: *Writer, b: u8) void {
+        self.buf[self.pos] = b;
+        self.pos += 1;
+    }
+
+    fn varint(self: *Writer, v: u64) void {
+        var x = v;
+        while (x >= 0x80) : (x >>= 7) self.byte(@as(u8, @truncate(x)) | 0x80);
+        self.byte(@truncate(x));
+    }
+
+    fn fixed64(self: *Writer, comptime field: u8, v: u64) void {
+        self.byte(tagByte(field, wire_fixed64));
+        var i: usize = 0;
+        while (i < 8) : (i += 1) self.byte(@truncate(v >> @intCast(i * 8)));
+    }
+
+    fn uint(self: *Writer, comptime field: u8, v: u64) void {
+        self.byte(tagByte(field, wire_varint));
+        self.varint(v);
+    }
+
+    /// Opens a length-delimited field whose payload length is already known.
+    fn delim(self: *Writer, comptime field: u8, payload: usize) void {
+        self.byte(tagByte(field, wire_len));
+        self.varint(payload);
+    }
+
+    fn string(self: *Writer, comptime field: u8, s: []const u8) void {
+        self.delim(field, s.len);
+        @memcpy(self.buf[self.pos..][0..s.len], s);
+        self.pos += s.len;
+    }
+};
+
+/// AnyValue{string_value=1}
+fn anyValueLen(v: []const u8) usize {
+    return delimLen(v.len);
+}
+
+/// KeyValue{key=1, value=AnyValue=2}
+fn keyValueLen(k: []const u8, v: []const u8) usize {
+    return delimLen(k.len) + delimLen(anyValueLen(v));
+}
+
+fn putAnyValue(w: *Writer, comptime field: u8, v: []const u8) void {
+    w.delim(field, anyValueLen(v));
+    w.string(1, v); // AnyValue.string_value
+}
+
+fn putKeyValue(w: *Writer, comptime field: u8, k: []const u8, v: []const u8) void {
+    w.delim(field, keyValueLen(k, v));
+    w.string(1, k); // KeyValue.key
+    putAnyValue(w, 2, v); // KeyValue.value
+}
+
+/// OTLP SeverityNumber. Only the two mandor emits.
+const sev_warn: u64 = 13;
+const sev_error: u64 = 17;
 
 const BuildError = error{ TooLarge, Malformed };
 
@@ -174,29 +313,56 @@ pub fn buildOtlp(bundle: []const u8) BuildError![]const u8 {
     const severity: []const u8 = if (std.mem.eql(u8, kind, "leak-suspect") or
         std.mem.eql(u8, kind, "restart-loop")) "WARN" else "ERROR";
 
+    const sev_num: u64 = if (std.mem.eql(u8, severity, "WARN")) sev_warn else sev_error;
+
+    // Decode the scanned fields: they are JSON source, and a protobuf string
+    // holds raw bytes. This both unescapes and validates — a bundle truncated
+    // mid-write or hand-edited fails here rather than filing a damaged
+    // incident. The bundle attribute itself is raw JSON text and ships as-is.
+    unesc_pos = 0;
+    const name_txt = unescape(name) orelse return error.Malformed;
+    const release_txt = unescape(release) orelse return error.Malformed;
+    const verdict_txt = unescape(verdict) orelse return error.Malformed;
+
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &ts);
-    const ns = @as(u128, @intCast(ts.sec)) * 1_000_000_000 + @as(u128, @intCast(ts.nsec));
+    const ns: u64 = @as(u64, @intCast(ts.sec)) *| 1_000_000_000 +| @as(u64, @intCast(ts.nsec));
 
-    var pos: usize = 0;
-    const p = &pos;
-    // `name`, `release` and `verdict` are escaped source text -> copied
-    // through. `bundle` is raw JSON being embedded *as* a string -> escaped.
-    if (!ap(p, "{{\"resourceLogs\":[{{\"resource\":{{\"attributes\":[" ++
-        "{{\"key\":\"service.name\",\"value\":{{\"stringValue\":\"", .{})) return error.TooLarge;
-    if (!apJsonSource(p, name)) return error.Malformed;
-    if (!ap(p, "\"}}}},{{\"key\":\"service.version\",\"value\":{{\"stringValue\":\"", .{}))
-        return error.TooLarge;
-    if (!apJsonSource(p, release)) return error.Malformed;
-    if (!ap(p, "\"}}}}]}},\"scopeLogs\":[{{\"logRecords\":[{{\"timeUnixNano\":\"{d}\"," ++
-        "\"severityText\":\"{s}\",\"body\":{{\"stringValue\":\"", .{ ns, severity }))
-        return error.TooLarge;
-    if (!apJsonSource(p, verdict)) return error.Malformed;
-    if (!ap(p, "\"}},\"attributes\":[{{\"key\":\"mandor.bundle\",\"value\":{{\"stringValue\":\"", .{}))
-        return error.TooLarge;
-    if (!apEscaped(p, bundle)) return error.TooLarge;
-    if (!ap(p, "\"}}}}]}}]}}]}}]}}", .{})) return error.TooLarge;
-    return body_buf[0..pos];
+    // Pass 1: sizes, innermost first. Protobuf writes a nested message's length
+    // *before* its bytes and mandor has no allocator to build-then-measure in,
+    // so two passes over a handful of known fields beats a scratch buffer.
+    const rec_len =
+        9 + // time_unix_nano (fixed64, field 1)
+        9 + // observed_time_unix_nano (fixed64, field 11)
+        1 + varintLen(sev_num) + // severity_number (field 2)
+        delimLen(severity.len) + // severity_text (field 3)
+        delimLen(anyValueLen(verdict_txt)) + // body (field 5)
+        delimLen(keyValueLen("mandor.bundle", bundle)); // attributes (field 6)
+    const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
+    const resource_len =
+        delimLen(keyValueLen("service.name", name_txt)) +
+        delimLen(keyValueLen("service.version", release_txt));
+    const rl_len = delimLen(resource_len) + delimLen(scope_len);
+    const total = delimLen(rl_len); // ExportLogsServiceRequest.resource_logs
+    if (total > body_buf.len) return error.TooLarge;
+
+    // Pass 2: write.
+    var w = Writer{ .buf = &body_buf };
+    w.delim(1, rl_len); // resource_logs
+    w.delim(1, resource_len); //   resource
+    putKeyValue(&w, 1, "service.name", name_txt); //     attributes
+    putKeyValue(&w, 1, "service.version", release_txt);
+    w.delim(2, scope_len); //   scope_logs
+    w.delim(2, rec_len); //     log_records
+    w.fixed64(1, ns); //       time_unix_nano
+    w.fixed64(11, ns); //       observed_time_unix_nano
+    w.uint(2, sev_num); //       severity_number
+    w.string(3, severity); //       severity_text
+    putAnyValue(&w, 5, verdict_txt); //       body
+    putKeyValue(&w, 6, "mandor.bundle", bundle); //       attributes
+
+    std.debug.assert(w.pos == total); // sizing and writing must agree
+    return body_buf[0..w.pos];
 }
 
 /// True only for a genuine HTTP status line reporting 2xx.
@@ -244,7 +410,7 @@ fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
     else
         "";
     const req = std.fmt.bufPrint(&req_buf, "POST /v1/logs HTTP/1.1\r\nHost: photon\r\n" ++
-        "Content-Type: application/json\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+        "Content-Type: application/x-protobuf\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
         auth, body.len, body,
     }) catch {
         err("request too large to send");
@@ -349,34 +515,133 @@ test "scanStr walks escapes and stops at the real closing quote" {
     try testing.expect(scanStr("{\"other\":\"x\"}", "v") == null);
 }
 
-test "buildOtlp does not double-escape scanned values" {
-    // The spool writer stores verdict already escaped, so relay must copy it
-    // through. Escaping again shipped `said \"boom\"` — literal backslashes
-    // in the operator's incident text.
+/// Minimal protobuf reader, test-only. Walks one nesting level and hands back
+/// each field so a test can assert on structure rather than on bytes that
+/// happen to appear somewhere in the payload.
+const Fields = struct {
+    b: []const u8,
+    i: usize = 0,
+
+    const Field = struct { num: u8, wire: u8, bytes: []const u8, int: u64 };
+
+    fn varint(self: *Fields) u64 {
+        var v: u64 = 0;
+        var shift: u6 = 0;
+        while (self.i < self.b.len) {
+            const c = self.b[self.i];
+            self.i += 1;
+            v |= @as(u64, c & 0x7f) << shift;
+            if (c & 0x80 == 0) break;
+            shift += 7;
+        }
+        return v;
+    }
+
+    fn next(self: *Fields) ?Field {
+        if (self.i >= self.b.len) return null;
+        const key = self.varint();
+        const num: u8 = @intCast(key >> 3);
+        const wire: u8 = @intCast(key & 7);
+        switch (wire) {
+            0 => return .{ .num = num, .wire = wire, .bytes = &.{}, .int = self.varint() },
+            1 => {
+                var v: u64 = 0;
+                for (0..8) |k| v |= @as(u64, self.b[self.i + k]) << @intCast(k * 8);
+                self.i += 8;
+                return .{ .num = num, .wire = wire, .bytes = &.{}, .int = v };
+            },
+            2 => {
+                const n: usize = @intCast(self.varint());
+                const out = self.b[self.i .. self.i + n];
+                self.i += n;
+                return .{ .num = num, .wire = wire, .bytes = out, .int = 0 };
+            },
+            else => return null,
+        }
+    }
+
+    /// First field with this number, or null.
+    fn get(b: []const u8, num: u8) ?Field {
+        var it = Fields{ .b = b };
+        while (it.next()) |f| if (f.num == num) return f;
+        return null;
+    }
+};
+
+/// AnyValue{string_value=1}
+fn avStr(b: []const u8) []const u8 {
+    return (Fields.get(b, 1) orelse return "").bytes;
+}
+
+/// Walk request -> resource_logs -> scope_logs -> log_records.
+fn firstRecord(body: []const u8) []const u8 {
+    const rl = Fields.get(body, 1).?.bytes; // resource_logs
+    const sl = Fields.get(rl, 2).?.bytes; // scope_logs
+    return Fields.get(sl, 2).?.bytes; // log_records
+}
+
+test "buildOtlp emits a well-formed OTLP protobuf record" {
+    // photon decodes protobuf only; this walks the payload the way its
+    // mapping layer does, so wrong field numbers or wire types fail here
+    // rather than at ingest.
     const bundle =
         "{\"name\":\"api\",\"kind\":\"crash\"," ++
         "\"verdict\":\"said \\\"boom\\\"\",\"release\":\"v1\"}";
     const body = try buildOtlp(bundle);
-    try testing.expect(std.mem.indexOf(u8, body, "\"stringValue\":\"said \\\"boom\\\"\"") != null);
-    // Scope the "not double-escaped" check to everything *before* the embedded
-    // bundle copy: that copy is raw JSON escaped on purpose, so `\"` correctly
-    // becomes `\\\"` there and would match this pattern legitimately.
-    const head = body[0..std.mem.indexOf(u8, body, "mandor.bundle").?];
-    try testing.expect(std.mem.indexOf(u8, head, "\\\\\"boom") == null);
-    // The bundle copy *is* raw JSON embedded as a string, so it stays escaped.
-    try testing.expect(std.mem.indexOf(u8, body, "{\\\"name\\\":\\\"api\\\"") != null);
+
+    const rl = Fields.get(body, 1).?.bytes;
+    const res = Fields.get(rl, 1).?.bytes; // resource
+    // Resource.attributes: service.name first, then service.version.
+    var attrs = Fields{ .b = res };
+    const a1 = attrs.next().?.bytes;
+    const a2 = attrs.next().?.bytes;
+    try testing.expectEqualStrings("service.name", Fields.get(a1, 1).?.bytes);
+    try testing.expectEqualStrings("api", avStr(Fields.get(a1, 2).?.bytes));
+    try testing.expectEqualStrings("service.version", Fields.get(a2, 1).?.bytes);
+    try testing.expectEqualStrings("v1", avStr(Fields.get(a2, 2).?.bytes));
+
+    const rec = firstRecord(body);
+    // time_unix_nano and observed_time_unix_nano are fixed64 and both set;
+    // photon falls back to the observed time when the event time is 0.
+    try testing.expectEqual(@as(u8, 1), Fields.get(rec, 1).?.wire); // fixed64
+    try testing.expect(Fields.get(rec, 1).?.int > 0);
+    try testing.expectEqual(Fields.get(rec, 1).?.int, Fields.get(rec, 11).?.int);
+    try testing.expectEqual(sev_error, Fields.get(rec, 2).?.int);
+    try testing.expectEqualStrings("ERROR", Fields.get(rec, 3).?.bytes);
+
+    // The verdict arrives as the text the operator wrote. The bundle stores it
+    // JSON-escaped; a protobuf string field holds raw bytes, so relay decodes
+    // it on the way out. Shipping the source instead would put literal
+    // backslashes in front of the operator — the 1.5.2 double-escape bug
+    // arriving from the other direction.
+    try testing.expectEqualStrings(
+        "said \"boom\"",
+        avStr(Fields.get(rec, 5).?.bytes),
+    );
+
+    // attributes: mandor.bundle carries the whole bundle, unescaped.
+    const kv = Fields.get(rec, 6).?.bytes;
+    try testing.expectEqualStrings("mandor.bundle", Fields.get(kv, 1).?.bytes);
+    try testing.expectEqualStrings(bundle, avStr(Fields.get(kv, 2).?.bytes));
 }
 
 test "buildOtlp maps severity and tolerates missing fields" {
-    const warn = try buildOtlp("{\"kind\":\"leak-suspect\"}");
-    try testing.expect(std.mem.indexOf(u8, warn, "\"severityText\":\"WARN\"") != null);
-    const loop = try buildOtlp("{\"kind\":\"restart-loop\"}");
-    try testing.expect(std.mem.indexOf(u8, loop, "\"severityText\":\"WARN\"") != null);
+    inline for (.{ "leak-suspect", "restart-loop" }) |k| {
+        const body = try buildOtlp("{\"kind\":\"" ++ k ++ "\"}");
+        const rec = firstRecord(body);
+        try testing.expectEqualStrings("WARN", Fields.get(rec, 3).?.bytes);
+        try testing.expectEqual(sev_warn, Fields.get(rec, 2).?.int);
+    }
     const oops = try buildOtlp("{\"kind\":\"signal\"}");
-    try testing.expect(std.mem.indexOf(u8, oops, "\"severityText\":\"ERROR\"") != null);
+    try testing.expectEqualStrings("ERROR", Fields.get(firstRecord(oops), 3).?.bytes);
+    try testing.expectEqual(sev_error, Fields.get(firstRecord(oops), 2).?.int);
+
     // An empty bundle still produces a well-formed record, not a crash.
     const bare = try buildOtlp("{}");
-    try testing.expect(std.mem.indexOf(u8, bare, "\"stringValue\":\"unknown\"") != null);
+    const rl = Fields.get(bare, 1).?.bytes;
+    const res = Fields.get(rl, 1).?.bytes;
+    var attrs = Fields{ .b = res };
+    try testing.expectEqualStrings("unknown", avStr(Fields.get(attrs.next().?.bytes, 2).?.bytes));
 }
 
 test "buildOtlp refuses a bundle with a broken escape" {
@@ -387,21 +652,18 @@ test "buildOtlp refuses a bundle with a broken escape" {
     try testing.expectError(error.Malformed, buildOtlp("{\"name\":\"a\\u01\"}"));
 }
 
-test "apJsonSource accepts every legal escape" {
-    var pos: usize = 0;
-    try testing.expect(apJsonSource(&pos, "plain \\\" \\\\ \\/ \\b \\f \\n \\r \\t \\u00e9"));
-    pos = 0;
-    try testing.expect(!apJsonSource(&pos, "trailing \\"));
-    pos = 0;
-    try testing.expect(!apJsonSource(&pos, "raw \x01 control"));
+test "validJsonSource accepts every legal escape" {
+    try testing.expect(validJsonSource("plain \\\" \\\\ \\/ \\b \\f \\n \\r \\t \\u00e9"));
+    try testing.expect(!validJsonSource("trailing \\"));
+    try testing.expect(!validJsonSource("raw \x01 control"));
 }
 
 test "buildOtlp rejects a bundle too large for the body buffer" {
-    // Fill past body_buf: the bundle is embedded escaped, so a buffer-sized
-    // input of quotes doubles on the way in.
+    // Protobuf embeds the bundle verbatim, so overflowing body_buf needs an
+    // input larger than the buffer rather than one that doubles on the way in.
     const big = &struct {
-        var b: [200 * 1024]u8 = undefined;
+        var b: [400 * 1024]u8 = undefined;
     }.b;
-    @memset(big, '"');
+    @memset(big, 'x');
     try testing.expectError(error.TooLarge, buildOtlp(big));
 }
