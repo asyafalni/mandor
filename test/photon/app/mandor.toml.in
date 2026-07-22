@@ -1,0 +1,4 @@
+# The documented integration, driven exactly as a user would write it: one key.
+# PHOTON_HOST is substituted with the photon container's name at test time.
+workers = ["sh -c 'echo boom >&2; exit 3'"]
+photon = "PHOTON_HOST:4318"

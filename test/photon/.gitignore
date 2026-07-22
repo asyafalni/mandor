@@ -1,0 +1,7 @@
+# Staged at test time; never commit binaries or rendered config.
+mandor
+mandor.prebuilt
+appbuild.log
+out/
+app/mandor
+app/mandor.toml

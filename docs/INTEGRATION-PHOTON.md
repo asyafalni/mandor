@@ -95,10 +95,34 @@ reporting a rejection. `202 Accepted` is treated as success, not failure.
 > `relay.zig` now emits, checked by two independent decoders (a Zig reader in
 > the unit tests, a Python one in harness case 65 reading off a real socket).
 >
-> **Not yet confirmed end to end.** photon's release publishes
-> `photon-agent-linux-x86_64` only, not the ingest server, so running the pair
-> means building `photon-ingest` from Rust source. mandor's half is verified;
-> the handshake against a live photon is not.
+> **Confirmed end to end 2026-07-22.** photon built from source
+> (`podman build`, its own Dockerfile — the published release ships
+> `photon-agent` only, not the ingest server), then a real crash supervised by
+> mandor as PID 1, forwarded by the `photon` key over a container network:
+>
+> ```
+> /api/services  -> ["sh"]
+> /api/storage   -> logs: total_rows 1, bytes 7022
+> /api/search    -> mandor.bundle with the full schema-v7 incident
+> ```
+>
+> photon promoted `service.name` to its own column and stored the whole bundle,
+> `PHOTON_TOKEN` redacted in the captured env. Reproduce with
+> `bash test/photon/e2e.sh`.
+>
+> **Two limitations the live run exposed**, neither visible from reading code:
+>
+> 1. **`photon = "hostname:4318"` is rejected** — the key takes a literal
+>    `ip:port` and mandor does no name resolution. In compose or Kubernetes you
+>    address a service by *name*, which is what the deployment sketch below
+>    implies, so that sketch does not work as written. Use an IP, or resolve the
+>    name yourself and pass it in.
+> 2. **The relay is fire-and-forget and mandor exits immediately when a fatal
+>    crash ends the run** — so the container can be torn down before delivery
+>    finishes. It works when mandor keeps supervising (restarts, or other live
+>    workers); a single-worker container that dies on first crash may lose the
+>    forward. Nothing reports this, because from mandor's side the spawn
+>    succeeded.
 
 **Historical note (2026-07-18 → 2026-07-22):** the original recon framed this
 as a photon-side gap and specced an afternoon of Rust to add OTLP/JSON ingest

@@ -3,6 +3,43 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.6.1] - 2026-07-22
+
+### Verified
+- **The photon integration works end to end** — confirmed for the first time,
+  not inferred. photon built from its own Dockerfile (the published release
+  ships `photon-agent` only, not the ingest server), then a real crash
+  supervised by mandor as PID 1, forwarded by the `photon` config key over a
+  container network, ingested, and queried back through photon's API:
+  `/api/services → ["sh"]`, `/api/storage → total_rows 1`, and the full
+  schema-v7 bundle in `/api/search` with `PHOTON_TOKEN` redacted. The 1.6.0
+  "not verified" caveat is removed.
+
+### Found by running it (invisible to source inspection)
+- **`photon = "hostname:4318"` is rejected.** The key takes a literal `ip:port`
+  and mandor does no name resolution — but compose and Kubernetes address
+  services by *name*, which is exactly what the deployment sketch in
+  `docs/INTEGRATION-PHOTON.md` implies. That sketch does not work as written.
+  Documented; a fix needs a resolver, which is a real design decision rather
+  than a patch.
+- **A single-worker container can lose the forward.** The relay is
+  fire-and-forget and mandor exits as soon as a fatal crash ends the run, so
+  the container may be torn down before delivery completes. It works whenever
+  mandor keeps supervising. Nothing reports it, because from mandor's side the
+  spawn succeeded.
+
+### Testing
+- `test/photon/e2e.sh` now runs **both sides in containers** — mandor is a Linux
+  binary and podman may live on a different host, so shelling out to
+  `./zig-out/bin/mandor` was never portable, and containers are how this is
+  deployed anyway.
+- It polls for photon's WAL flush rather than sleeping. A fixed 5s wait
+  reported "0 rows" for an incident that had ingested perfectly and became
+  queryable at ~25s — the fourth fixed-sleep race this suite has produced.
+- The delivery check no longer passes vacuously: when the endpoint was rejected
+  outright, "no error reported" went green while nothing had been sent at all.
+  It now requires positive evidence that a forward was attempted.
+
 ## [1.6.0] - 2026-07-22
 
 ### Changed
