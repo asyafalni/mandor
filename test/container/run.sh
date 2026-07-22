@@ -13,8 +13,21 @@ IMAGE=${IMAGE:-mandor-pid1test}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 
-command -v "$ENGINE" >/dev/null 2>&1 || { echo "SKIP: $ENGINE not installed"; exit 0; }
-"$ENGINE" info >/dev/null 2>&1 || { echo "SKIP: $ENGINE not running"; exit 0; }
+# Skipping is right for a dev box without an engine, and wrong for CI: a job
+# that silently passes because it never ran is the same "green means nothing"
+# failure this suite exists to catch. Set MANDOR_REQUIRE_ENGINE=1 to turn a
+# skip into a failure.
+skip() {
+  if [ -n "${MANDOR_REQUIRE_ENGINE:-}" ]; then
+    echo "FAIL $1 — MANDOR_REQUIRE_ENGINE is set, refusing to skip"
+    exit 1
+  fi
+  echo "SKIP: $1"
+  exit 0
+}
+
+command -v "$ENGINE" >/dev/null 2>&1 || skip "$ENGINE not installed"
+"$ENGINE" info >/dev/null 2>&1 || skip "$ENGINE not running"
 
 pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "ok   $1"; }
@@ -25,7 +38,7 @@ bad() { fail=$((fail+1)); echo "FAIL $1 — $2"; return 0; }
 # engine live in different environments (a Windows dev box builds under WSL
 # but runs podman.exe on the host). CI has both in one place and just builds.
 if [ -n "${MANDOR_MUSL:-}" ]; then
-  [ -f "$MANDOR_MUSL" ] || { echo "SKIP: MANDOR_MUSL=$MANDOR_MUSL not found"; exit 0; }
+  [ -f "$MANDOR_MUSL" ] || skip "MANDOR_MUSL=$MANDOR_MUSL not found"
   cp "$MANDOR_MUSL" "$HERE/mandor"
 else
   # Build to its own prefix so it can never clobber zig-out/bin/mandor: a cross
@@ -34,7 +47,7 @@ else
   ZIG=${ZIG:-zig}
   echo "building x86_64-linux-musl binary..."
   (cd "$ROOT" && "$ZIG" build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dstrip=true -p "$HERE/out") \
-    || { echo "SKIP: cross build failed"; exit 0; }
+    || skip "cross build failed"
   cp "$HERE/out/bin/mandor" "$HERE/mandor"
 fi
 trap 'rm -f "$HERE/mandor"; rm -rf "$HERE/out"' EXIT

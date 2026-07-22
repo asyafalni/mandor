@@ -38,6 +38,15 @@ cross-compiling — needed where the toolchain and the container engine live in
 different environments (a Windows box building under WSL but running
 `podman.exe` on the host).
 
+`MANDOR_REQUIRE_ENGINE=1` turns a missing engine into a failure instead of a
+skip. CI sets it: a job that goes green because it never ran is worse than no
+job, and this suite exists precisely to catch tests that pass without testing.
+
+CI runs this as its own `pid1` job. The existing `distros` job runs the harness
+*inside* a container, but the runner's entrypoint is PID 1 there, so mandor is
+still an ordinary process — only making mandor the ENTRYPOINT exercises orphan
+reparenting and process-group signalling as init.
+
 ### Soak
 
 ```console

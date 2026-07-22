@@ -3,6 +3,47 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.5.14] - 2026-07-22
+
+### CI
+- **The PID-1 container tests now run on every push** as a `pid1` job. They
+  existed since 1.5.12 but only ran when someone remembered — which is exactly
+  how the harness regression in 1.5.2 survived four releases. The job reuses
+  the musl binary the `test` job already built and size-gated rather than
+  installing the toolchain twice.
+- **A missing container engine now fails CI instead of skipping.**
+  `MANDOR_REQUIRE_ENGINE=1` turns the skip path into an error; the job sets it.
+  Skipping is right on a dev box without an engine and wrong in CI, where a job
+  that goes green because it never ran is worse than no job at all — the same
+  "green means nothing" failure this suite was built to catch.
+
+Note the existing `distros` job runs the harness *inside* a container, but the
+runner's entrypoint is PID 1 there, so mandor is an ordinary process just as on
+the host. Only running mandor as the ENTRYPOINT exercises orphan reparenting
+and process-group signalling as init.
+
+## [1.5.13] - 2026-07-22
+
+### Fixed
+- **The orphan test from 1.5.12 did not test what its name claimed.** Its
+  background subshell exited while its parent was still alive, so the worker
+  shell reaped its own child and mandor was never involved — it reported
+  `zombies=0` while proving nothing. A second attempt then read
+  `/proc/self/stat` from inside `$( )`, which reports *awk's* parent rather
+  than the shell's, making correct reparenting look broken.
+
+  Rebuilt so the scenario is real: the intermediate parent exits immediately
+  and the grandchild outlives it, which is what makes the kernel hand it to
+  PID 1. Five at once, so a single lucky reap cannot pass for a working loop,
+  and the assertion runs while mandor is *still supervising* — showing reaping
+  is continuous through the SIGCHLD/signalfd loop, not only at shutdown.
+
+  Result: all five report `ppid=1`, `zombies=0`, and PID 1's child list holds
+  only the legitimate worker. Mutation-tested — a mandor patched to `waitpid`
+  known worker pids instead of `-1` yields `zombies=5` with PID 1 holding every
+  orphan, and the case fails. (A control using plain `sh` as PID 1 was tried
+  first and discarded: busybox ash reaps too, so it could not discriminate.)
+
 ## [1.5.12] - 2026-07-22
 
 ### Added
@@ -15,13 +56,6 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
   case), and the exit-code contract an orchestrator reads (7, 139, 127). Skips
   cleanly with no container engine; `MANDOR_MUSL` supplies a prebuilt binary
   where the toolchain and engine live in different environments.
-- **Orphan adoption and reaping is now proven, not assumed.** Five grandchildren
-  are orphaned at once by killing their intermediate parents; all five report
-  `ppid=1` (adopted by mandor) and `zombies=0` while mandor is *still
-  supervising* — so reaping happens continuously through the SIGCHLD/signalfd
-  loop, not only at shutdown. Mutation-tested: a mandor patched to `waitpid`
-  only known worker pids instead of `-1` leaves `zombies=5` with PID 1 holding
-  every orphan, and the case fails.
 
 ### Validation of the 1.5.x series
 Every release from 1.5.1 to 1.5.11 was developed and verified on the host,

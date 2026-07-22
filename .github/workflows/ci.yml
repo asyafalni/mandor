@@ -137,3 +137,38 @@ jobs:
             done
             exit 1
           }
+
+  # The distros job above runs the harness *inside* a container, but the
+  # runner's own entrypoint is PID 1 there — mandor is an ordinary process,
+  # exactly as on the host. Making mandor the ENTRYPOINT is the only way to
+  # exercise what actually differs: orphans being reparented to it, and
+  # process-group signalling as init. Reaping is literally unobservable
+  # anywhere else, because nothing is ever handed to a non-PID-1 process.
+  pid1:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reuse the musl binary the test job already built and size-gated rather
+      # than installing the toolchain a second time.
+      - uses: actions/download-artifact@v4
+        with:
+          name: mandor-x64
+          path: prebuilt
+
+      - name: Real PID-1 semantics (mandor as container entrypoint)
+        env:
+          # Without this the suite skips when no engine is present, which in CI
+          # is a silent pass — a job that goes green because it never ran.
+          MANDOR_REQUIRE_ENGINE: "1"
+        run: |
+          chmod +x prebuilt/mandor
+          MANDOR_MUSL="$PWD/prebuilt/mandor" ENGINE=docker \
+            bash test/container/run.sh 2>&1 | tee /tmp/pid1.log
+          grep -qE "^passed [0-9]+, failed 0$" /tmp/pid1.log || {
+            grep -E "^FAIL" /tmp/pid1.log | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+            exit 1
+          }
