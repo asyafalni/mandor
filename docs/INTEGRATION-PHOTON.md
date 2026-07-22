@@ -73,11 +73,25 @@ strand one process per incident — and incidents fire per restart, so a crash
 loop would strand one per crash. A timeout says so explicitly rather than
 reporting a rejection. `202 Accepted` is treated as success, not failure.
 
-> **Status: still blocked. Re-verified 2026-07-21** against
-> `crates/photon-ingest/src/http.rs` on photon `main`. `decode_export_request`
-> is unchanged — `prost::Message::decode(body)`, protobuf only, and the handler
-> does not inspect `Content-Type` at all. photon's README describing it as
-> "OTEL-native" refers to the protobuf receivers; it does not imply OTLP/JSON.
+> **Status: still blocked. Re-verified 2026-07-22** against a fresh clone of
+> photon `main` (`c393269`), after photon shipped v1.4.0 on 2026-07-21. photon
+> has moved on — new commits, a release — but this gap is untouched:
+>
+> - `ingest_logs` takes `headers: HeaderMap` yet calls `decode_export_request`
+>   unconditionally (`http.rs:77`); `Content-Type` is never consulted for the
+>   body format. `trace_http.rs` is the same.
+> - Repo-wide, every `application/json` occurrence is in `photon-alerts`
+>   (outbound webhooks) or `photon-api` (REST responses). **Zero** in
+>   `photon-ingest`.
+> - No `pbjson` / `with-serde` dependency has been added.
+>
+> photon's README describing it as "OTEL-native" refers to the protobuf
+> receivers; it does not imply OTLP/JSON.
+>
+> The v1.4.0 release publishes `photon-agent-linux-x86_64` only, not the ingest
+> server, so an end-to-end run of the pair means building photon-ingest from
+> Rust source. Source inspection is used instead because the outcome is not in
+> doubt — the decode error is legible in the handler.
 >
 > So `photon = "ip:port"` still fails on every incident: mandor POSTs OTLP/JSON
 > and photon returns a protobuf decode error. The failure is *visible* — the
