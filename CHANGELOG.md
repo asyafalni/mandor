@@ -7,15 +7,21 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
 
 ### Added
 - **`test/container/run.sh` — real PID-1 tests.** The host harness runs mandor
-  as an ordinary process: nothing is reparented to it, so zombie reaping is
+  as an ordinary process: nothing is reparented to it, so orphan reaping is
   literally unobservable there, and the process-group behaviour it relies on is
-  never exercised. Five cases now cover what the host cannot — mandor really
-  being PID 1, reaping grandchildren the kernel reparents to it, a grandchild's
-  own TERM handler draining rather than being cut short by the post-death sweep
-  (the v1.5.1 case), and the exit-code contract an orchestrator reads (7, 139,
-  127). Skips cleanly with no container engine; `MANDOR_MUSL` supplies a
-  prebuilt binary where the toolchain and engine live in different
-  environments.
+  never exercised. Six cases now cover what the host cannot — mandor really
+  being PID 1, adopting and reaping orphans, a grandchild's own TERM handler
+  draining rather than being cut short by the post-death sweep (the v1.5.1
+  case), and the exit-code contract an orchestrator reads (7, 139, 127). Skips
+  cleanly with no container engine; `MANDOR_MUSL` supplies a prebuilt binary
+  where the toolchain and engine live in different environments.
+- **Orphan adoption and reaping is now proven, not assumed.** Five grandchildren
+  are orphaned at once by killing their intermediate parents; all five report
+  `ppid=1` (adopted by mandor) and `zombies=0` while mandor is *still
+  supervising* — so reaping happens continuously through the SIGCHLD/signalfd
+  loop, not only at shutdown. Mutation-tested: a mandor patched to `waitpid`
+  only known worker pids instead of `-1` leaves `zombies=5` with PID 1 holding
+  every orphan, and the case fails.
 
 ### Validation of the 1.5.x series
 Every release from 1.5.1 to 1.5.11 was developed and verified on the host,

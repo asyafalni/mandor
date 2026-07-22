@@ -41,11 +41,25 @@ trap 'rm -f "$HERE/mandor"; rm -rf "$HERE/out"' EXIT
 
 "$ENGINE" build -t "$IMAGE" "$HERE" >/dev/null 2>&1 || { bad "image build" "see $ENGINE build output"; exit 1; }
 
-# 1. mandor really is PID 1, and reaps a grandchild the kernel reparents to it.
+# 1. mandor really is PID 1 and the worker hangs off it.
 out=$("$ENGINE" run --rm "$IMAGE" "sh /t/pid1.sh" 2>&1)
-if echo "$out" | grep -q "ppid=1" && echo "$out" | grep -q "zombies=0"; then
-  ok "runs as PID 1 and reaps orphaned grandchildren"
-else bad "pid1 + reaping" "$(echo "$out" | grep -E 'ppid|zombies' | tr '\n' ' ')"; fi
+if echo "$out" | grep -q "ppid=1"; then
+  ok "runs as PID 1"
+else bad "pid1 identity" "$(echo "$out" | grep -E 'pid|ppid' | tr '\n' ' ')"; fi
+
+# 2. Orphans are adopted AND released. This is the guarantee the whole class of
+# tool exists for: a process whose parent dies is handed to PID 1, and a PID 1
+# that does not reap it leaves a zombie occupying a slot forever.
+#
+# Five at once, so a single lucky reap cannot pass for a working loop. The
+# check runs while mandor is still supervising, which is what proves reaping
+# happens continuously rather than only at shutdown.
+out=$("$ENGINE" run --rm "$IMAGE" "sh /t/orphan.sh" 2>&1)
+adopted=$(echo "$out" | grep -c "ppid=1")
+if [ "$adopted" -eq 5 ] && echo "$out" | grep -q "zombies=0"; then
+  ok "orphans are adopted by PID 1 and reaped (5/5, no zombies)"
+else bad "orphan adoption + reaping" \
+  "adopted=$adopted/5, $(echo "$out" | grep -E 'zombies|pid1-children' | tr '\n' ' ')"; fi
 
 # 2. A grandchild's own TERM handler must run to completion. This is the v1.5.1
 # case: the leader exits promptly on TERM, and the post-death process-group
