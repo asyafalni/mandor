@@ -91,6 +91,21 @@ Two footguns, both found the hard way on 30-minute runs:
   a long soak runs can corrupt that run. Snapshot it
   (`cp test/harness/soak.sh /tmp/soak.sh`) before a long session.
 
+### Speed (`bench/`)
+
+```console
+zig run bench/scan.zig -OReleaseSafe    # substring-scan cost per incident
+zig run bench/cold.zig -OReleaseSafe    # compactor + prune sort
+bash bench/compare.sh                   # vs tini/dumb-init/s6/supervisord
+```
+
+"Fast like the flash" is a motto term, so it gets numbers, not adjectives. The
+hot path (per log line) has no super-linear work; the cold path (per incident)
+tops out around 1.7 ms. See `bench/README.md` for the measurements and — just
+as important — the recorded decisions *not* to optimize, so nobody re-derives
+them. One lesson lives there: a predicted 26× substring win measured 1.16×,
+because the naive loop already short-circuited. Measure before optimizing.
+
 ### Spawn-failure behaviour
 
 A failed `fork` is impractical to trigger on demand (`ulimit -u` starves the

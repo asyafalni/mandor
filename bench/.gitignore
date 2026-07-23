@@ -1,0 +1,4 @@
+# Built at bench time; never commit binaries or cross-build output.
+mandor
+mandor.prebuilt
+out/

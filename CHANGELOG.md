@@ -3,6 +3,27 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.6.4] - 2026-07-23
+
+### Added
+- **`bench/` — the third motto term gets numbers.** Stability and size were
+  gated; speed was an assertion. Two complexity micro-benchmarks and a
+  container comparison against tini/dumb-init/s6/supervisord. Standalone, so
+  the binary is unchanged.
+
+  Complexity: the hot path (per log line) has no super-linear work; the cold
+  path (per incident) tops out ~1.7 ms. The recorded conclusion is *no change*,
+  with the reasoning kept so nobody re-optimizes on a hunch — including that a
+  substring scan predicted to be 26× faster measured 1.16×, because the naive
+  loop already short-circuited.
+
+  Comparison (Alpine, podman, x86_64): mandor is a 261 KB single static binary
+  vs tini's 28 KB and dumb-init's 59 KB — larger, because it does far more than
+  reap and forward — but a single dependency-free binary against s6's 63-file
+  suite and supervisord's 40 MB Python install. TERM forwarding is 5 ms, the
+  reaper class. Idle RSS 640 KB, above the bare reapers, from the ring buffers
+  and sampler. Reported honestly in `bench/README.md`, losses included.
+
 ## [1.6.3] - 2026-07-22
 
 A pass against the project motto — *push the stability to the sky, light like a
