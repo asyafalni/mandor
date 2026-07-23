@@ -53,32 +53,35 @@ machine-specific; what's committed is the reproducible method.
 
 | | mandor | tini | dumb-init | s6 | supervisord |
 |---|---|---|---|---|---|
-| deployable size | 261 KB | 28 KB | 59 KB | 1.0 MB (63 files) | 40 MB (Python) |
+| deployable size | 256 KB | 28 KB | 59 KB | 1.0 MB (63 files) | 40 MB (Python) |
 | single static binary | ✅ | ✅ | ✅ | ❌ suite | ❌ needs runtime |
-| idle RSS as PID 1 (KB) | 640 | 524 | 68 | — | — |
-| TERM → worker (ms, best of 5) | 5 | 93 | 2 | — | — |
+| idle RSS as PID 1 (KB) | **384** | 564 | 72 | — | — |
+| TERM → worker (ms, best of 5) | 2 | 93 | 2 | — | — |
 
-**Read this honestly, because it is not all in mandor's favour:**
+**Read this honestly:**
 
 - **mandor is not the smallest binary, and does not claim to be.** tini and
   dumb-init are ~30–60 KB because they *only* reap zombies and forward signals.
-  mandor is 261 KB because it also captures logs, samples `/proc`, detects
+  mandor is 256 KB because it also captures logs, samples `/proc`, detects
   incidents, parses traces, and forwards to photon. The fair comparison by
   *scope* is s6 and supervisord — and there mandor is one static binary against
   a 63-binary suite and a 40 MB Python install.
-- **Idle RSS is higher than the pure reapers** (640 KB vs 68–524), from the
-  fixed ring buffers and the sampler. Still well under a megabyte, and flat —
-  the soak test holds it at zero drift over 30 minutes.
-- **Signal forwarding is fast**: 5 ms, in the same class as dumb-init (2 ms).
-  tini's 93 ms in this run is an outlier and may reflect its default forwarding
-  mode rather than raw speed — treat the reaper numbers as "all effectively
-  instant" rather than a ranking. The poll granularity is 5 ms, so single-digit
-  readings are at the measurement floor.
+- **Idle RSS is now *below* tini** (384 KB vs 564), and flat — the soak holds
+  it at zero drift over 30 minutes. This took a fix: Zig installs a 256 KB
+  `sigaltstack` at startup so a signal handler can print a stack trace, and
+  mandor prints none (custom panic, segfault handler off, signalfd rather than
+  async handlers). Setting `signal_stack_size = null` dropped idle RSS from
+  640 KB to 384. What's left is ~208 KB of code pages — intrinsic to the work —
+  plus the ring, which faults in only as logs are actually written.
+- **Signal forwarding is fast**: 2 ms, matching dumb-init. tini's 93 ms is
+  likely its default forwarding mode rather than raw speed — treat the reaper
+  numbers as "all effectively instant". The 5 ms poll granularity puts
+  single-digit readings at the measurement floor.
 
-The honest one-line summary: **mandor is heavier than a bare reaper because it
-does far more, and lighter than every tool in its actual feature class — while
-staying a single dependency-free static binary and forwarding signals as fast
-as the reapers do.**
+The honest one-line summary: **mandor does far more than a bare reaper, is
+lighter than every tool in its actual feature class, now idles below tini, and
+forwards signals as fast as the reapers — as a single dependency-free static
+binary.**
 
 s6 and supervisord are compared on footprint only; running them needs a service
 directory, out of scope for this quick pass. Their idle-RSS and latency would

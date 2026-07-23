@@ -7,7 +7,16 @@ const cli = @import("cli.zig");
 /// design), so skip std.debug's DWARF/ELF/decompression stack-trace
 /// machinery (~100 KB) — print the message and trap.
 pub const panic = std.debug.FullPanic(rawPanic);
-pub const std_options: std.Options = .{ .enable_segfault_handler = false };
+pub const std_options: std.Options = .{
+    .enable_segfault_handler = false,
+    // Zig installs a 256 KB `sigaltstack` at startup so a signal handler can
+    // render a stack trace on a clean stack. mandor renders none — the panic
+    // above just writes and traps, the segfault handler is off, and signals
+    // are handled via signalfd (no async handlers, no SA_ONSTACK). So that
+    // alt-stack is 256 KB of resident memory serving nothing: null skips it,
+    // ~40% off idle RSS, no behaviour lost.
+    .signal_stack_size = null,
+};
 
 /// Raw-syscall panic: message to stderr, immediate exit. Avoids
 /// std.debug's stderr lock machinery (Progress + Io.Threaded vtable orbit).

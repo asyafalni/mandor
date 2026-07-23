@@ -3,6 +3,31 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.6.5] - 2026-07-23
+
+### Fixed
+- **Idle RSS cut 40%, 640 KB → 384 KB, by dropping an unused signal stack.**
+  The benchmark showed mandor idling heavier than the bare reapers, and a
+  `/proc/1/smaps` breakdown found the reason: a fully-resident 256 KB anonymous
+  mapping — a `sigaltstack` Zig installs at startup (`signal_stack_size`
+  defaults to `1 << 18`) so a signal handler can render a stack trace on a
+  clean stack.
+
+  mandor renders no such trace: its panic just writes and traps, the segfault
+  handler is off, and signals arrive via `signalfd` (no async handlers, no
+  `SA_ONSTACK`). The alt-stack served nothing. `signal_stack_size = null` skips
+  it — consistent with the existing choice to drop stack-trace machinery.
+
+  Result: idle RSS **384 KB, now below tini's 564** while doing far more; the
+  binary also shrank 264,000 → 256,184 bytes. What remains resident is mostly
+  code pages, intrinsic to the work. No behaviour changed — 143/143 unit,
+  73/73 harness, TERM forwarding still 2 ms.
+
+  Found by measuring, not guessing: the first hypothesis (lazily fault in the
+  log ring) was tested and rejected — the ring was already lazily faulted, and
+  a silent worker still showed the 256 KB, which is what pointed at a fixed
+  startup cost instead. `bench/README.md` updated.
+
 ## [1.6.4] - 2026-07-23
 
 ### Added
