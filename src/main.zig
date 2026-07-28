@@ -84,6 +84,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Invisible subcommand: `mandor relay <bundle.json>` (photon bridge).
     // The supervisor path never networks; this runs only when invoked.
     if (vec.len >= 3 and std.mem.eql(u8, std.mem.span(vec[1]), "relay")) {
+        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd>`.
+        // Spawned by the supervisor when `photon=` is set (it owns the socket so
+        // the supervision path never does). <spool_dir> is the mandor state dir
+        // (the one holding incidents/); <pipe_fd> is the inherited read end.
+        if (std.mem.eql(u8, std.mem.span(vec[2]), "--daemon")) {
+            if (vec.len < 6) {
+                writeOut(usage_text);
+                return 2;
+            }
+            const endpoint = std.mem.span(vec[3]);
+            const spool_dir = std.mem.span(vec[4]);
+            const pipe_fd = std.fmt.parseInt(i32, std.mem.span(vec[5]), 10) catch return 2;
+            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, init.environ.block.slice);
+        }
         const endpoint: ?[]const u8 = if (vec.len >= 4) std.mem.span(vec[3]) else null;
         return @import("relay.zig").run(vec[2], endpoint, init.environ.block.slice);
     }

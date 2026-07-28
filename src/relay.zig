@@ -10,6 +10,7 @@ const posix = std.posix;
 const spawner = @import("spawner.zig");
 const resolve = @import("resolve.zig");
 const frame = @import("frame.zig");
+const spool = @import("spool.zig");
 
 /// Wall-clock ceiling on each blocking socket call. Generous enough that a
 /// merely slow collector still succeeds, short enough that a hung one cannot
@@ -51,7 +52,7 @@ pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const
     };
     // photon requires a bearer token; inherited env keeps it off /proc cmdline.
     const token = spawner.findEnv(environ, "PHOTON_TOKEN") orelse "";
-    return post(host, port, body, token);
+    return post(host, port, "/v1/logs", body, token);
 }
 
 fn err(msg: []const u8) void {
@@ -563,7 +564,7 @@ fn statusOk(resp: []const u8) bool {
     return resp[9] == '2';
 }
 
-fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
+fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const u8) u8 {
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (posix.errno(rc) != .SUCCESS) {
         err("socket failed");
@@ -593,9 +594,9 @@ fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
         std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}\r\n", .{token}) catch ""
     else
         "";
-    const req = std.fmt.bufPrint(&req_buf, "POST /v1/logs HTTP/1.1\r\nHost: photon\r\n" ++
+    const req = std.fmt.bufPrint(&req_buf, "POST {s} HTTP/1.1\r\nHost: photon\r\n" ++
         "Content-Type: application/x-protobuf\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
-        auth, body.len, body,
+        path, auth, body.len, body,
     }) catch {
         err("request too large to send");
         return 1;
@@ -639,6 +640,270 @@ fn post(host: u32, port: u16, body: []const u8, token: []const u8) u8 {
         err("photon rejected the payload (no response) — see docs/INTEGRATION-PHOTON.md");
     }
     return 1;
+}
+
+// ------------------------------------------------------- long-lived daemon
+//
+// `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd>` is spawned once when
+// `photon=` is set (Task 4 wires the spawn). It OWNS the socket so the
+// supervision path never touches one. Each cycle it:
+//   1. SPOOL FIRST (priority, durable): ships every incident bundle on disk
+//      that it has not shipped yet; a send failure leaves it for the next cycle
+//      so an incident is never dropped.
+//   2. DRAINS THE PIPE (routine, best-effort): decodes framed metric/lifecycle
+//      records the core wrote non-blocking, re-encodes them as OTLP, and POSTs;
+//      anything that will not fit or will not send is dropped, never retried.
+// It exits 0 on pipe EOF (parent gone) or SIGTERM (clean-shutdown request),
+// flushing the spool one last time first. STABILITY LEADS: no syscall error,
+// bad frame, or send failure ever ends the loop — worst case is a skipped cycle.
+
+/// Seconds between cycles. The pipe is drained fully each cycle, so this only
+/// bounds shutdown/EOF latency and the spool retry cadence, not throughput.
+const daemon_cycle_s = 1;
+
+// Shipped-set watermark.
+//
+// A single epoch-ms high-watermark is NOT safe here. Spool filenames are
+// `<epoch_ms>-<name>-<seq>.json` (spool.zig:310): the epoch-ms prefix is
+// monotonic but NOT unique — two incidents in the same millisecond share it —
+// and the `seq` tiebreaker is not zero-padded, so lexical filename order
+// inverts (`…-9.json` sorts after `…-10.json`) and a REALTIME clock step can
+// even move a later bundle's prefix backwards. Any of those would let a single
+// watermark silently skip a bundle, i.e. drop an incident. So the daemon tracks
+// the SET of filenames it has shipped. The spool self-caps at
+// spool.max_incidents (spool.zig), so a set one window larger always covers a
+// full spool; entries whose files have since been pruned are swept out each
+// cycle so the set stays bounded to what is actually on disk.
+const ship_name_cap = 64; // == spool.DirEntry.name length; spool caps names at 63
+const ship_cap = spool.max_incidents + 32;
+const dir_cap = spool.max_incidents + 32;
+
+var dir_entries: [dir_cap]spool.DirEntry = undefined;
+
+const Shipped = struct {
+    names: [ship_cap][ship_name_cap]u8 = undefined,
+    lens: [ship_cap]u8 = undefined,
+    /// Per-cycle mark for the sweep: reset to false, set true for every set
+    /// entry still present on disk, then survivors are compacted down.
+    present: [ship_cap]bool = undefined,
+    n: usize = 0,
+
+    fn find(self: *const Shipped, name: []const u8) ?usize {
+        var i: usize = 0;
+        while (i < self.n) : (i += 1) {
+            if (self.lens[i] == name.len and
+                std.mem.eql(u8, self.names[i][0..self.lens[i]], name)) return i;
+        }
+        return null;
+    }
+
+    /// Record a shipped filename. A name that will not fit, or a full set, is
+    /// silently not tracked — the bundle simply gets re-shipped later (a
+    /// duplicate at photon, never a dropped incident).
+    fn add(self: *Shipped, name: []const u8) void {
+        if (name.len > ship_name_cap or self.n >= ship_cap) return;
+        @memcpy(self.names[self.n][0..name.len], name);
+        self.lens[self.n] = @intCast(name.len);
+        self.present[self.n] = true;
+        self.n += 1;
+    }
+
+    /// Drop entries not marked present this cycle (their files were pruned),
+    /// keeping the set bounded to the on-disk spool.
+    fn sweep(self: *Shipped) void {
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < self.n) : (i += 1) {
+            if (!self.present[i]) continue;
+            if (w != i) {
+                @memcpy(self.names[w][0..self.lens[i]], self.names[i][0..self.lens[i]]);
+                self.lens[w] = self.lens[i];
+            }
+            w += 1;
+        }
+        self.n = w;
+    }
+};
+
+/// Read one bundle, encode it, ship it. Returns true only on a 2xx.
+fn shipOne(spool_dir: []const u8, name: []const u8, host: u32, port: u16, token: []const u8) bool {
+    var path_buf: [640]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{ spool_dir, name }) catch return false;
+    const bundle = readFile(path.ptr) catch return false;
+    const body = buildOtlp(bundle) catch return false;
+    return post(host, port, "/v1/logs", body, token) == 0;
+}
+
+/// Ship every spooled bundle not yet shipped, oldest first. Returns false if a
+/// send failed (photon unreachable/rejecting) so the caller can re-resolve.
+/// Never advances past a failed bundle: incidents are durable and retried.
+fn shipSpool(shipped: *Shipped, spool_dir: []const u8, host: u32, port: u16, token: []const u8) bool {
+    // Oldest-first, newest-wins on the (rare) overflow — mirrors spool.prune.
+    const n = spool.listIncidents(spool_dir, &dir_entries, .newest);
+
+    // Mark which already-shipped entries still exist; the rest get swept.
+    for (shipped.present[0..shipped.n]) |*p| p.* = false;
+    for (dir_entries[0..n]) |*e| {
+        if (shipped.find(e.name[0..e.name_len])) |idx| shipped.present[idx] = true;
+    }
+
+    var ok = true;
+    for (dir_entries[0..n]) |*e| {
+        const name = e.name[0..e.name_len];
+        if (shipped.find(name) != null) continue; // already shipped
+        if (shipOne(spool_dir, name, host, port, token)) {
+            shipped.add(name);
+        } else {
+            // photon is down or rejecting: stop this cycle (one bounded connect
+            // rather than one per bundle), leave the rest for the next cycle.
+            ok = false;
+            break;
+        }
+    }
+    shipped.sweep();
+    return ok;
+}
+
+// Routine pipe drain state — fixed, preallocated, zero allocation.
+var pipe_buf: [16 * 1024]u8 = undefined;
+var pipe_filled: usize = 0;
+const metric_batch_cap = 64;
+var metric_samples: [metric_batch_cap]frame.MetricSample = undefined;
+var metric_names: [metric_batch_cap][ship_name_cap]u8 = undefined;
+
+/// Drain everything currently readable from the pipe, ship it best-effort, and
+/// report whether EOF (parent gone) was seen. Metric samples are batched into a
+/// single OTLP request; lifecycle events post one LogRecord each. Any encode or
+/// send failure drops the record — routine telemetry is ephemeral.
+fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
+    var eof = false;
+    while (pipe_filled < pipe_buf.len) {
+        const rc = linux.read(pipe_fd, pipe_buf[pipe_filled..].ptr, pipe_buf.len - pipe_filled);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) {
+                    eof = true;
+                    break;
+                }
+                pipe_filled += rc;
+            },
+            .INTR => continue,
+            .AGAIN => break, // nothing more queued right now
+            else => break, // read error: keep what we have, retry next cycle
+        }
+    }
+
+    var n_samples: usize = 0;
+    var scratch: [256]u8 = undefined;
+    var off: usize = 0;
+    while (true) {
+        const d = frame.decode(pipe_buf[off..pipe_filled], &scratch) orelse break;
+        switch (d.rec) {
+            .metric_sample => |m| {
+                if (n_samples < metric_batch_cap and m.name.len <= ship_name_cap) {
+                    @memcpy(metric_names[n_samples][0..m.name.len], m.name);
+                    metric_samples[n_samples] = m;
+                    metric_samples[n_samples].name = metric_names[n_samples][0..m.name.len];
+                    n_samples += 1;
+                } // batch full → drop (best-effort routine metric)
+            },
+            .lifecycle_event => |e| {
+                if (buildOtlpEvent(e)) |b| {
+                    _ = post(host, port, "/v1/logs", b, token);
+                } else |_| {
+                    // too large to encode → drop (routine telemetry is ephemeral)
+                }
+            },
+        }
+        off += d.used;
+    }
+
+    // Compact the undecoded tail (a partial frame) back to the front.
+    if (off > 0) {
+        const rem = pipe_filled - off;
+        if (rem > 0) std.mem.copyForwards(u8, pipe_buf[0..rem], pipe_buf[off..pipe_filled]);
+        pipe_filled = rem;
+    } else if (pipe_filled == pipe_buf.len) {
+        // Full yet nothing decodes: only reachable on a corrupt/misaligned
+        // stream (max frame ≪ buffer). Drop it to avoid a permanent wedge —
+        // "drop oldest" taken to its limit. Never happens on our own writer.
+        pipe_filled = 0;
+    }
+
+    if (n_samples > 0) {
+        if (buildOtlpMetrics(metric_samples[0..n_samples])) |b| {
+            _ = post(host, port, "/v1/metrics", b, token);
+        } else |_| {
+            // batch too large → drop
+        }
+    }
+    return eof;
+}
+
+/// Non-blocking check: has a clean-shutdown signal (TERM/INT) arrived?
+fn shutdownRequested(sigfd: posix.fd_t) bool {
+    if (sigfd < 0) return false;
+    var sbuf: [4]linux.signalfd_siginfo = undefined;
+    const n = posix.read(sigfd, std.mem.sliceAsBytes(&sbuf)) catch return false; // WouldBlock → none
+    return n > 0;
+}
+
+/// Long-lived: owns the socket, ships incidents (durable) + routine telemetry
+/// (best-effort). `endpoint` is "host:port"; `spool_dir` is the mandor STATE
+/// dir (the one that contains `incidents/`, passed straight to
+/// spool.listIncidents); `pipe_fd` is the inherited non-blocking read end.
+/// Returns an exit code (0 = clean shutdown / parent gone). Never traps.
+pub fn runDaemon(
+    endpoint: []const u8,
+    spool_dir: []const u8,
+    pipe_fd: i32,
+    environ: [:null]const ?[*:0]const u8,
+) u8 {
+    // Resolve once up front; re-resolved on a send failure below because photon
+    // may restart with a new IP under compose. A literal IP short-circuits with
+    // no network (resolve.zig), so re-resolving is free in that case.
+    var hp = resolve.resolve(endpoint) orelse {
+        err("bad photon endpoint (want ip:port)");
+        return 2;
+    };
+    const token = spawner.findEnv(environ, "PHOTON_TOKEN") orelse "";
+
+    // Clean shutdown via signalfd (same synchronous model as signals.zig — no
+    // async handlers). Block TERM/INT and poll the fd each cycle. If signalfd
+    // setup fails, degrade to EOF-only shutdown rather than dying.
+    var sigset = posix.sigemptyset();
+    posix.sigaddset(&sigset, .TERM);
+    posix.sigaddset(&sigset, .INT);
+    posix.sigprocmask(posix.SIG.BLOCK, &sigset, null);
+    const sigfd: posix.fd_t = posix.signalfd(-1, &sigset, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK) catch -1;
+    defer {
+        if (sigfd >= 0) _ = linux.close(sigfd);
+    }
+
+    var shipped: Shipped = .{};
+
+    while (true) {
+        // Spool first: priority, durable, retried on failure.
+        if (!shipSpool(&shipped, spool_dir, hp.host, hp.port, token)) {
+            if (resolve.resolve(endpoint)) |new_hp| hp = new_hp;
+        }
+
+        // Routine: drain the pipe (best-effort). EOF means the parent is gone.
+        if (drainPipe(pipe_fd, hp.host, hp.port, token)) {
+            _ = shipSpool(&shipped, spool_dir, hp.host, hp.port, token); // final flush
+            return 0;
+        }
+
+        // Clean-shutdown request: final flush of both tiers, then exit.
+        if (shutdownRequested(sigfd)) {
+            _ = drainPipe(pipe_fd, hp.host, hp.port, token);
+            _ = shipSpool(&shipped, spool_dir, hp.host, hp.port, token);
+            return 0;
+        }
+
+        var ts = linux.timespec{ .sec = daemon_cycle_s, .nsec = 0 };
+        _ = linux.nanosleep(&ts, &ts);
+    }
 }
 
 const testing = std.testing;
@@ -889,6 +1154,30 @@ test "buildOtlpMetrics rejects a batch too large for body_buf" {
     }.arr;
     for (many) |*s| s.* = .{ .name = "api", .rss_kb = 1, .cpu_pct = 1, .fds = 1, .threads = 1, .restarts = 1, .t_unix_ns = 1 };
     try testing.expectError(error.TooLarge, buildOtlpMetrics(many));
+}
+
+test "Shipped set tracks names and sweeps entries no longer on disk" {
+    // The daemon's durability hinges on this set: a shipped bundle must be
+    // recognized (never re-shipped forever), an unshipped one must not, and a
+    // bundle pruned from disk must fall out so the set stays bounded.
+    var s: Shipped = .{};
+    try testing.expect(s.find("a.json") == null);
+    s.add("100-api-1.json");
+    s.add("100-api-2.json"); // same epoch-ms prefix: a single watermark would miss this
+    s.add("101-api-3.json");
+    try testing.expectEqual(@as(usize, 3), s.n);
+    try testing.expect(s.find("100-api-2.json") != null);
+    try testing.expect(s.find("102-api-4.json") == null);
+
+    // Simulate a cycle where only the two newest still exist on disk.
+    for (s.present[0..s.n]) |*p| p.* = false;
+    if (s.find("100-api-2.json")) |i| s.present[i] = true;
+    if (s.find("101-api-3.json")) |i| s.present[i] = true;
+    s.sweep();
+    try testing.expectEqual(@as(usize, 2), s.n);
+    try testing.expect(s.find("100-api-1.json") == null); // pruned → forgotten
+    try testing.expect(s.find("100-api-2.json") != null);
+    try testing.expect(s.find("101-api-3.json") != null);
 }
 
 test "buildOtlpEvent renders body, severity, and service.name" {
