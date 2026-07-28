@@ -4,10 +4,17 @@
 > the product-boundary wording in `CLAUDE.md` and `docs/INTEGRATION-PHOTON.md`
 > changes **in the same commit as the code**, never ahead of it.
 
-**Goal:** When `photon = "host:port"` is set, mandor delivers its full story —
-incidents, process lifecycle events, per-process resource metrics, supervisor
-self-metrics, and worker logs — to photon as OTLP, with **no collector in the
+**Goal:** When `photon = "host:port"` is set, mandor delivers its story —
+incidents, process lifecycle events, per-process resource metrics, and
+supervisor self-metrics — to photon as OTLP, with **no collector in the
 container**. Without the key, mandor touches no socket.
+
+**mandor curates; it does not stream.** mandor is a supervisor that surfaces
+*important* things, not a log shipper. It does **not** forward raw worker log
+lines. Log *content* still reaches photon — as the summary mandor already
+builds: the incident bundle's `logs_tail` (last ~200 lines, error/warn flagged)
+and deduplicated error signatures. Same curated payload we ship today; only the
+transport is new.
 
 **One-line boundary (the revised non-goal):**
 **mandor optionally speaks OTLP** — off by default; when `photon=` is set a
@@ -22,11 +29,11 @@ protobuf. No key, no socket.
   child process. PID 1's poll loop never blocks on or allocates for telemetry.
 - **Zero steady-state allocation in the core.** Fixed buffers, preallocated.
 - **Offline by default.** No `photon=` → no child spawned → no network.
-- **Size budget < 500 KB stripped** (currently ~256 KB). This is the largest
-  addition yet; it is staged across commits and each step respects the
-  per-commit 2 KB delta gate (`[size]` bypass only with a recorded reason).
+- **Size budget < 500 KB stripped** (currently ~256 KB). Staged across commits;
+  each step respects the per-commit 2 KB delta gate (`[size]` bypass only with a
+  recorded reason).
 - **Simplicity: 4 CLI flags stay 4.** The whole feature turns on with the
-  existing `photon=` key. Per-signal disable and interval tuning are TOML-only.
+  existing `photon=` key. Advanced tuning is TOML-only.
 - **No new dependencies.** OTLP protobuf is hand-encoded, extending the encoder
   `relay.zig` already has.
 - **ReleaseSafe, no `unreachable` / no panic on any path a running mandor
@@ -36,32 +43,34 @@ protobuf. No key, no socket.
 
 ## The architectural heart: priority by durability, not an in-memory heap
 
-The user requirement is: *under backpressure (photon down/slow), the incident
-that explains a crash must survive; a routine 5 s RSS sample may be dropped.*
+The requirement: under backpressure (photon down/slow), the incident that
+explains a crash must survive; a routine 5 s RSS sample may be dropped.
 
-The naive reading is an in-memory priority queue in the sender. We get the same
-guarantee for free by using the **durability tier that already exists**:
+We get that guarantee for free from the **durability tier that already exists**,
+rather than an in-memory priority queue:
 
 - **Incidents are already written durably** to the self-pruning, atomic-rename
   spool dir (`/var/lib/mandor/incidents/*.json`, `spool.zig`). They survive a
-  process death, a photon outage, and a crash loop.
-- **Routine telemetry (metrics, log lines, lifecycle events) is ephemeral** —
-  it lives only in mandor's fixed rings and is regenerated every tick.
-
-So the priority policy is realized structurally:
+  process death, a photon outage, and a crash loop — and they carry the log
+  summary (`logs_tail` + error dedup).
+- **Routine telemetry (lifecycle events, metric samples) is ephemeral** — it
+  lives only in mandor's fixed rings and is regenerated every tick.
 
 | Class | Path core → child | Durability | Under backpressure |
 |---|---|---|---|
-| **Incident bundles** | spool dir (child watches it) | durable on disk | **retried; never dropped** |
+| **Incident bundles** (incl. log summary) | spool dir (child watches it) | durable on disk | **retried; never dropped** |
 | Lifecycle events | pipe | ephemeral | dropped after bounded buffer |
-| Per-process metrics | pipe | ephemeral | dropped (newest wins) |
-| Worker logs | pipe | ephemeral | dropped (newest wins) |
+| Per-process / self metrics | pipe | ephemeral | dropped (newest wins) |
 
-The child ships the **spool first** every cycle, then whatever routine
-telemetry fits. No priority heap, no comparator, no extra allocation — the
-"queue" is the filesystem for the high class and a fixed ring for the low
-class. This is the smallest design that satisfies the requirement, and it
-reuses the spool that the premium sidecar already watches.
+The child ships the **spool first** each cycle, then whatever routine telemetry
+fits. No priority heap, no comparator, no extra allocation — the "queue" is the
+filesystem for the high class and a small fixed ring for the low class. Reuses
+the spool the premium sidecar already watches.
+
+**Routine volume is now low by design** — with raw logs cut, the pipe carries
+only lifecycle events (discrete, bounded by the restart-loop detector) and
+metric samples (one set per worker per 5 s tick). The firehose is gone; the
+backpressure ring can be small.
 
 ---
 
@@ -69,12 +78,15 @@ reuses the spool that the premium sidecar already watches.
 
 ```
 mandor core (PID 1, poll loop)                 mandor relay child (long-lived)
-├── sampler   ──┐                               ├── watches spool dir ──▶ incidents
-├── capture   ──┼─ framed records ─▶ pipe ─────▶├── reads pipe ──▶ routine ring
-├── detector  ──┤   (non-blocking write)        ├── batches + OTLP-encodes
-└── lifecycle ──┘                               ├── POST /v1/logs, /v1/metrics
-   writes incidents ─────────▶ spool dir ◀──────┘   (bearer PHOTON_TOKEN, DNS,
+├── sampler    ─┐                              ├── watches spool dir ──▶ incidents
+├── detector   ─┼─ framed records ─▶ pipe ────▶├── reads pipe ──▶ routine ring
+└── lifecycle  ─┘   (non-blocking write)       ├── batches + OTLP-encodes
+   detector writes incidents ──▶ spool dir ◀───├── POST /v1/logs, /v1/metrics
+   (logs_tail + error dedup, as today)         └──  (bearer PHOTON_TOKEN, DNS,
                                                       10 s socket timeouts)
+
+capture.zig ring feeds the incident bundle's logs_tail (unchanged) —
+it does NOT feed the pipe. No raw log line ever crosses to the child.
 ```
 
 ### Consolidation: the child replaces per-incident re-exec
@@ -97,24 +109,23 @@ one child, same bounded-budget shape).
 
 - One `pipe2(O_NONBLOCK | O_CLOEXEC)`; child inherits the read end.
 - Core writes **fixed-header framed records**: `[u8 kind][u16 len][payload]`.
-  `kind ∈ {metric_sample, log_line, lifecycle_event}`. Payload is mandor's own
-  compact internal form, **not** OTLP — OTLP encoding happens in the child so
-  the core carries no protobuf cost.
+  `kind ∈ {metric_sample, lifecycle_event}`. Payload is mandor's own compact
+  internal form, **not** OTLP — OTLP encoding happens in the child so the core
+  carries no protobuf cost.
 - **The core write is non-blocking and never retried.** If the pipe is full
   (child stalled because photon is down), `write` returns `EAGAIN` and the core
-  **drops the record and moves on**. This is the routine-class drop, and it is
-  correct: the supervision loop must never block on telemetry. Incidents are
-  unaffected — they are on the spool, not the pipe.
+  **drops the record and moves on**. The supervision loop must never block on
+  telemetry. Incidents are unaffected — they are on the spool, not the pipe.
 - No allocation: records are built in a per-record stack buffer and written in
   one syscall.
 
 ### Child internals
 
-- Bounded routine ring (fixed KB, sized from measurement, e.g. 64 KB) holding
-  framed records read from the pipe. Drop-oldest within the ring.
-- Flush trigger: on a timer (default 1 s) **and** on ring-high-water.
-- Each flush cycle: (1) scan spool, ship any new incident bundles (durable,
-  priority); (2) drain routine ring, batch by signal, OTLP-encode, POST.
+- Small bounded routine ring (fixed KB, sized from measurement) holding framed
+  records read from the pipe. Drop-oldest within the ring.
+- Flush trigger: on a timer **and** on ring-high-water.
+- Each cycle: (1) scan spool, ship any new incident bundles (durable, priority);
+  (2) drain routine ring, batch by signal, OTLP-encode, POST.
 - Reuses `relay.zig`: `resolve.resolve` (DNS/hosts), the protobuf `Writer` and
   `buildOtlp` logs encoder, `statusOk`, socket timeouts, `PHOTON_TOKEN` bearer.
 - **New encoder: OTLP metrics** (`buildOtlpMetrics`) — Gauge + Sum data points.
@@ -127,7 +138,9 @@ one child, same bounded-budget shape).
 ### 1. Incidents (already shipping) — OTLP logs `/v1/logs`
 
 Unchanged wire shape (schema v7 bundle → LogRecord, `service.name` via resource
-attrs, `mandor.bundle` attr). Only the *transport* changes: shipped by the
+attrs, `mandor.bundle` attr). The bundle already contains the **log summary**
+(`logs_tail`, error/warn flagged) and deduplicated error signatures — this is
+how log content reaches photon. Only the *transport* changes: shipped by the
 long-lived child from the spool instead of a per-incident re-exec.
 
 ### 2. Process lifecycle events — OTLP logs `/v1/logs`
@@ -142,8 +155,8 @@ The discrete facts only mandor knows. One LogRecord each:
 | oom | `worker <name> OOM-killed` | ERROR | `process.pid` |
 | health | `worker <name> <up\|down>` | INFO / WARN | `health.state` |
 
-`service.name` = worker name. Low volume (events, not streams); a restart storm
-is bounded by the detector threshold. Reuses the logs encoder verbatim.
+`service.name` = worker name. Discrete and low-volume; a restart storm is
+bounded by the detector threshold. Reuses the logs encoder verbatim.
 
 ### 3. Per-process resource metrics — OTLP metrics `/v1/metrics`
 
@@ -157,9 +170,9 @@ Straight from `sampler.zig`, one datapoint set per worker per tick (default 5 s)
 | `mandor.process.threads` | Gauge | 1 |
 | `mandor.process.restarts` | Sum (monotonic, cumulative) | 1 |
 
-Resource attr `service.name` = worker name. **This is complementary, not
-duplicative, of `photon-agent`** — the agent knows *host* CPU/RAM; only mandor
-can attribute resources *per supervised worker*.
+Resource attr `service.name` = worker name. **Complementary, not duplicative, of
+`photon-agent`** — the agent knows *host* CPU/RAM; only mandor can attribute
+resources *per supervised worker*.
 
 ### 4. Supervisor self-metrics — OTLP metrics `/v1/metrics`
 
@@ -167,13 +180,12 @@ can attribute resources *per supervised worker*.
 `mandor.supervisor.workers`, `mandor.incidents.total`. Trivial once the metrics
 encoder exists.
 
-### 5. Worker log stream — OTLP logs `/v1/logs`
+### Cut — raw worker log stream
 
-Every captured line (`capture.zig` ring, already timestamped and `[name]`-
-tagged) → LogRecord. `service.name` derived from the `[name]` prefix,
-`time_unix_nano` from the capture timestamp. **Highest volume**, so it is the
-signal most exposed to routine-class drop under backpressure — acceptable by
-design (logs are best-effort; incidents are durable).
+mandor does **not** forward per-line worker logs. It is a supervisor, not a log
+shipper; raw logs are the highest-volume, most-duplicative signal and the
+container runtime already collects stdout. Log *content* photon needs is the
+curated summary already inside the incident bundle (signal 1).
 
 ### Rejected — traces / APM
 
@@ -189,8 +201,8 @@ Wire format (OTLP vs remote_write) is a wash at this volume; **the sender
 architecture is what matters**:
 
 - **Core never blocks:** non-blocking pipe write, drop on `EAGAIN`.
-- **Child memory is bounded:** fixed routine ring, drop-oldest; no unbounded
-  queue, no growth when photon is down.
+- **Child memory is bounded:** small fixed routine ring, drop-oldest; no
+  unbounded queue, no growth when photon is down.
 - **Incidents are never dropped:** they sit durably on the spool and are retried
   next cycle; a photon outage delays them, never loses them.
 - **Every socket call times out (10 s)** — a stalled photon cannot strand the
@@ -207,20 +219,20 @@ architecture is what matters**:
 ## Config surface (simplicity preserved)
 
 - **CLI unchanged** — 4 flags. `photon=` (existing) turns the whole thing on.
-- **Default when `photon=` set:** send *all* signals (incidents + lifecycle +
-  metrics + self-metrics + logs). One key, full story.
+- **Default when `photon=` set:** send all curated signals (incidents +
+  lifecycle + per-process metrics + self-metrics). One key, full story. No raw
+  logs — nothing to opt out of.
 - **TOML-only advanced keys** (documented in `docs/CONFIG.md`):
-  - `telemetry.logs = false` — disable worker-log forwarding (the loudest one)
-  - `telemetry.metrics = false` — disable metrics
+  - `telemetry.metrics = false` — disable metric forwarding (keep incidents)
   - `telemetry.interval = "1s"` — routine flush interval
-  - `telemetry.ring = "64KiB"` — child routine buffer size
+  - `telemetry.ring = "16KiB"` — child routine buffer size
 - `PHOTON_TOKEN` bearer auth and hostname resolution: unchanged, already exist.
 
 ---
 
 ## Size budget & staging
 
-Largest addition to date. Staged so each commit is reviewable and gate-legal:
+Staged so each commit is reviewable and gate-legal:
 
 1. **Long-lived child + pipe IPC + spool watch** — replaces per-incident
    re-exec, ships incidents from the child. *Net size ~neutral* (removes
@@ -229,9 +241,8 @@ Largest addition to date. Staged so each commit is reviewable and gate-legal:
 3. **OTLP metrics encoder** (`buildOtlpMetrics`) + per-process & self-metrics.
    Largest single step (~150 lines); likely needs a `[size]` commit with a
    recorded reason.
-4. **Worker log forwarding** + TOML disable knobs. Small.
 
-Target ceiling after all four: **well under 300 KB**; hard gate 500 KB.
+Target ceiling after all three: **well under 300 KB**; hard gate 500 KB.
 
 ---
 
@@ -247,15 +258,16 @@ Target ceiling after all four: **well under 300 KB**; hard gate 500 KB.
 - **Mutation checks:** break the "ship spool before routine" ordering → a named
   test must fail; break non-blocking write (make it block) → a hang-detection
   test must fail.
-- **e2e (`test/photon/e2e.sh`, extend):** real crash + real metrics + real logs
-  through the live child to a containerized photon; assert `/api/search` shows
-  the incident, `/api/storage` shows metric rows, logs queryable.
+- **e2e (`test/photon/e2e.sh`, extend):** real crash + real metrics through the
+  live child to a containerized photon; assert `/api/search` shows the incident
+  (with its log summary) and `/api/storage` shows metric rows.
 
 ---
 
 ## Non-goals
 
 - mandor does not scrape anything (it is a producer).
+- **No raw log-line forwarding** (curated incident summary only).
 - No traces/APM (needs worker instrumentation).
 - No native OTLP on the **supervision path** — only in the child.
 - No config beyond the one key for the common case.
@@ -265,12 +277,8 @@ Target ceiling after all four: **well under 300 KB**; hard gate 500 KB.
 ## Open questions for review
 
 1. **Flush interval default** — 1 s routine flush vs aligning to the 5 s sampler
-   tick. Leaning 1 s for logs/events responsiveness, metrics naturally at 5 s.
-2. **Worker logs default on or off?** Self-sufficient argues *on*; the volume
-   and drop exposure argue a conservative *off*-by-default with `telemetry.logs
-   = true` to enable. Recommend **on** (matches "full story, one key") but flag
-   it as the one place a user might be surprised by egress volume.
-3. **Spool retention vs photon** — after the child ships an incident, does it
-   mark/prune, or leave it for the premium sidecar too? Recommend: leave the
+   tick. Leaning: lifecycle events flush at ~1 s for timeline responsiveness,
+   metrics naturally at 5 s.
+2. **Spool retention vs photon** — after the child ships an incident, leave the
    spool's existing self-pruning untouched; the child tracks a shipped-watermark
-   in memory so it does not re-ship within a run.
+   in memory so it does not re-ship within a run. (Recommended.)
