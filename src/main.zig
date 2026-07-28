@@ -384,6 +384,7 @@ test {
     // with no coverage. Reference it explicitly.
     _ = @import("relay.zig");
     _ = @import("resolve.zig");
+    _ = @import("frame.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");
