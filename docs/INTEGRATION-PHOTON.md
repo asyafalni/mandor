@@ -10,15 +10,27 @@ endpoint).
 
 ## The three story channels
 
-### 1. Metrics — works today, zero code
+### 1. Metrics — via a remote_write bridge (photon does not scrape)
 
-mandor serves Prometheus text on `--metrics=PORT` (127.0.0.1). photon accepts
-Prometheus `remote_write`. Any standard agent bridges the two, or photon can
-scrape directly when co-deployed:
+mandor serves Prometheus text on `--metrics=PORT` (127.0.0.1) — a **pull**
+endpoint. photon ingests metrics by **push** only: OTLP to `/v1/metrics`, or
+Prometheus `remote_write` to `/api/v1/write`. It has **no scraper** — verified
+against photon `main` (`f5b70df`, 2026-07-27): `photon-ingest` handles OTLP and
+`promrw_mapping`, and `photon-agent` collects host/GPU and *pushes*; nothing in
+the tree scrapes a target. A pull exporter and a push sink therefore do not
+meet on their own — a collector sits between them, scraping mandor and
+`remote_write`-ing to photon:
 
 ```
-mandor --metrics=9464  ──scrape──▶  photon (remote_write sink / collector)
+mandor --metrics=9464  ──scrape──▶  collector  ──remote_write──▶  photon /api/v1/write
 ```
+
+The collector is any standard Prometheus, Grafana Alloy, or OTel Collector
+(`remote_write: url: http://photon:4318/api/v1/write`, bearer token). This is
+one small sidecar, **not zero infra** — the honest cost of bridging a pull
+exporter to a push sink. mandor stays a plain exporter and speaks no OTLP for
+metrics; that boundary is deliberate (see Non-goals). If native push ever lands
+it will ride the existing `photon =` relay, not the supervision path.
 
 Exposed series (stable names): `mandor_worker_up`,
 `mandor_worker_restarts_total`, `mandor_worker_rss_kilobytes`,
@@ -178,6 +190,9 @@ services:
   app:
     image: my-app            # ENTRYPOINT ["/mandor", "--metrics=9464", ...]
     volumes: [mandor-state:/var/lib/mandor]
+    # photon = "photon:4318" in mandor.toml forwards incidents directly (channel 3).
+  collector:                 # bridges mandor's pull metrics to photon's push sink (channel 1)
+    image: grafana/alloy     # or prometheus / otelcol — scrape app:9464, remote_write to photon
   photon:
     image: photon
     ports: ["8080:8080"]
