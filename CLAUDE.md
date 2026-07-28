@@ -15,10 +15,15 @@
   heuristic incident summaries. **Fully offline. No network, no account, no LLM.**
 - **Premium (separate sidecar binary, later):** ships incident bundles to a
   relay → AI root-cause analysis → optional repo access → auto-fix PR.
-  mandor stays offline until the user enables a network feature in config:
-  the local metrics endpoint (`--metrics`) or photon forwarding (`photon =
-  "ip:port"`, which fire-and-forget re-execs `mandor relay` so the
-  supervision path itself never touches a socket). No config, no network.
+- **mandor OPTIONALLY speaks OTLP.** Off by default: with no `photon=` key the
+  binary opens no socket, spawns no child, and phones nowhere — the
+  offline-by-default guarantee is unchanged. When `photon = "ip:port"` IS set,
+  mandor ships incidents, per-process/supervisor metrics, and process-lifecycle
+  events to photon as OTLP. All network I/O lives in a single long-lived
+  `mandor relay --daemon` child (it owns the socket, watches the spool, drains a
+  non-blocking pipe); **the supervision path itself never touches a socket.**
+  The other network toggle is the local metrics endpoint (`--metrics`). No
+  config, no network.
 
 ## Architecture
 

@@ -5,14 +5,33 @@ OTEL-native, single-binary observability platform (logs, traces, metrics,
 APM, uptime) in Rust. mandor is a PID-1 supervisor that *produces* exactly
 the signals photon *displays*. This doc defines how mandor tells its story
 to photon — without breaking mandor's product boundary (the free binary
-never phones home; its only network surface is the optional local metrics
-endpoint).
+never phones home unless the operator opts in with `photon=`, and even then
+the supervision path itself opens no socket).
+
+> **Self-sufficient as of the OTLP-telemetry work.** When `photon=` is set,
+> mandor ships **incidents, per-process/supervisor metrics, and process
+> lifecycle events** to photon directly as OTLP — **no collector in the
+> container is required** for any of the three. A single long-lived
+> `mandor relay --daemon` child owns the socket (watches the incident spool,
+> drains a non-blocking telemetry pipe); the supervision path never touches a
+> socket. The collector note in §1 below now applies only if you additionally
+> want third-party **pull** metrics off the Prometheus `--metrics` endpoint.
+> mandor does **not** ship raw per-line worker logs and never ships traces —
+> log content reaches photon inside incident bundles (their flagged log-tail
+> summary), not as a live stream.
 
 ## The three story channels
 
-### 1. Metrics — via a remote_write bridge (photon does not scrape)
+### 1. Metrics — native OTLP push when `photon=` is set; collector only for pull
 
-mandor serves Prometheus text on `--metrics=PORT` (127.0.0.1) — a **pull**
+**With `photon=` set, mandor now pushes OTLP metrics itself** (`/v1/metrics`,
+via the relay daemon): one `ResourceMetrics` per worker (`service.name=<worker>`)
+carrying rss/cpu/fds/threads gauges and a monotonic restarts sum, plus one
+`service.name="mandor"` supervisor self-metric. No collector needed. The rest
+of this section applies **only** if you instead want to *pull* metrics off
+mandor's Prometheus endpoint with third-party tooling.
+
+mandor also serves Prometheus text on `--metrics=PORT` (127.0.0.1) — a **pull**
 endpoint. photon ingests metrics by **push** only: OTLP to `/v1/metrics`, or
 Prometheus `remote_write` to `/api/v1/write`. It has **no scraper** — verified
 against photon `main` (`f5b70df`, 2026-07-27): `photon-ingest` handles OTLP and
@@ -64,12 +83,17 @@ photon = "127.0.0.1:4318"   # that's the whole integration
 ```
 
 One config key. When set, mandor forwards every incident bundle to photon's
-OTLP/HTTP logs endpoint as **OTLP protobuf** (`application/x-protobuf`), by
-fire-and-forget re-exec of its own invisible `mandor relay` subcommand — the
-supervision path never touches a socket, and without the key mandor is fully
-offline. `--photon=ip:port` works on the CLI too. Auth: set `PHOTON_TOKEN` in
-the environment and the relay sends `Authorization: Bearer …`. The generic
-`on_incident` hook remains for custom tooling and the premium sidecar.
+OTLP/HTTP logs endpoint as **OTLP protobuf** (`application/x-protobuf`). It no
+longer re-execs `mandor relay` once per incident: instead a single long-lived
+`mandor relay --daemon` child is spawned when `photon=` is set, **watches the
+incident spool**, and ships each new bundle itself — so a crash loop spawns one
+child, not one relay per crash, and a bundle that fails to send is retried from
+the durable spool rather than lost. The supervision path never touches a socket,
+and without the key mandor is fully offline. `photon` is a `mandor.toml` key,
+not a CLI flag — the everyday CLI stays at four flags (`--config` loads the
+TOML). Auth: set `PHOTON_TOKEN` in the environment and the relay sends
+`Authorization: Bearer …`. The generic `on_incident` hook remains for custom
+tooling and the premium sidecar (a separate, per-incident detached process).
 
 Protobuf rather than JSON because OTLP/HTTP makes protobuf the mandatory
 encoding and JSON the optional one: the relay therefore works with any

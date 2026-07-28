@@ -20,7 +20,7 @@ names stay safe in the Prometheus exposition format.
 | `expected_exit = "143,129"` | — | none | Exit codes treated exactly like 0. Overridable per worker |
 | `state_dir = "/path"` | `--state-dir=` / `MANDOR_STATE_DIR` | `/var/lib/mandor` | State file + incident spool + history |
 | `metrics_port = 9464` | `--metrics=` | off | Prometheus text endpoint on 127.0.0.1 |
-| `photon = "127.0.0.1:4318"` | — | off | Auto-forward incidents to photon (OTLP); offline without it. Auth via `PHOTON_TOKEN` env |
+| `photon = "127.0.0.1:4318"` | — | off | Ship incidents + metrics + lifecycle events to photon as OTLP; fully offline without it. Auth via `PHOTON_TOKEN` env. See "photon telemetry" below |
 | `on_incident = "CMD"` | — | off | Exec CMD after each bundle write, bundle path appended |
 | `health_interval = "30s"` | — | `30s` | Probe cadence |
 | `health_start_period = "10s"` | — | `10s` | Probe failures ignored this long after spawn (until first success) |
@@ -29,6 +29,36 @@ names stay safe in the Prometheus exposition format.
 | `env_file = ".env"` | — | off | KEY=VAL file loaded into every worker's environment |
 | `psi_mem_pct = 80` | — | off | Incident when container memory pressure (PSI some avg60) sustains above this % |
 | `psi_cpu_pct = 90` | — | off | Incident when container CPU pressure sustains above this % |
+
+### photon telemetry (the `photon` key)
+
+Setting `photon = "host:port"` is the single switch that makes mandor speak
+OTLP. With it unset, mandor opens no socket and spawns no relay child — the
+offline default is unchanged. With it set, the supervisor spawns one long-lived
+`mandor relay --daemon` child that owns the socket; the supervision path itself
+never touches one. That child ships three things to photon:
+
+- **Incidents** → OTLP logs (`/v1/logs`). Read from the durable incident spool,
+  so they are **never dropped** — a bundle that fails to send is retried next
+  cycle. Each bundle already carries the flagged log-tail summary and
+  deduplicated error signatures, so log *content* reaches photon this way.
+- **Per-process + supervisor metrics** → OTLP metrics (`/v1/metrics`). One
+  `service.name` per worker (rss / cpu% / open-fds / threads as gauges, restarts
+  as a monotonic sum), plus one `service.name="mandor"` self-metric. Sampled on
+  the same cadence as the `/proc` sampler (5 s) and delivered over a
+  **non-blocking** pipe: best-effort, dropped under backpressure so telemetry
+  can never stall supervision.
+- **Process-lifecycle events** → OTLP logs (`/v1/logs`): `started`, `exited`
+  (ok / error / OOM), `restarting` (with backoff), `unhealthy`. Best-effort,
+  same pipe.
+
+mandor does **not** ship raw per-line worker logs and never ships traces; log
+content travels only inside incident bundles. These behaviours (metrics on when
+`photon` is set, the 5 s sample cadence, the daemon's internal buffer size) are
+fixed and intentionally not exposed as separate keys — `photon` is the whole
+telemetry surface, keeping to the four-CLI-flag / minimal-key rule. `PHOTON_TOKEN`
+(env, kept off the process cmdline) sets the bearer token when photon requires
+auth.
 
 ## Per-worker keys — `[worker.NAME]` sections
 

@@ -586,19 +586,29 @@ fn execChild(
 
 /// Fire-and-forget child (incident hooks): inherits stdio, own signal mask
 /// restored; reaped later as an ordinary orphan.
-/// Fork+exec a side process (incident hook, photon relay). Returns its pid so
-/// the caller can wait for it at shutdown -- mandor is PID 1 in a container,
-/// so exiting while one is mid-flight kills it. 0 means the fork failed.
+/// Fork+exec a side process (incident hook, telemetry relay daemon). Returns
+/// its pid so the caller can wait for it at shutdown -- mandor is PID 1 in a
+/// container, so exiting while one is mid-flight kills it. 0 means the fork
+/// failed.
+///
+/// `keep_fd` (>= 0) is an fd the child must INHERIT across execve. The caller
+/// creates it O_CLOEXEC so it never leaks into other children; here the child
+/// clears CLOEXEC on its own copy right before exec, so exactly this one process
+/// keeps it open and the parent's copy still closes on any later exec. Pass -1
+/// when no fd needs to survive (the on_incident hook case).
 pub fn spawnDetached(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
+    keep_fd: i32,
 ) i32 {
     const rc = linux.fork();
     if (posix.errno(rc) != .SUCCESS) return 0;
     if (rc == 0) {
         const empty = posix.sigemptyset();
         posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+        // Clear FD_CLOEXEC (the only fd flag) so this fd survives execve.
+        if (keep_fd >= 0) _ = linux.fcntl(keep_fd, linux.F.SETFD, 0);
         execArgv(argv, envp, path_env);
     }
     return @intCast(rc);

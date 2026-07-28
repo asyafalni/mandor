@@ -71,12 +71,15 @@ fn fireHook(bundle_path: []const u8) void {
     hook_path_buf[bundle_path.len] = 0;
     hook_argv[hook_argc] = @ptrCast(&hook_path_buf);
     hook_argv[hook_argc + 1] = null;
-    noteForward(spawner.spawnDetached(@ptrCast(&hook_argv), snap_environ.ptr, snap_path_env));
+    noteForward(spawner.spawnDetached(@ptrCast(&hook_argv), snap_environ.ptr, snap_path_env, -1));
 }
 
-// photon auto-forward: enabled ONLY by the `photon` config key — mandor
-// stays offline otherwise. Fire-and-forget self-exec keeps network syscalls
-// off the supervision path entirely.
+// photon telemetry: enabled ONLY by the `photon` config key — mandor stays
+// offline otherwise. As of the self-sufficient-OTLP work, incidents no longer
+// re-exec `mandor relay` per crash: the long-lived relay daemon (owned by
+// telemetry.zig, spawned by the supervisor when `photon=` is set) watches the
+// spool and ships bundles itself. `setPhoton` remains as the enable/validation
+// flag; the daemon reads the durable spool, so nothing here touches a socket.
 var photon_endpoint_buf: [64]u8 = undefined;
 var photon_endpoint_len: usize = 0;
 
@@ -88,25 +91,14 @@ pub fn setPhoton(endpoint: []const u8) bool {
     return true;
 }
 
-fn firePhoton(bundle_path: []const u8) void {
-    if (photon_endpoint_len == 0 or bundle_path.len >= hook_path_buf.len) return;
-    @memcpy(hook_path_buf[0..bundle_path.len], bundle_path);
-    hook_path_buf[bundle_path.len] = 0;
-    const argv = [_:null]?[*:0]const u8{
-        "/proc/self/exe",
-        "relay",
-        @ptrCast(&hook_path_buf),
-        @ptrCast(&photon_endpoint_buf),
-    };
-    noteForward(spawner.spawnDetached(&argv, snap_environ.ptr, snap_path_env));
-}
-
 // ------------------------------------------------- in-flight forwards
 //
-// `on_incident` and `photon` run as detached children. mandor is PID 1 in a
-// container, so exiting while one is still talking to a collector kills it and
-// the incident explaining the crash is lost -- silently, because the spawn
-// itself succeeded. Remember the live ones and give them a moment at shutdown.
+// The `on_incident` hook runs as a detached child. mandor is PID 1 in a
+// container, so exiting while one is still running kills it and whatever it was
+// doing with the incident is lost -- silently, because the spawn itself
+// succeeded. Remember the live ones and give them a moment at shutdown.
+// (photon forwarding no longer uses this path: the relay daemon is long-lived
+// and drained separately by telemetry.shutdown.)
 
 const max_forwards = 16;
 var forward_pids: [max_forwards]i32 = .{0} ** max_forwards;
@@ -122,17 +114,6 @@ fn noteForward(pid: i32) void {
     // Table full: a crash loop outrunning its forwards. Drop the oldest rather
     // than grow -- the newest incident is the one worth waiting for.
     forward_pids[0] = pid;
-}
-
-/// Reap any forward that has already finished. Called from the supervision
-/// loop so finished children do not sit as zombies between incidents.
-pub fn reapForwards() void {
-    for (&forward_pids) |*slot| {
-        if (slot.* == 0) continue;
-        var st: u32 = undefined;
-        const rc = linux.waitpid(slot.*, &st, linux.W.NOHANG);
-        if (std.posix.errno(rc) == .SUCCESS and rc != 0) slot.* = 0;
-    }
 }
 
 /// Wait up to `budget_ms` for in-flight forwards before mandor exits.
@@ -170,7 +151,9 @@ pub fn drainForwards(budget_ms: u64) usize {
 fn writeBundle(state_dir: []const u8, in: spool.BundleInput) void {
     writeTermLog(in.name, in.cause_str, in.verdict);
     if (spool.write(state_dir, in)) |path| {
-        firePhoton(path);
+        // No per-incident photon re-exec any more: the relay daemon watches the
+        // spool and ships this bundle itself. The generic on_incident hook still
+        // fires here — it is a separate, user-configured feature.
         fireHook(path);
     }
 }

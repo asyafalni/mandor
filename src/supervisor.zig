@@ -20,10 +20,15 @@ const incident = @import("incident.zig");
 const cgroup = @import("cgroup.zig");
 const metrics = @import("metrics.zig");
 const cost = @import("cost.zig");
+const telemetry = @import("telemetry.zig");
+const frame = @import("frame.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
 var workers_buf: [cli.max_workers]spawner.Worker = undefined;
+
+// Supervisor self-metric sampling window (only touched when telemetry is on).
+var self_stats: sampler.Window = .{};
 
 pub fn nowMs() u64 {
     var ts: linux.timespec = undefined;
@@ -239,6 +244,11 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     cost.init(state_dir, name_slots[0..workers.len]);
     if (cfg.photon) |endpoint| {
         _ = incident.setPhoton(endpoint);
+        // Spawn the long-lived relay daemon: it owns the socket (the supervision
+        // path never does), watches the spool for incidents, and drains the
+        // telemetry pipe for metrics/lifecycle events. Best-effort — if the
+        // spawn fails, telemetry is simply off and supervision is unaffected.
+        telemetry.spawnDaemon(endpoint, state_dir, envp, path_env);
         logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
     }
 
@@ -424,6 +434,11 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     // Long enough for a relay to finish a local round trip (resolve, connect,
     // POST); short enough that a wedged hook costs a moment, not the container.
     const forward_drain_ms: u64 = 2000;
+    // The relay daemon may still be shipping the very incident that explains
+    // this crash: close its pipe (EOF → final flush), SIGTERM it, and give it
+    // the same bounded budget to exit before we do. Then drain any on_incident
+    // hook children (separate feature, its own detached processes).
+    telemetry.shutdown(forward_drain_ms);
     const stranded = incident.drainForwards(forward_drain_ms);
     if (stranded > 0) {
         logmod.print("[mandor] {d} incident forward(s) still running after {d}ms; exiting anyway\n", .{
@@ -559,6 +574,11 @@ fn runHealth(
                     // failure mandor could produce.
                     w.health_fails = 0;
                     incident.onUnhealthy(state_dir, workers, w, health_fail_threshold, now);
+                    telemetry.emitLifecycle(.{
+                        .name = w.nameSlice(),
+                        .ev = .health_down,
+                        .t_unix_ns = telemetry.nowNs(),
+                    });
                     logmod.print("[mandor] {s} unhealthy, sending SIGTERM\n", .{w.nameSlice()});
                     w.health_killed = true;
                     posix.kill(-w.pid, .TERM) catch {};
@@ -604,6 +624,12 @@ fn spawnWorker(
     };
     w.spawn_failed = false;
     logmod.print("[mandor] spawned {s} (pid {d})\n", .{ w.nameSlice(), w.pid });
+    telemetry.emitLifecycle(.{
+        .name = w.nameSlice(),
+        .ev = .started,
+        .restarts = w.restarts,
+        .t_unix_ns = telemetry.nowNs(),
+    });
 }
 
 /// Exit code stamped on a worker that could not be spawned at all.
@@ -820,15 +846,44 @@ fn runSamplerTick(
 ) void {
     const psi = sampler.readPsi(); // container-wide, read once per tick
     const wall = wallMs();
+    const t_ns = wall *| 1_000_000; // one wall read per tick, ms → ns
     for (workers, 0..) |*w, i| {
         if (w.pid > 0) {
             sampler.sample(&w.stats, w.pid, now, psi);
             const s = w.stats.at(w.stats.len - 1);
             cost.get(i).update(s.rss_kb, s.cpu_pct, s.fds, s.threads, sampler.interval_ms, wall);
+            // Per-worker telemetry: the Sample field types match frame's exactly
+            // (rss_kb u64, cpu/fds/threads u16), so no cast can trap. No-op when
+            // telemetry is off.
+            telemetry.emitMetric(.{
+                .name = w.nameSlice(),
+                .rss_kb = s.rss_kb,
+                .cpu_pct = s.cpu_pct,
+                .fds = s.fds,
+                .threads = s.threads,
+                .restarts = w.restarts,
+                .t_unix_ns = t_ns,
+            });
             if (w.det.leakCheck(&w.stats, now)) |info|
                 incident.onLeak(state_dir, workers, w, info, now);
             checkRecycle(w, now);
         }
+    }
+    // One supervisor self-metric (service.name = "mandor") so photon can show
+    // mandor's own footprint. Guarded so the extra /proc/self read only happens
+    // when a daemon is actually consuming it.
+    if (telemetry.enabled()) {
+        sampler.sample(&self_stats, linux.getpid(), now, psi);
+        const ss = self_stats.at(self_stats.len - 1);
+        telemetry.emitMetric(.{
+            .name = "mandor",
+            .rss_kb = ss.rss_kb,
+            .cpu_pct = ss.cpu_pct,
+            .fds = ss.fds,
+            .threads = ss.threads,
+            .restarts = 0,
+            .t_unix_ns = t_ns,
+        });
     }
     // PSI stall is container-scoped: check once, attribute the
     // incident to the largest consumer of the pressured resource.
@@ -896,6 +951,34 @@ fn handleDeaths(
         else if (uptime_ms >= backoff.stable_uptime_ms) 1 else w.fail_streak + 1;
         closePipes(w);
         logDeath(w);
+        // Lifecycle: every death emits one event (clean or not, shutdown or not).
+        // A worker killed by SIGKILL while the cgroup OOM counter rose is an OOM;
+        // otherwise exited_ok/exited_err. `code` follows frame's convention: a
+        // negative value is a fatal signal, non-negative is an exit status.
+        {
+            const sigkill = switch (w.status) {
+                .signaled => |sig| sig == 9,
+                else => false,
+            };
+            const ev: frame.Event = if (oom_hit and sigkill)
+                .oom
+            else if (clean)
+                .exited_ok
+            else
+                .exited_err;
+            const ecode: i32 = switch (w.status) {
+                .exited => |code| code,
+                .signaled => |sig| -@as(i32, sig),
+                else => 0,
+            };
+            telemetry.emitLifecycle(.{
+                .name = w.nameSlice(),
+                .ev = ev,
+                .code = ecode,
+                .restarts = w.restarts,
+                .t_unix_ns = telemetry.nowNs(),
+            });
+        }
         var loop_detected = false;
         if (!sd.active and !clean) {
             w.det.recordDeath(now);
@@ -933,6 +1016,13 @@ fn handleDeaths(
             w.next_restart_ms = now + w.cur_delay_ms;
             logmod.print("[mandor] restarting {s} in {d}ms\n", .{
                 w.nameSlice(), w.cur_delay_ms,
+            });
+            telemetry.emitLifecycle(.{
+                .name = w.nameSlice(),
+                .ev = .restarting,
+                .backoff_ms = @intCast(@min(w.cur_delay_ms, std.math.maxInt(u32))),
+                .restarts = w.restarts,
+                .t_unix_ns = telemetry.nowNs(),
             });
         } else {
             w.done = true;

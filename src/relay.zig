@@ -868,6 +868,14 @@ pub fn runDaemon(
     };
     const token = spawner.findEnv(environ, "PHOTON_TOKEN") orelse "";
 
+    // Block SIGPIPE so a photon that resets the connection mid-write makes the
+    // socket write return EPIPE (handled as an ordinary send failure) instead of
+    // killing this long-lived daemon. Kept OUT of the signalfd set below so a
+    // broken pipe is never mistaken for a shutdown request.
+    var pipe_set = posix.sigemptyset();
+    posix.sigaddset(&pipe_set, .PIPE);
+    posix.sigprocmask(posix.SIG.BLOCK, &pipe_set, null);
+
     // Clean shutdown via signalfd (same synchronous model as signals.zig — no
     // async handlers). Block TERM/INT and poll the fd each cycle. If signalfd
     // setup fails, degrade to EOF-only shutdown rather than dying.
