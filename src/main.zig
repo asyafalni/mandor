@@ -400,6 +400,7 @@ test {
     _ = @import("resolve.zig");
     _ = @import("frame.zig");
     _ = @import("telemetry.zig");
+    _ = @import("hostmetrics.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");
