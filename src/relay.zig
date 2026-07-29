@@ -448,6 +448,184 @@ pub fn buildOtlpMetrics(samples: []const frame.MetricSample) error{TooLarge}![]c
     return body_buf[0..w.pos];
 }
 
+// ------------------------------------------------------- OTLP host metrics
+//
+// Node-level `system.*` metrics: ONE ResourceMetrics scoped to the host
+// (host.name/host.id/os.type), a mix of Gauges and one monotonic Sum. Unlike
+// the per-worker path each metric can carry MULTIPLE datapoints and each
+// datapoint carries attributes (cpu/state/direction/mountpoint), so this path
+// uses its own datapoint helpers rather than the single-point per-worker ones.
+//
+// Value encoding: NumberDataPoint.value is a oneof. Byte/count metrics use
+// as_int = field 6 (fixed64 wire, the integer verbatim). Ratio/load metrics
+// (utilization, load average) use as_double = field 4 (fixed64 wire, the IEEE-
+// 754 bits via @bitCast(f64)). Both tags are one byte and both bodies are 8
+// bytes, so a datapoint's value costs 9 bytes regardless of which arm is used —
+// which is why the sizing helper does not branch on is_double.
+
+/// One datapoint attribute (all host attrs are string-valued KeyValues).
+const HAttr = struct { k: []const u8, v: []const u8 };
+
+/// One NumberDataPoint: the pre-`@bitCast` u64 `value_bits` (as_int verbatim,
+/// or as_double bit pattern when `is_double`), plus its attribute set.
+const HDp = struct { value_bits: u64, is_double: bool, attrs: []const HAttr };
+
+const HKind = enum { gauge, sum };
+const HMetric = struct { name: []const u8, unit: []const u8, kind: HKind, dps: []const HDp };
+
+/// NumberDataPoint { time_unix_nano=3 (fixed64), as_double=4 | as_int=6
+/// (fixed64), attributes=7 (repeated KeyValue) }. time + value are 9 bytes
+/// each; is_double does not change the size (see the note above).
+fn hDataPointLen(attrs: []const HAttr) usize {
+    var n: usize = 9 + 9;
+    for (attrs) |a| n += delimLen(keyValueLen(a.k, a.v));
+    return n;
+}
+
+fn putHDataPoint(w: *Writer, t_ns: u64, value_bits: u64, is_double: bool, attrs: []const HAttr) void {
+    w.fixed64(3, t_ns); // time_unix_nano
+    if (is_double) w.fixed64(4, value_bits) else w.fixed64(6, value_bits); // as_double | as_int
+    for (attrs) |a| putKeyValue(w, 7, a.k, a.v); // attributes
+}
+
+/// Sum of every datapoint body — shared by the Gauge and Sum data messages.
+fn hDataPointsLen(dps: []const HDp) usize {
+    var n: usize = 0;
+    for (dps) |d| n += delimLen(hDataPointLen(d.attrs));
+    return n;
+}
+
+fn putHDataPoints(w: *Writer, t_ns: u64, dps: []const HDp) void {
+    for (dps) |d| {
+        w.delim(1, hDataPointLen(d.attrs)); // data_points (field 1, repeated)
+        putHDataPoint(w, t_ns, d.value_bits, d.is_double, d.attrs);
+    }
+}
+
+/// Sum body adds aggregation_temporality=CUMULATIVE and is_monotonic=true.
+fn hSumBodyLen(dps: []const HDp) usize {
+    return hDataPointsLen(dps) + (1 + varintLen(2)) + (1 + varintLen(1));
+}
+
+fn hMetricLen(m: HMetric) usize {
+    const body_len = switch (m.kind) {
+        .gauge => hDataPointsLen(m.dps),
+        .sum => hSumBodyLen(m.dps),
+    };
+    return delimLen(m.name.len) + delimLen(m.unit.len) + delimLen(body_len);
+}
+
+fn putHMetric(w: *Writer, m: HMetric, t_ns: u64) void {
+    w.string(1, m.name); // Metric.name
+    w.string(3, m.unit); // Metric.unit
+    switch (m.kind) {
+        .gauge => {
+            w.delim(5, hDataPointsLen(m.dps)); // Metric.gauge
+            putHDataPoints(w, t_ns, m.dps);
+        },
+        .sum => {
+            w.delim(7, hSumBodyLen(m.dps)); // Metric.sum
+            putHDataPoints(w, t_ns, m.dps);
+            w.uint(2, 2); // aggregation_temporality = CUMULATIVE
+            w.uint(3, 1); // is_monotonic = true
+        },
+    }
+}
+
+/// A ratio in [0,1] as f64 bits (as_double). Denominator 0 -> 0.0 (guard the
+/// divide). Clamped to [0,1] so a slightly inconsistent /proc delta cannot emit
+/// a nonsense utilization.
+fn ratioBits(num: u64, den: u64) u64 {
+    if (den == 0) return @bitCast(@as(f64, 0.0));
+    var r = @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
+    if (r < 0.0) r = 0.0;
+    if (r > 1.0) r = 1.0;
+    return @bitCast(r);
+}
+
+/// Encode one node HostSample as an OTLP ExportMetricsServiceRequest holding a
+/// single host-scoped ResourceMetrics. Same two-pass sizing discipline as
+/// buildOtlpMetrics: size innermost-first, refuse an oversize body, write, then
+/// assert the two passes agree. Timestamp is taken here (the frame carries no
+/// time), matching buildOtlp's clock read.
+pub fn buildOtlpHostMetrics(h: frame.Host, host_name: []const u8, host_id: []const u8) error{TooLarge}![]const u8 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    const ns: u64 = @as(u64, @intCast(ts.sec)) *| 1_000_000_000 +| @as(u64, @intCast(ts.nsec));
+
+    // Derived ratio/load values, as_double bit patterns.
+    const cpu_util_bits = ratioBits(h.cpu_total_delta -| h.cpu_idle_delta, h.cpu_total_delta);
+    const mem_util_bits = ratioBits(h.mem_used, h.mem_total);
+    const fs_util_bits = ratioBits(h.fs_used, h.fs_total);
+    const load1_bits: u64 = @bitCast(@as(f64, @floatFromInt(h.load1_milli)) / 1000.0);
+
+    // Datapoint attribute sets.
+    const a_cpu_total = [_]HAttr{.{ .k = "cpu", .v = "total" }};
+    const a_state_used = [_]HAttr{.{ .k = "state", .v = "used" }};
+    const a_state_free = [_]HAttr{.{ .k = "state", .v = "free" }};
+    const a_dir_rx = [_]HAttr{.{ .k = "direction", .v = "receive" }};
+    const a_dir_tx = [_]HAttr{.{ .k = "direction", .v = "transmit" }};
+    const a_fs_used = [_]HAttr{ .{ .k = "mountpoint", .v = "/" }, .{ .k = "state", .v = "used" } };
+    const a_fs_root = [_]HAttr{.{ .k = "mountpoint", .v = "/" }};
+    const a_none = [_]HAttr{};
+
+    // Datapoints (one array per metric so the slices outlive the sizing/write
+    // passes below).
+    const dp_cpu_util = [_]HDp{.{ .value_bits = cpu_util_bits, .is_double = true, .attrs = &a_cpu_total }};
+    const dp_cpu_count = [_]HDp{.{ .value_bits = h.logical_cpus, .is_double = false, .attrs = &a_none }};
+    const dp_load = [_]HDp{.{ .value_bits = load1_bits, .is_double = true, .attrs = &a_none }};
+    const dp_mem = [_]HDp{
+        .{ .value_bits = h.mem_used, .is_double = false, .attrs = &a_state_used },
+        .{ .value_bits = h.mem_total -| h.mem_used, .is_double = false, .attrs = &a_state_free },
+    };
+    const dp_mem_limit = [_]HDp{.{ .value_bits = h.mem_total, .is_double = false, .attrs = &a_none }};
+    const dp_mem_util = [_]HDp{.{ .value_bits = mem_util_bits, .is_double = true, .attrs = &a_none }};
+    const dp_net = [_]HDp{
+        .{ .value_bits = h.net_rx, .is_double = false, .attrs = &a_dir_rx },
+        .{ .value_bits = h.net_tx, .is_double = false, .attrs = &a_dir_tx },
+    };
+    const dp_fs_usage = [_]HDp{.{ .value_bits = h.fs_used, .is_double = false, .attrs = &a_fs_used }};
+    const dp_fs_util = [_]HDp{.{ .value_bits = fs_util_bits, .is_double = true, .attrs = &a_fs_root }};
+
+    const metrics = [_]HMetric{
+        .{ .name = "system.cpu.utilization", .unit = "1", .kind = .gauge, .dps = &dp_cpu_util },
+        .{ .name = "system.cpu.logical.count", .unit = "{cpu}", .kind = .gauge, .dps = &dp_cpu_count },
+        .{ .name = "system.cpu.load_average.1m", .unit = "1", .kind = .gauge, .dps = &dp_load },
+        .{ .name = "system.memory.usage", .unit = "By", .kind = .gauge, .dps = &dp_mem },
+        .{ .name = "system.memory.limit", .unit = "By", .kind = .gauge, .dps = &dp_mem_limit },
+        .{ .name = "system.memory.utilization", .unit = "1", .kind = .gauge, .dps = &dp_mem_util },
+        .{ .name = "system.network.io", .unit = "By", .kind = .sum, .dps = &dp_net },
+        .{ .name = "system.filesystem.usage", .unit = "By", .kind = .gauge, .dps = &dp_fs_usage },
+        .{ .name = "system.filesystem.utilization", .unit = "1", .kind = .gauge, .dps = &dp_fs_util },
+    };
+
+    // Pass 1: sizes, innermost first.
+    var scope_len: usize = 0;
+    for (metrics) |m| scope_len += delimLen(hMetricLen(m));
+    const resource_len =
+        delimLen(keyValueLen("host.name", host_name)) +
+        delimLen(keyValueLen("host.id", host_id)) +
+        delimLen(keyValueLen("os.type", "linux"));
+    const rm_len = delimLen(resource_len) + delimLen(scope_len);
+    const total = delimLen(rm_len); // ExportMetricsServiceRequest.resource_metrics
+    if (total > body_buf.len) return error.TooLarge;
+
+    // Pass 2: write.
+    var w = Writer{ .buf = &body_buf };
+    w.delim(1, rm_len); // resource_metrics
+    w.delim(1, resource_len); //   resource
+    putKeyValue(&w, 1, "host.name", host_name); //     attributes
+    putKeyValue(&w, 1, "host.id", host_id);
+    putKeyValue(&w, 1, "os.type", "linux");
+    w.delim(2, scope_len); //   scope_metrics
+    for (metrics) |m| {
+        w.delim(2, hMetricLen(m)); //   metrics (Metric)
+        putHMetric(&w, m, ns);
+    }
+    std.debug.assert(w.pos == total); // sizing and writing must agree
+    return body_buf[0..w.pos];
+}
+
 // ------------------------------------------------------- OTLP lifecycle event
 //
 // One LogRecord, same nesting as buildOtlp's logs path: the body is a rendered
@@ -814,6 +992,10 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
                     // too large to encode → drop (routine telemetry is ephemeral)
                 }
             },
+            // Host samples are decoded but not yet shipped here — Task 3 wires
+            // this to buildOtlpHostMetrics + POST /v1/metrics. Dropping for now
+            // keeps the daemon's decode loop exhaustive and never traps.
+            .host_sample => {},
         }
         off += d.used;
     }
@@ -1162,6 +1344,95 @@ test "buildOtlpMetrics rejects a batch too large for body_buf" {
     }.arr;
     for (many) |*s| s.* = .{ .name = "api", .rss_kb = 1, .cpu_pct = 1, .fds = 1, .threads = 1, .restarts = 1, .t_unix_ns = 1 };
     try testing.expectError(error.TooLarge, buildOtlpMetrics(many));
+}
+
+test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can walk" {
+    const h = frame.Host{
+        .mem_total = 1000,
+        .mem_used = 400,
+        .cpu_total_delta = 100,
+        .cpu_idle_delta = 25, // utilization = 0.75
+        .logical_cpus = 8,
+        .load1_milli = 1250,
+        .net_rx = 5000,
+        .net_tx = 7000,
+        .fs_total = 2000,
+        .fs_used = 500,
+    };
+    const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
+
+    // Resource identity: host.name first, then host.id, then os.type=linux.
+    const rm = Fields.get(body, 1).?.bytes; // resource_metrics
+    const res = Fields.get(rm, 1).?.bytes; // resource
+    var ra = Fields{ .b = res };
+    const r1 = ra.next().?.bytes;
+    const r2 = ra.next().?.bytes;
+    const r3 = ra.next().?.bytes;
+    try testing.expectEqualStrings("host.name", Fields.get(r1, 1).?.bytes);
+    try testing.expectEqualStrings("node-1", avStr(Fields.get(r1, 2).?.bytes));
+    try testing.expectEqualStrings("host.id", Fields.get(r2, 1).?.bytes);
+    try testing.expectEqualStrings("abc123", avStr(Fields.get(r2, 2).?.bytes));
+    try testing.expectEqualStrings("os.type", Fields.get(r3, 1).?.bytes);
+    try testing.expectEqualStrings("linux", avStr(Fields.get(r3, 2).?.bytes));
+
+    // Find metrics by name (a rename would leave these empty and fail below).
+    const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
+    var mit = Fields{ .b = sm };
+    var mem_usage: []const u8 = &.{};
+    var net_io: []const u8 = &.{};
+    var cpu_util: []const u8 = &.{};
+    while (mit.next()) |f| {
+        if (f.num != 2) continue; // Metric
+        const name = Fields.get(f.bytes, 1).?.bytes;
+        if (std.mem.eql(u8, name, "system.memory.usage")) mem_usage = f.bytes;
+        if (std.mem.eql(u8, name, "system.network.io")) net_io = f.bytes;
+        if (std.mem.eql(u8, name, "system.cpu.utilization")) cpu_util = f.bytes;
+    }
+    try testing.expect(mem_usage.len > 0);
+    try testing.expect(net_io.len > 0);
+    try testing.expect(cpu_util.len > 0);
+
+    // system.memory.usage is a Gauge; its first datapoint is state=used, as_int
+    // = mem_used. (Dropping the datapoint attr breaks the state assertion.)
+    const gauge = Fields.get(mem_usage, 5).?.bytes;
+    var gdps = Fields{ .b = gauge };
+    const used_dp = gdps.next().?.bytes; // data_points[0]
+    const used_kv = Fields.get(used_dp, 7).?.bytes; // NumberDataPoint.attributes
+    try testing.expectEqualStrings("state", Fields.get(used_kv, 1).?.bytes);
+    try testing.expectEqualStrings("used", avStr(Fields.get(used_kv, 2).?.bytes));
+    try testing.expectEqual(@as(u64, 400), Fields.get(used_dp, 6).?.int); // as_int
+    // second datapoint is state=free, mem_total-mem_used.
+    const free_dp = gdps.next().?.bytes;
+    const free_kv = Fields.get(free_dp, 7).?.bytes;
+    try testing.expectEqualStrings("free", avStr(Fields.get(free_kv, 2).?.bytes));
+    try testing.expectEqual(@as(u64, 600), Fields.get(free_dp, 6).?.int);
+
+    // system.cpu.utilization carries an as_double (field 4), not as_int; the
+    // bits decode to 0.75.
+    const cpu_gauge = Fields.get(cpu_util, 5).?.bytes;
+    const cpu_dp = Fields.get(cpu_gauge, 1).?.bytes;
+    try testing.expect(Fields.get(cpu_dp, 6) == null); // no as_int
+    const util: f64 = @bitCast(Fields.get(cpu_dp, 4).?.int); // as_double bits
+    try testing.expectApproxEqAbs(@as(f64, 0.75), util, 1e-9);
+
+    // system.network.io is a Sum (field 7, not a Gauge), monotonic cumulative,
+    // and its first datapoint has a direction attribute.
+    try testing.expect(Fields.get(net_io, 5) == null); // not a gauge
+    const sum = Fields.get(net_io, 7).?.bytes;
+    try testing.expectEqual(@as(u64, 2), Fields.get(sum, 2).?.int); // CUMULATIVE
+    try testing.expectEqual(@as(u64, 1), Fields.get(sum, 3).?.int); // is_monotonic
+    var sdps = Fields{ .b = sum };
+    var first_sdp: []const u8 = &.{};
+    while (sdps.next()) |f| {
+        if (f.num == 1) {
+            first_sdp = f.bytes;
+            break;
+        }
+    }
+    const dir_kv = Fields.get(first_sdp, 7).?.bytes; // NumberDataPoint.attributes
+    try testing.expectEqualStrings("direction", Fields.get(dir_kv, 1).?.bytes);
+    try testing.expectEqualStrings("receive", avStr(Fields.get(dir_kv, 2).?.bytes));
+    try testing.expectEqual(@as(u64, 5000), Fields.get(first_sdp, 6).?.int); // net_rx
 }
 
 test "Shipped set tracks names and sweeps entries no longer on disk" {
