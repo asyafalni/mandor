@@ -341,6 +341,23 @@ pub fn addGlobalEnv(entry: []const u8) bool {
 fn setName(w: *Worker, argv0: []const u8, prior: []const Worker) void {
     var base = argv0;
     if (std.mem.lastIndexOfScalar(u8, argv0, '/')) |i| base = argv0[i + 1 ..];
+    assignName(w, base, prior);
+}
+
+/// Byte a name may not hold: the Prometheus exposition format has no escaping
+/// for label values, so a quote/backslash/control byte would silently corrupt
+/// every scrape. Neutralized to '_' before the name is stored.
+fn unsafeNameByte(c: u8) bool {
+    return c == '"' or c == '\\' or c < 0x20;
+}
+
+/// Write `base` into `w.name`: length-cap (room for a "-NN" dedup suffix),
+/// dedup against `prior`, then neutralize Prometheus-unsafe bytes. The one
+/// place a display/telemetry name is finalized — both basename derivation and
+/// the TOML `name` override flow through here so capping, dedup, and
+/// neutralization are identical.
+fn assignName(w: *Worker, raw: []const u8, prior: []const Worker) void {
+    var base = raw;
     if (base.len > name_cap - 4) base = base[0 .. name_cap - 4]; // room for "-NN"
     var dupes: usize = 0;
     for (prior) |*p| {
@@ -362,12 +379,33 @@ fn setName(w: *Worker, argv0: []const u8, prior: []const Worker) void {
         w.name_len = @intCast(base.len + suffix.len);
     }
     // The name is a basename, so it can hold any byte a filename can. JSON
-    // sinks escape it, but the Prometheus exposition format has no escaping
-    // for label values — a quote or backslash would silently corrupt every
-    // scrape. Neutralize once here rather than at each sink.
+    // sinks escape it, but the Prometheus format does not — neutralize once
+    // here rather than at each sink.
     for (w.name[0..w.name_len]) |*c| {
-        if (c.* == '"' or c.* == '\\' or c.* < 0x20) c.* = '_';
+        if (unsafeNameByte(c.*)) c.* = '_';
     }
+}
+
+/// Apply a TOML `name` override to an already-initialized worker, reusing the
+/// basename path's cap + dedup + neutralize (so a colliding or Prometheus-unsafe
+/// override is handled identically). Returns false — a hard config error — when
+/// the override is empty, longer than the name buffer allows, or made entirely
+/// of bytes that would neutralize away: configs are small, so a typo stops
+/// startup rather than silently keeping the derived name. `prior` are the
+/// workers to dedup against (those already finalized, i.e. lower index).
+pub fn setNameOverride(w: *Worker, override: []const u8, prior: []const Worker) bool {
+    if (override.len == 0) return false;
+    if (override.len > name_cap - 4) return false; // explicit intent: don't truncate
+    var has_valid = false;
+    for (override) |c| {
+        if (!unsafeNameByte(c)) {
+            has_valid = true;
+            break;
+        }
+    }
+    if (!has_valid) return false; // every byte would become '_'
+    assignName(w, override, prior);
+    return true;
 }
 
 /// Look up NAME= in the environ block.
@@ -662,6 +700,43 @@ test "names are neutralized for the unescaped metrics sink" {
     var w: Worker = undefined;
     setName(&w, "./we\"ird\\na\nme", &.{});
     try std.testing.expectEqualStrings("we_ird_na_me", w.nameSlice());
+}
+
+test "name override replaces the derived name" {
+    var w: Worker = undefined;
+    setName(&w, "./start.sh", &.{}); // derives "start.sh"
+    try std.testing.expect(setNameOverride(&w, "api", &.{}));
+    // The override flows through the single nameSlice() everything reads.
+    try std.testing.expectEqualStrings("api", w.nameSlice());
+}
+
+test "name override is neutralized like a basename" {
+    var w: Worker = undefined;
+    setName(&w, "./worker", &.{});
+    try std.testing.expect(setNameOverride(&w, "a\"b\\c\td", &.{}));
+    try std.testing.expectEqualStrings("a_b_c_d", w.nameSlice());
+}
+
+test "name overrides colliding on the same name dedup" {
+    var workers: [2]Worker = undefined;
+    setName(&workers[0], "./start.sh", &.{});
+    setName(&workers[1], "./worker", workers[0..1]);
+    // Applied in index order, each dedups against the workers before it.
+    try std.testing.expect(setNameOverride(&workers[0], "api", workers[0..0]));
+    try std.testing.expect(setNameOverride(&workers[1], "api", workers[0..1]));
+    try std.testing.expectEqualStrings("api", workers[0].nameSlice());
+    try std.testing.expectEqualStrings("api-2", workers[1].nameSlice());
+}
+
+test "name override rejects empty and all-invalid" {
+    var w: Worker = undefined;
+    setName(&w, "./worker", &.{});
+    try std.testing.expect(!setNameOverride(&w, "", &.{})); // empty
+    try std.testing.expect(!setNameOverride(&w, "\"\\\t", &.{})); // all neutralize
+    const too_long = "x" ** (name_cap - 3);
+    try std.testing.expect(!setNameOverride(&w, too_long, &.{})); // too long
+    // A rejected override never touched the derived name.
+    try std.testing.expectEqualStrings("worker", w.nameSlice());
 }
 
 test "findPath falls back to default" {

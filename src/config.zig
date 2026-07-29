@@ -47,6 +47,10 @@ pub const FileConfig = struct {
     /// Per-worker `expected_exit` overrides ("name" -> "143,129").
     expected_pairs: [16]cli.HealthSpec = undefined,
     expected_pairs_n: u8 = 0,
+    /// Per-worker display/telemetry `name` overrides ("start.sh" -> "api").
+    /// Keyed by the DERIVED basename (the section name); the value replaces it.
+    name_pairs: [16]cli.HealthSpec = undefined,
+    name_pairs_n: u8 = 0,
     /// Workers marked `essential = false`. Every worker is essential by
     /// default, so this records the *opt-outs*.
     not_essential: [16][]const u8 = undefined,
@@ -58,7 +62,7 @@ pub const FileConfig = struct {
     commands: []const []const u8 = &.{},
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, user, cap_drop, oom, nice, max_rss, lifetime, expected, pre_stop };
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, user, cap_drop, oom, nice, max_rss, lifetime, expected, pre_stop, name };
 
 /// Per-worker settings all land in `worker -> value` pair arrays; map the
 /// section key to its slot.
@@ -76,6 +80,7 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
         .lifetime => .{ .arr = &cfg.lifetime_pairs, .n = &cfg.lifetime_pairs_n },
         .expected => .{ .arr = &cfg.expected_pairs, .n = &cfg.expected_pairs_n },
         .pre_stop => .{ .arr = &cfg.prestop_pairs, .n = &cfg.prestop_pairs_n },
+        .name => .{ .arr = &cfg.name_pairs, .n = &cfg.name_pairs_n },
         else => null,
     };
 }
@@ -211,6 +216,7 @@ fn workerKey(key: []const u8) ?ArrayTarget {
         .{ "oom_score_adj", ArrayTarget.oom },      .{ "nice", ArrayTarget.nice },
         .{ "max_rss_mb", ArrayTarget.max_rss },     .{ "max_lifetime", ArrayTarget.lifetime },
         .{ "expected_exit", ArrayTarget.expected }, .{ "pre_stop", ArrayTarget.pre_stop },
+        .{ "name", ArrayTarget.name },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, key, entry[0])) return entry[1];
@@ -225,7 +231,12 @@ fn sectionWorker(line: []const u8) ParseError!?[]const u8 {
     const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
     const prefix = "worker.";
     if (!std.mem.startsWith(u8, inner, prefix)) return error.Syntax;
-    const name = std.mem.trim(u8, inner[prefix.len..], " \t");
+    var name = std.mem.trim(u8, inner[prefix.len..], " \t");
+    // A TOML-quoted key lets a name with a dot read naturally —
+    // `[worker."start.sh"]` — since a bare dot would otherwise look like a
+    // nested table. The subset takes the literal remainder either way.
+    if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"')
+        name = name[1 .. name.len - 1];
     if (name.len == 0) return error.Syntax;
     return name;
 }
@@ -422,6 +433,20 @@ test "worker section: scalars, bare ints, membership flags" {
     // so only the explicit opt-out is listed.
     try t.expectEqual(@as(u8, 1), cfg.not_essential_n);
     try t.expectEqualStrings("cron", cfg.not_essential[0]);
+}
+
+test "worker section: name override keyed by derived basename" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\workers = ["./start.sh --serve", "./worker"]
+        \\
+        \\[worker."start.sh"]
+        \\name = "api"
+    ;
+    const cfg = try parseTest(text, &storage);
+    try t.expectEqual(@as(u8, 1), cfg.name_pairs_n);
+    try t.expectEqualStrings("start.sh", cfg.name_pairs[0].worker);
+    try t.expectEqualStrings("api", cfg.name_pairs[0].cmd);
 }
 
 test "worker section: multiline env array keeps its worker" {

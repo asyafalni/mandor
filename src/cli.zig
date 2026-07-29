@@ -83,6 +83,9 @@ pub const Config = struct {
     /// Per-worker `expected_exit` overrides ("name" -> "143,129").
     expected_pairs: [16]HealthSpec = undefined,
     expected_pairs_n: u8 = 0,
+    /// Per-worker display/telemetry `name` overrides (derived basename -> name).
+    name_pairs: [16]HealthSpec = undefined,
+    name_pairs_n: u8 = 0,
     /// Workers marked `essential = false`. Every worker is essential by
     /// default — its failure ends the run — so this records the opt-outs.
     not_essential: [16][]const u8 = undefined,

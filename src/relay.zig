@@ -11,6 +11,7 @@ const spawner = @import("spawner.zig");
 const resolve = @import("resolve.zig");
 const frame = @import("frame.zig");
 const spool = @import("spool.zig");
+const hostmetrics = @import("hostmetrics.zig");
 
 /// Wall-clock ceiling on each blocking socket call. Generous enough that a
 /// merely slow collector still succeeds, short enough that a hung one cannot
@@ -949,6 +950,15 @@ const metric_batch_cap = 64;
 var metric_samples: [metric_batch_cap]frame.MetricSample = undefined;
 var metric_names: [metric_batch_cap][ship_name_cap]u8 = undefined;
 
+// Host identity for the `system.*` resource, read ONCE at daemon start (it does
+// not change for the daemon's life) into these fixed buffers; drainPipe ships
+// host samples with the slices below, so the drain path never re-reads /proc or
+// allocates. Default to "unknown" until runDaemon populates them.
+var daemon_host_name_buf: [256]u8 = undefined;
+var daemon_host_id_buf: [256]u8 = undefined;
+var daemon_host_name: []const u8 = "unknown";
+var daemon_host_id: []const u8 = "unknown";
+
 /// Drain everything currently readable from the pipe, ship it best-effort, and
 /// report whether EOF (parent gone) was seen. Metric samples are batched into a
 /// single OTLP request; lifecycle events post one LogRecord each. Any encode or
@@ -992,10 +1002,17 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
                     // too large to encode → drop (routine telemetry is ephemeral)
                 }
             },
-            // Host samples are decoded but not yet shipped here — Task 3 wires
-            // this to buildOtlpHostMetrics + POST /v1/metrics. Dropping for now
-            // keeps the daemon's decode loop exhaustive and never traps.
-            .host_sample => {},
+            // Node host sample → one host-scoped ResourceMetrics on /v1/metrics.
+            // Same best-effort shape as lifecycle_event: build inline into
+            // body_buf, post, drop on any encode failure. daemon_host_name/id
+            // were read once at daemon start.
+            .host_sample => |h| {
+                if (buildOtlpHostMetrics(h, daemon_host_name, daemon_host_id)) |b| {
+                    _ = post(host, port, "/v1/metrics", b, token);
+                } else |_| {
+                    // too large to encode → drop (routine telemetry is ephemeral)
+                }
+            },
         }
         off += d.used;
     }
@@ -1069,6 +1086,11 @@ pub fn runDaemon(
     defer {
         if (sigfd >= 0) _ = linux.close(sigfd);
     }
+
+    // Host identity for the system.* resource attributes: read once here (it is
+    // stable for the daemon's life) so drainPipe's ship path never re-reads /proc.
+    daemon_host_name = hostmetrics.hostName(&daemon_host_name_buf);
+    daemon_host_id = hostmetrics.hostId(&daemon_host_id_buf);
 
     var shipped: Shipped = .{};
 

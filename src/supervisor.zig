@@ -22,6 +22,7 @@ const metrics = @import("metrics.zig");
 const cost = @import("cost.zig");
 const telemetry = @import("telemetry.zig");
 const frame = @import("frame.zig");
+const hostmetrics = @import("hostmetrics.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -29,6 +30,10 @@ var workers_buf: [cli.max_workers]spawner.Worker = undefined;
 
 // Supervisor self-metric sampling window (only touched when telemetry is on).
 var self_stats: sampler.Window = .{};
+
+// Node host-metrics sampler: one fixed struct held across ticks so it keeps the
+// prior CPU/net reading for delta derivation. Only sampled when telemetry is on.
+var host_sampler: hostmetrics.Sampler = .{};
 
 pub fn nowMs() u64 {
     var ts: linux.timespec = undefined;
@@ -149,6 +154,29 @@ fn applyConfig(
                 return 2;
             }
             cur = dep_of[c];
+        }
+    }
+    // Name overrides run LAST of the name-keyed steps: applying one renames the
+    // worker, so every lookup that keys on the derived section name (the pair
+    // table, essential, oneshot, start_after) must already be resolved. Warn on
+    // an unknown section like the others, then apply in index order so each
+    // override dedups against the workers before it — exactly as basenames do.
+    // A single assignment to w.name here reaches every downstream sink through
+    // nameSlice() (log prefix, report, Prometheus, incident service.name).
+    for (cfg.name_pairs[0..cfg.name_pairs_n]) |pair| {
+        if (findWorker(workers, pair.worker) == null) {
+            logmod.print("[mandor] name: no worker named {s}\n", .{pair.worker});
+            setup_warnings += 1;
+        }
+    }
+    for (workers, 0..) |*w, i| {
+        for (cfg.name_pairs[0..cfg.name_pairs_n]) |pair| {
+            if (!std.mem.eql(u8, w.nameSlice(), pair.worker)) continue;
+            if (!spawner.setNameOverride(w, pair.cmd, workers[0..i])) {
+                logmod.print("[mandor] name: bad override for {s}\n", .{pair.worker});
+                return 2;
+            }
+            break;
         }
     }
     if (cfg.on_incident) |cmd| {
@@ -883,6 +911,26 @@ fn runSamplerTick(
             .threads = ss.threads,
             .restarts = 0,
             .t_unix_ns = t_ns,
+        });
+        // Node-level host metrics: one sample per tick so each worker is visible
+        // against the node total in photon's Infrastructure view. sample() never
+        // traps (unreadable /proc → zeros) and emitHost is a non-blocking write
+        // that drops on backpressure, so this cannot stall supervision. The wire
+        // type frame.Host mirrors hostmetrics.HostSample field-for-field; build
+        // it at the call site (as the per-worker emitMetric above does) since the
+        // two are distinct named structs and Zig does not coerce between them.
+        const hs = host_sampler.sample();
+        telemetry.emitHost(.{
+            .mem_total = hs.mem_total,
+            .mem_used = hs.mem_used,
+            .cpu_total_delta = hs.cpu_total_delta,
+            .cpu_idle_delta = hs.cpu_idle_delta,
+            .logical_cpus = hs.logical_cpus,
+            .load1_milli = hs.load1_milli,
+            .net_rx = hs.net_rx,
+            .net_tx = hs.net_tx,
+            .fs_total = hs.fs_total,
+            .fs_used = hs.fs_used,
         });
     }
     // PSI stall is container-scoped: check once, attribute the

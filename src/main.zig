@@ -213,6 +213,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.lifetime_pairs_n = file_cfg.lifetime_pairs_n;
             cfg.expected_pairs = file_cfg.expected_pairs;
             cfg.expected_pairs_n = file_cfg.expected_pairs_n;
+            cfg.name_pairs = file_cfg.name_pairs;
+            cfg.name_pairs_n = file_cfg.name_pairs_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.env_file) |path| {

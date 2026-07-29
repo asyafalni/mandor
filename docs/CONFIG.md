@@ -48,6 +48,19 @@ never touches one. That child ships three things to photon:
   the same cadence as the `/proc` sampler (5 s) and delivered over a
   **non-blocking** pipe: best-effort, dropped under backpressure so telemetry
   can never stall supervision.
+- **Node / host metrics** → OTLP metrics (`/v1/metrics`). One host-scoped
+  resource (`host.name` / `host.id` / `os.type="linux"`) carrying the node total
+  so each worker is visible against its host baseline in photon's Infrastructure
+  view. Emitted automatically whenever `photon` is set — there is **no separate
+  toggle** (same minimal-surface rule as the rest of telemetry), sampled on the
+  same 5 s cadence, over the same non-blocking, drop-under-backpressure pipe.
+  Metrics shipped: `system.cpu.utilization`, `system.cpu.logical.count`,
+  `system.cpu.load_average.1m`, `system.memory.usage` (`state=used|free`),
+  `system.memory.limit`, `system.memory.utilization`, `system.network.io`
+  (monotonic sum, `direction=receive|transmit`), `system.filesystem.usage` and
+  `system.filesystem.utilization` (`mountpoint=/`). Host identity comes from
+  `/proc/sys/kernel/hostname` and `/etc/machine-id` (falling back to `boot_id`,
+  then the literal `unknown`).
 - **Process-lifecycle events** → OTLP logs (`/v1/logs`): `started`, `exited`
   (ok / error / OOM), `restarting` (with backoff), `unhealthy`. Best-effort,
   same pipe.
@@ -65,7 +78,9 @@ auth.
 Anything specific to one worker lives in a `[worker.NAME]` section, where
 `NAME` is the worker's derived name (see above). Unknown sections and unknown
 keys inside a section are hard errors — configs are small, so a typo should
-stop startup rather than be silently ignored.
+stop startup rather than be silently ignored. A name containing a dot can be
+quoted so it reads naturally: `[worker."start.sh"]`. Use the `name` key inside a
+section to override that derived name everywhere it surfaces.
 
 ```toml
 workers = ["./migrate", "./api --port 8080", "./worker", "./metrics-shipper"]
@@ -101,6 +116,7 @@ essential = false   # a sidecar: its death should not take the app down
 | `max_lifetime` | duration string | Periodic recycle |
 | `expected_exit` | string | Exit codes that mean success **for this worker only** — e.g. `"3"` for a job that reports "nothing to do". Replaces the global set |
 | `pre_stop` | string | Drain command on graceful shutdown; TERM follows its completion |
+| `name` | string | Override the display/telemetry name (log prefix, `report`, Prometheus label, incident `service.name`). The section is still keyed by the derived basename; the override replaces it everywhere. Empty, too long (>28 bytes), or all-invalid overrides are rejected; collisions dedup (`-2`) like basenames |
 
 `oneshot` defaults to `false`; `essential` defaults to **`true`**, so the
 value you write is the one that differs from the default.
