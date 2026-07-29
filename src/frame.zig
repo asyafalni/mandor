@@ -354,8 +354,16 @@ test "host sample survives encode -> decode" {
 test "host decode returns null on a truncated frame" {
     var out: [128]u8 = undefined;
     const bytes = try encodeHost(&out, .{
-        .mem_total = 1, .mem_used = 1, .cpu_total_delta = 1, .cpu_idle_delta = 1,
-        .logical_cpus = 1, .load1_milli = 1, .net_rx = 1, .net_tx = 1, .fs_total = 1, .fs_used = 1,
+        .mem_total = 1,
+        .mem_used = 1,
+        .cpu_total_delta = 1,
+        .cpu_idle_delta = 1,
+        .logical_cpus = 1,
+        .load1_milli = 1,
+        .net_rx = 1,
+        .net_tx = 1,
+        .fs_total = 1,
+        .fs_used = 1,
     });
     var scratch: [1]u8 = undefined;
     try testing.expect(decode(bytes[0 .. bytes.len - 1], &scratch) == null);
