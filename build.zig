@@ -6,8 +6,8 @@ pub fn build(b: *std.Build) void {
     const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse
         (optimize != .Debug);
 
-    // Version stamped into the binary; overridable in CI: -Dversion=v0.15.0.
-    const version = b.option([]const u8, "version", "Version string") orelse "0.15.0-dev";
+    // Version stamped into the binary; overridable in CI: -Dversion=v1.7.0.
+    const version = b.option([]const u8, "version", "Version string") orelse "1.7.0";
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "version", version);
 
