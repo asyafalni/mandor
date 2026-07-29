@@ -3,6 +3,65 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.7.0] - 2026-07-29
+
+mandor becomes self-sufficient for its container: with one `mandor.toml` key it
+ships its whole story to photon as OTLP, and reports the node it runs on so each
+supervised process is visible against the node's total resources. Verified end
+to end against a real photon instance.
+
+### Added
+- **Self-sufficient OTLP telemetry — `photon = "host:port"` is the whole
+  switch.** When set, the supervisor spawns one long-lived `mandor relay
+  --daemon` child that owns the socket and ships three signals as OTLP protobuf:
+  **incidents** (from the durable spool — retried on failure, never dropped),
+  **process lifecycle events** (started / exited / restarting / oom / health, as
+  `/v1/logs` records), and **per-process resource metrics** (rss, cpu, fds,
+  threads, restarts, one `ResourceMetrics` per worker with `service.name` — to
+  `/v1/metrics`). The core writes compact framed records to the daemon over a
+  **non-blocking pipe** and drops on backpressure; **the supervision path never
+  touches a socket**, and with no `photon=` key mandor is fully offline. The
+  daemon replaces the old per-incident `mandor relay` re-exec, so a crash loop
+  spawns one child, not one process per crash. Auth via `PHOTON_TOKEN`.
+
+- **Node host metrics — mandor populates photon's Infrastructure view**, making
+  a separate host agent unnecessary for a supervised container. The daemon emits
+  the `system.*` metrics photon expects (`system.cpu.utilization`,
+  `cpu.logical.count`, `cpu.load_average.1m`, `memory.usage`/`limit`/
+  `utilization`, `network.io`, `filesystem.usage`/`utilization`) with a
+  `host.name`/`host.id`/`os.type` resource, sourced from node-scoped `/proc`
+  (`meminfo`, `stat`, `loadavg`, `net/dev`) and `statfs("/")`. Combined with the
+  per-process metrics above, photon shows **each process against the node total
+  and which one is heaviest** — the reason this exists. New `src/hostmetrics.zig`
+  parses `/proc` with saturating arithmetic (untrusted input, never a trap); a
+  hand-declared `struct statfs` (Zig 0.16 ships no wrapper) is validated by a
+  live smoke test.
+
+- **TOML per-worker name override.** `[worker."start.sh"] name = "api"` renames a
+  worker everywhere its derived name flows — log prefix, `report`, Prometheus
+  label, incident `service.name`, lifecycle events, metrics — so a `start.sh`
+  wrapper can present cleanly as `api`. Shares the basename path's cap / dedup /
+  neutralize; an empty or all-unsafe override is a hard config error. TOML-only;
+  the everyday CLI stays four flags.
+
+### Changed
+- **The product boundary is now "mandor *optionally* speaks OTLP"** (was "mandor
+  will not speak OTLP natively"). Off by default; opt-in via `photon=`; all
+  network I/O lives in the relay child, never the supervision path.
+  `docs/INTEGRATION-PHOTON.md` rewritten: mandor is self-sufficient, no collector
+  needed for incidents/metrics/lifecycle; a stale "`--photon` works on the CLI"
+  claim and a wrong "photon scrapes Prometheus" claim were both corrected
+  (photon is push-only; `photon` is a TOML key).
+
+### Notes
+- Size: x86_64 musl ReleaseSafe stripped **291,888 bytes** (256,184 at v1.6.5;
+  +35.7 KB for both features), well under the 500 KB budget. OTLP protobuf and
+  the `/proc` readers are hand-rolled — no new dependencies.
+- Verified against a live photon: a real supervised crash and its metrics
+  appear as a structured incident, lifecycle timeline, and `system.*`/process
+  series (memory 4.1 GB, cpu, 25 GB filesystem via the hand-rolled `statfs`).
+  164 unit tests; e2e in `test/photon/{daemon,supervised,host-metrics}-e2e.sh`.
+
 ## [1.6.5] - 2026-07-23
 
 ### Fixed
