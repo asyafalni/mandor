@@ -409,7 +409,7 @@ const restart_metric_unit = "{restart}";
 /// one ResourceMetrics per sample. Mirrors buildOtlp's two-pass sizing: pass 1
 /// sizes innermost-first and refuses a batch that will not fit body_buf, pass 2
 /// writes, and the final assert proves the two agree.
-pub fn buildOtlpMetrics(samples: []const frame.MetricSample) error{TooLarge}![]const u8 {
+pub fn buildOtlpMetrics(samples: []const frame.MetricSample, host_name: []const u8) error{TooLarge}![]const u8 {
     // Pass 1: sizes, innermost first.
     var total: usize = 0;
     for (samples) |s| {
@@ -417,7 +417,8 @@ pub fn buildOtlpMetrics(samples: []const frame.MetricSample) error{TooLarge}![]c
         for (gauge_metrics) |g| scope_len += delimLen(gaugeMetricLen(g.name, g.unit));
         scope_len += delimLen(sumMetricLen(restart_metric_name, restart_metric_unit));
 
-        const resource_len = delimLen(keyValueLen("service.name", s.name));
+        const resource_len = delimLen(keyValueLen("service.name", s.name)) +
+            delimLen(keyValueLen("host.name", host_name));
         const rm_len = delimLen(resource_len) + delimLen(scope_len);
         total += delimLen(rm_len);
     }
@@ -429,12 +430,14 @@ pub fn buildOtlpMetrics(samples: []const frame.MetricSample) error{TooLarge}![]c
         var scope_len: usize = 0;
         for (gauge_metrics) |g| scope_len += delimLen(gaugeMetricLen(g.name, g.unit));
         scope_len += delimLen(sumMetricLen(restart_metric_name, restart_metric_unit));
-        const resource_len = delimLen(keyValueLen("service.name", s.name));
+        const resource_len = delimLen(keyValueLen("service.name", s.name)) +
+            delimLen(keyValueLen("host.name", host_name));
         const rm_len = delimLen(resource_len) + delimLen(scope_len);
 
         w.delim(1, rm_len); // resource_metrics
         w.delim(1, resource_len); //   resource
         putKeyValue(&w, 1, "service.name", s.name); //     attributes
+        putKeyValue(&w, 1, "host.name", host_name); //     (so the process is attributable to its node)
         w.delim(2, scope_len); //   scope_metrics
 
         const values = [_]u64{ s.rss_kb, s.cpu_pct, s.fds, s.threads };
@@ -1030,7 +1033,7 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
     }
 
     if (n_samples > 0) {
-        if (buildOtlpMetrics(metric_samples[0..n_samples])) |b| {
+        if (buildOtlpMetrics(metric_samples[0..n_samples], daemon_host_name)) |b| {
             _ = post(host, port, "/v1/metrics", b, token);
         } else |_| {
             // batch too large → drop
@@ -1328,13 +1331,19 @@ test "buildOtlp rejects a bundle too large for the body buffer" {
 
 test "buildOtlpMetrics emits per-worker gauges photon can walk" {
     const s = frame.MetricSample{ .name = "api", .rss_kb = 1000, .cpu_pct = 50, .fds = 10, .threads = 4, .restarts = 2, .t_unix_ns = 1_700_000_000_000_000_000 };
-    const body = try buildOtlpMetrics(&.{s});
+    const body = try buildOtlpMetrics(&.{s}, "node-1");
 
     const rm = Fields.get(body, 1).?.bytes; // resource_metrics
     const res = Fields.get(rm, 1).?.bytes; // resource
-    const attr = Fields.get(res, 1).?.bytes; // first attribute
+    // Two resource attributes, in order: service.name then host.name (the latter
+    // lets photon attribute the process to its node for the Host-detail view).
+    var res_attrs = Fields{ .b = res };
+    const attr = res_attrs.next().?.bytes; // service.name
     try testing.expectEqualStrings("service.name", Fields.get(attr, 1).?.bytes);
     try testing.expectEqualStrings("api", avStr(Fields.get(attr, 2).?.bytes));
+    const hattr = res_attrs.next().?.bytes; // host.name
+    try testing.expectEqualStrings("host.name", Fields.get(hattr, 1).?.bytes);
+    try testing.expectEqualStrings("node-1", avStr(Fields.get(hattr, 2).?.bytes));
 
     const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
     // first Metric is the rss gauge; datapoint as_int == rss_kb (1000)
@@ -1365,7 +1374,7 @@ test "buildOtlpMetrics rejects a batch too large for body_buf" {
         var arr: [body_buf.len / 200 + 1]frame.MetricSample = undefined;
     }.arr;
     for (many) |*s| s.* = .{ .name = "api", .rss_kb = 1, .cpu_pct = 1, .fds = 1, .threads = 1, .restarts = 1, .t_unix_ns = 1 };
-    try testing.expectError(error.TooLarge, buildOtlpMetrics(many));
+    try testing.expectError(error.TooLarge, buildOtlpMetrics(many, "host"));
 }
 
 test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can walk" {
