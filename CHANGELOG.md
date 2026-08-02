@@ -3,6 +3,18 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.7.1] - 2026-08-02
+
+### Added
+- **Per-worker process metrics now carry `host.name`** (alongside `service.name`)
+  in their OTLP resource, so an observability backend can attribute each process
+  to the node it runs on — e.g. a per-host "processes" view that ranks each
+  supervised worker's CPU/RSS against the node's totals. Verified against photon:
+  its metric ingest merges resource attributes onto every point and promotes
+  both `service.name` and `host.name`, so `process.*{host.name=…}` groups per
+  host with no further config. Purely additive; the existing `service.name`
+  grouping is unchanged.
+
 ## [1.7.0] - 2026-07-29
 
 mandor becomes self-sufficient for its container: with one `mandor.toml` key it
