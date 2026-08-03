@@ -3,6 +3,23 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.7.2] - 2026-08-03
+
+### Changed
+- **Per-worker process metrics renamed to OTel process semantic conventions**, so
+  any OTLP backend (photon, an OTel Collector) reads them with no translation:
+  `process.cpu.percent` → **`process.cpu.utilization`** (now a 0..1 fraction,
+  encoded `as_double`), `process.memory.rss` (kB) → **`process.memory.usage`**
+  (bytes), `process.open_fds` → **`process.unix.file_descriptor.count`**,
+  `process.threads` → **`process.thread.count`**. `process.restarts` (a monotonic
+  cumulative Sum) is kept as a mandor-specific extension — there is no semconv
+  equivalent. The `host.name` resource attribute added in 1.7.1 is unchanged, so
+  per-host process attribution still works.
+
+  This is a metric-**name** change: any dashboard or query targeting the old
+  bespoke names must update. (photon's per-host Processes view reads the semconv
+  names, with the old names accepted as a fallback.)
+
 ## [1.7.1] - 2026-08-02
 
 ### Added

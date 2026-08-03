@@ -342,16 +342,19 @@ pub fn buildOtlp(bundle: []const u8) BuildError![]const u8 {
 // as a monotonic cumulative Sum. NumberDataPoint carries time_unix_nano
 // (fixed64) and as_int (fixed64 wire) — non-negative values, so a plain u64.
 
-/// NumberDataPoint { time_unix_nano = 3 (fixed64), as_int = 6 (fixed64 wire) }.
-/// Both are tag(1) + 8 bytes → 18, and every datapoint mandor emits is these
-/// two fields only, so the length is constant.
+/// NumberDataPoint { time_unix_nano = 3 (fixed64), then either as_int = 6 or
+/// as_double = 4 (both fixed64 wire) }. Every datapoint is time + one value =
+/// tag(1)+8 twice → 18, constant regardless of int-vs-double.
 fn numberDataPointLen() usize {
     return 9 + 9;
 }
 
-fn putNumberDataPoint(w: *Writer, t_ns: u64, value: u64) void {
+/// `value` is the raw 8 bytes: a u64 for as_int, or an f64 bit pattern
+/// (@bitCast) for as_double. as_double is used for ratio metrics like
+/// process.cpu.utilization (0..1) per OTel semconv; as_int for byte/count ones.
+fn putNumberDataPoint(w: *Writer, t_ns: u64, value: u64, is_double: bool) void {
     w.fixed64(3, t_ns); // time_unix_nano
-    w.fixed64(6, value); // as_int
+    if (is_double) w.fixed64(4, value) else w.fixed64(6, value); // as_double | as_int
 }
 
 /// Gauge { data_points = 1 }.
@@ -376,12 +379,12 @@ fn sumMetricLen(name: []const u8, unit: []const u8) usize {
     return delimLen(name.len) + delimLen(unit.len) + delimLen(sumBodyLen());
 }
 
-fn putGaugeMetric(w: *Writer, name: []const u8, unit: []const u8, t_ns: u64, value: u64) void {
+fn putGaugeMetric(w: *Writer, name: []const u8, unit: []const u8, t_ns: u64, value: u64, is_double: bool) void {
     w.string(1, name); // Metric.name
     w.string(3, unit); // Metric.unit
     w.delim(5, gaugeBodyLen()); // Metric.gauge
     w.delim(1, numberDataPointLen()); //   Gauge.data_points
-    putNumberDataPoint(w, t_ns, value);
+    putNumberDataPoint(w, t_ns, value, is_double);
 }
 
 fn putSumMetric(w: *Writer, name: []const u8, unit: []const u8, t_ns: u64, value: u64) void {
@@ -389,19 +392,23 @@ fn putSumMetric(w: *Writer, name: []const u8, unit: []const u8, t_ns: u64, value
     w.string(3, unit); // Metric.unit
     w.delim(7, sumBodyLen()); // Metric.sum
     w.delim(1, numberDataPointLen()); //   Sum.data_points
-    putNumberDataPoint(w, t_ns, value);
+    putNumberDataPoint(w, t_ns, value, false); // restarts is a monotonic int counter
     w.uint(2, 2); //   Sum.aggregation_temporality = CUMULATIVE
     w.uint(3, 1); //   Sum.is_monotonic = true
 }
 
-/// The four gauge metrics, in emit order (rss first — see the test that walks
-/// the first metric). Names/units are stable OTLP semantic-ish identifiers.
-const gauge_metrics = [_]struct { name: []const u8, unit: []const u8 }{
-    .{ .name = "process.memory.rss", .unit = "kB" },
-    .{ .name = "process.cpu.percent", .unit = "%" },
-    .{ .name = "process.open_fds", .unit = "{fd}" },
-    .{ .name = "process.threads", .unit = "{thread}" },
+/// The four gauge metrics, in emit order (memory first — see the test that walks
+/// the first metric). OTel process semantic-convention names/units so any OTLP
+/// backend (photon, collectors) reads them without a translation table.
+/// cpu.utilization is a 0..1 fraction (as_double); the rest are byte/count ints.
+const gauge_metrics = [_]struct { name: []const u8, unit: []const u8, is_double: bool }{
+    .{ .name = "process.memory.usage", .unit = "By", .is_double = false },
+    .{ .name = "process.cpu.utilization", .unit = "1", .is_double = true },
+    .{ .name = "process.unix.file_descriptor.count", .unit = "{count}", .is_double = false },
+    .{ .name = "process.thread.count", .unit = "{thread}", .is_double = false },
 };
+// No OTel semconv equivalent for a supervisor restart counter — kept as a
+// mandor-specific extension (a monotonic cumulative Sum).
 const restart_metric_name = "process.restarts";
 const restart_metric_unit = "{restart}";
 
@@ -440,10 +447,19 @@ pub fn buildOtlpMetrics(samples: []const frame.MetricSample, host_name: []const 
         putKeyValue(&w, 1, "host.name", host_name); //     (so the process is attributable to its node)
         w.delim(2, scope_len); //   scope_metrics
 
-        const values = [_]u64{ s.rss_kb, s.cpu_pct, s.fds, s.threads };
+        // Values in the semconv order of gauge_metrics: memory.usage is bytes
+        // (rss is kB → ×1024, saturating), cpu.utilization is a 0..1 fraction
+        // carried as an f64 bit pattern (as_double), the counts pass through.
+        const cpu_util: f64 = @as(f64, @floatFromInt(s.cpu_pct)) / 100.0;
+        const values = [_]u64{
+            s.rss_kb *| 1024, // process.memory.usage (By)
+            @bitCast(cpu_util), // process.cpu.utilization (as_double)
+            s.fds, // process.unix.file_descriptor.count
+            s.threads, // process.thread.count
+        };
         for (gauge_metrics, 0..) |g, i| {
             w.delim(2, gaugeMetricLen(g.name, g.unit)); //   metrics (Metric)
-            putGaugeMetric(&w, g.name, g.unit, s.t_unix_ns, values[i]);
+            putGaugeMetric(&w, g.name, g.unit, s.t_unix_ns, values[i], g.is_double);
         }
         w.delim(2, sumMetricLen(restart_metric_name, restart_metric_unit)); // metrics (Metric)
         putSumMetric(&w, restart_metric_name, restart_metric_unit, s.t_unix_ns, s.restarts);
@@ -1346,12 +1362,28 @@ test "buildOtlpMetrics emits per-worker gauges photon can walk" {
     try testing.expectEqualStrings("node-1", avStr(Fields.get(hattr, 2).?.bytes));
 
     const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
-    // first Metric is the rss gauge; datapoint as_int == rss_kb (1000)
-    const metric = Fields.get(sm, 2).?.bytes;
-    const gauge = Fields.get(metric, 5).?.bytes;
-    const dp = Fields.get(gauge, 1).?.bytes;
-    try testing.expectEqual(@as(u8, 1), Fields.get(dp, 3).?.wire); // time fixed64
-    try testing.expectEqual(@as(u64, 1000), Fields.get(dp, 6).?.int); // as_int
+    // Gauges in semconv order: memory.usage (bytes, as_int) then cpu.utilization
+    // (0..1, as_double). Collect the first two Metric (field 2) entries.
+    var mit = Fields{ .b = sm };
+    var m_mem: []const u8 = &.{};
+    var m_cpu: []const u8 = &.{};
+    var midx: usize = 0;
+    while (mit.next()) |f| {
+        if (f.num != 2) continue;
+        if (midx == 0) m_mem = f.bytes;
+        if (midx == 1) m_cpu = f.bytes;
+        midx += 1;
+    }
+    // process.memory.usage: rss_kb (1000) × 1024 as_int bytes.
+    try testing.expectEqualStrings("process.memory.usage", Fields.get(m_mem, 1).?.bytes);
+    const mem_dp = Fields.get(Fields.get(m_mem, 5).?.bytes, 1).?.bytes; // gauge → data_points
+    try testing.expectEqual(@as(u8, 1), Fields.get(mem_dp, 3).?.wire); // time fixed64
+    try testing.expectEqual(@as(u64, 1000 * 1024), Fields.get(mem_dp, 6).?.int); // as_int bytes
+    // process.cpu.utilization: 0..1 fraction as_double (field 4, NOT as_int/6).
+    try testing.expectEqualStrings("process.cpu.utilization", Fields.get(m_cpu, 1).?.bytes);
+    const cpu_dp = Fields.get(Fields.get(m_cpu, 5).?.bytes, 1).?.bytes;
+    try testing.expect(Fields.get(cpu_dp, 6) == null); // not as_int
+    try testing.expectEqual(@as(f64, 0.5), @as(f64, @bitCast(Fields.get(cpu_dp, 4).?.int))); // cpu_pct 50 → 0.5
 
     // restarts is the last metric and a Sum (field 7), not a Gauge.
     var it = Fields{ .b = sm };
