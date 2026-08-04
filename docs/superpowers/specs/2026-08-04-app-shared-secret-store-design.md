@@ -46,6 +46,36 @@ Secret names: `[a-z0-9-]` (lowercase); uppercased + `-`→`_` for the env var
 (`integration` → `MANDOR_SECRET_FD_INTEGRATION`). A name that collides with
 another after this mapping → hard config error.
 
+## Access model (grants + deny-by-default)
+
+A secret's `workers` list **is** its access grant. mandor can hold many secrets;
+each worker receives an fd (and its `MANDOR_SECRET_FD_<NAME>` env var) **only**
+for the secrets whose `workers` list names it. Everything else is denied.
+
+```toml
+[secret.integration]   # granted to gateway, proxy
+workers = ["gateway", "proxy"]
+[secret.db-signing]    # granted to gateway only
+workers = ["gateway"]
+[secret.cron-token]    # granted to cron only
+workers = ["cron"]
+```
+
+| worker | integration | db-signing | cron-token |
+|---|---|---|---|
+| `gateway` | ✅ | ✅ | ❌ |
+| `proxy` | ✅ | ❌ | ❌ |
+| `cron` | ❌ | ❌ | ✅ |
+
+**Denial is structural, not a runtime check.** An ungranted worker gets no env
+var and no fd for that secret: the pipe's read end is `O_CLOEXEC` (closed on
+every worker's `execve`) and CLOEXEC is cleared *only* for granted workers;
+mandor closes its own ends after the fork. So an ungranted worker has no
+descriptor to that secret's pipe at all — it cannot read it even by probing fd
+numbers, and there is no file/socket/API fallback. Least privilege by
+construction; the secret-centric config keeps each secret's full blast radius
+visible in one place.
+
 ## Formats
 
 All values from a single CSPRNG draw (`getrandom`). Printable formats are written
@@ -92,7 +122,71 @@ For each designated worker, on **every (re)spawn**:
 The secret *value* lives only in mandor's memory (below) and is re-written to a
 fresh pipe on each spawn — nothing persistent is created.
 
-Consumer (shell): `IFS= read -r SECRET <&"$MANDOR_SECRET_FD_INTEGRATION"`.
+See the consumer guide below for reading it from any language.
+
+## Consuming the secret — developer guide (any language)
+
+The contract is language-agnostic, three rules:
+
+1. **Find the fd.** Read the number from env `MANDOR_SECRET_FD_<NAME>` — `<NAME>`
+   is the secret name **uppercased** with `-` → `_` (`integration` →
+   `MANDOR_SECRET_FD_INTEGRATION`). **Absent var = you were not granted this
+   secret** (deny-by-default) — fail/exit; do not proceed without it.
+2. **Read it once, at startup, to EOF.** Printable formats (`hex`/`b10`/`b32`/
+   `b64`/`b64url`) arrive as a single `\n`-terminated line — strip the trailing
+   newline. `raw` arrives as exactly `bytes` binary bytes with **no** newline —
+   read to EOF, keep the bytes as-is (don't line-read, don't strip). The pipe
+   EOFs after the one value; there is nothing to re-read later.
+3. **Close the fd** when done — you only need it at boot.
+
+**POSIX shell (`sh`/`dash`/busybox — e.g. `proxy.sh`):**
+```sh
+FD="$MANDOR_SECRET_FD_INTEGRATION"
+[ -n "$FD" ] || { echo "not granted the 'integration' secret" >&2; exit 1; }
+# `<&"$var"` isn't portable in dash, so eval the fd number in:
+eval "IFS= read -r SECRET <&$FD"     # bash/zsh can use: IFS= read -r SECRET <&\"$FD\"
+eval "exec $FD<&-"                    # close (optional)
+```
+
+**Go:**
+```go
+v := os.Getenv("MANDOR_SECRET_FD_INTEGRATION")
+if v == "" { log.Fatal("not granted the 'integration' secret") }
+fd, _ := strconv.Atoi(v)
+f := os.NewFile(uintptr(fd), "mandor-secret")
+raw, _ := io.ReadAll(f) // read to EOF
+f.Close()
+secret := strings.TrimRight(string(raw), "\n") // omit TrimRight for format="raw"
+```
+
+**TypeScript / Node:**
+```ts
+import { readFileSync, closeSync } from "node:fs";
+const v = process.env.MANDOR_SECRET_FD_INTEGRATION;
+if (!v) throw new Error("not granted the 'integration' secret");
+const fd = Number(v);
+const buf = readFileSync(fd);                       // reads the pipe to EOF
+closeSync(fd);
+const secret = buf.toString("utf8").replace(/\n$/, ""); // for "raw", keep `buf`
+```
+
+**Python:**
+```python
+v = os.environ.get("MANDOR_SECRET_FD_INTEGRATION")
+if not v: raise SystemExit("not granted the 'integration' secret")
+with os.fdopen(int(v), "rb", closefd=True) as f:
+    secret = f.read().rstrip(b"\n")   # for format="raw", keep f.read() as-is
+```
+
+**Any other language:** get the integer fd from the env var, `read()` that file
+descriptor to EOF, strip a trailing `\n` for printable formats. That's all —
+it's an ordinary inherited pipe.
+
+**Keeping it out of your own environ:** reading via the fd does *not* put the
+secret in your environ. If you then `export` it (as `proxy.sh` did for
+`envsubst`), it re-enters *your* process's environ — avoid that where you can by
+passing the value in-process (or piping the fd straight into the tool that needs
+it) rather than exporting.
 
 ## Lifecycle & the "lock" (structural, not a state machine)
 
