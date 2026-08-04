@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
+const names = @import("names.zig");
 const secret = @import("secret.zig");
 
 pub const FileConfig = struct {
@@ -81,7 +82,6 @@ var env_store: [cli.max_secrets][64]u8 = undefined;
 /// dependency-free module (it must not import the OS-coupled spawner). Worker
 /// name derivation below reproduces `spawner.setName` so a `[secret.*]` grant
 /// resolves to exactly the worker `start_after` and the other name refs see.
-const worker_name_cap = 32;
 const worker_max_args = 64; // mirrors spawner.max_args
 
 const ArrayTarget = enum { none, workers, health, start_after, env, cwd, user, cap_drop, oom, nice, max_rss, lifetime, expected, pre_stop, name, secret_workers };
@@ -407,13 +407,13 @@ fn deriveEnv(idx: usize, name: []const u8) ParseError![]const u8 {
 fn resolveSecrets(cfg: *FileConfig) ParseError!void {
     if (cfg.secrets_n == 0) return;
 
-    // Worker display names, derived once (basename + cap + dedup + neutralize)
-    // exactly as spawner.setName does, so a grant keys on the same pre-override
-    // name that start_after and the other name refs resolve against.
-    var name_bufs: [cli.max_workers][worker_name_cap]u8 = undefined;
-    var names: [cli.max_workers][]const u8 = undefined;
-    for (cfg.commands, 0..) |cmd, i| names[i] = deriveWorkerName(cmd, name_bufs[i][0..], names[0..i]);
-    const resolved = names[0..cfg.commands.len];
+    // Worker display names, derived once through the SAME names.finalize the
+    // spawner uses, so a grant keys on the same pre-override name that
+    // start_after and the other name refs resolve against.
+    var name_bufs: [cli.max_workers][names.cap]u8 = undefined;
+    var derived: [cli.max_workers][]const u8 = undefined;
+    for (cfg.commands, 0..) |cmd, i| derived[i] = deriveOne(cmd, name_bufs[i][0..], derived[0..i]);
+    const resolved = derived[0..cfg.commands.len];
 
     var si: usize = 0;
     while (si < cfg.secrets_n) : (si += 1) {
@@ -435,39 +435,20 @@ fn resolveSecrets(cfg: *FileConfig) ParseError!void {
     }
 }
 
-/// Reproduces spawner.setName: basename of argv0, length cap (room for a `-NN`
-/// dedup suffix), dedup against prior workers, then Prometheus-unsafe bytes ->
-/// `_`. Returns the finalized name written into `out`.
-fn deriveWorkerName(cmd: []const u8, out: []u8, prior: []const []const u8) []const u8 {
+/// A worker's finalized name from its command string, derived the same way the
+/// spawner does at spawn time: basename of argv0 through `names.finalize` (cap +
+/// dedup + neutralize). Empty on a tokenize failure — `matchWorker` skips empty
+/// names, so a malformed command simply matches no grant.
+fn deriveOne(cmd: []const u8, out: []u8, prior: []const []const u8) []const u8 {
     var tokbuf: [4096]u8 = undefined; // matches spawner.Worker.cmd_buf
     var toks: [worker_max_args][]const u8 = undefined;
     const argv = cli.tokenize(cmd, &tokbuf, &toks) catch return out[0..0];
-    var base = argv[0];
-    if (std.mem.lastIndexOfScalar(u8, base, '/')) |slash| base = base[slash + 1 ..];
-    if (base.len > worker_name_cap - 4) base = base[0 .. worker_name_cap - 4];
-    var dupes: usize = 0;
-    for (prior) |pn| {
-        if (std.mem.eql(u8, pn, base) or
-            (pn.len > base.len + 1 and std.mem.startsWith(u8, pn, base) and pn[base.len] == '-'))
-        {
-            dupes += 1;
-        }
-    }
-    @memcpy(out[0..base.len], base);
-    var n: usize = base.len;
-    if (dupes != 0) {
-        const suffix = std.fmt.bufPrint(out[base.len..], "-{d}", .{dupes + 1}) catch out[base.len..base.len];
-        n = base.len + suffix.len;
-    }
-    for (out[0..n]) |*c| {
-        if (c.* == '"' or c.* == '\\' or c.* < 0x20) c.* = '_';
-    }
-    return out[0..n];
+    return names.finalize(names.basename(argv[0]), prior, out);
 }
 
 /// Match a grant's worker-name ref to a worker index by the derived names.
-fn matchWorker(names: []const []const u8, ref: []const u8) ?u8 {
-    for (names, 0..) |nm, i| {
+fn matchWorker(derived: []const []const u8, ref: []const u8) ?u8 {
+    for (derived, 0..) |nm, i| {
         if (nm.len != 0 and std.mem.eql(u8, nm, ref)) return @as(u8, @intCast(i));
     }
     return null;
