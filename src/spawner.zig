@@ -24,6 +24,17 @@ pub const Status = union(enum) {
     signaled: u8,
 };
 
+/// One secret granted to a worker for a single spawn. The delivery layer owns
+/// this shape; the supervisor (Task 4) fills each with slices INTO its mlock'd
+/// registry — the bytes are never copied here. `value` is written to a pipe (a
+/// trailing '\n' is added unless `raw`); only the fd NUMBER reaches the child,
+/// via `env`. The value never enters env, argv, or disk.
+pub const Grant = struct {
+    value: []const u8,
+    env: []const u8,
+    raw: bool,
+};
+
 pub const Worker = struct {
     name: [name_cap]u8 = undefined,
     name_len: u8 = 0,
@@ -119,6 +130,13 @@ pub const Worker = struct {
     stats: sampler.Window = .{},
     det: detector.State = .{},
 
+    // App-shared secrets granted to this worker (v1.7). Populated by the
+    // supervisor before each (re)spawn with slices into its mlock'd registry;
+    // default 0 = no secrets = behavior unchanged. See spawner's per-spawn
+    // delivery: one inherited pipe fd per grant, only the fd number in env.
+    secrets: [cli.max_secrets]Grant = undefined,
+    secrets_n: usize = 0,
+
     pub fn nameSlice(w: *const Worker) []const u8 {
         return w.name[0..w.name_len];
     }
@@ -171,6 +189,7 @@ fn resetWorker(w: *Worker) void {
     w.health_ever_ok = false;
     w.extra_env_n = 0;
     w.extra_env_used = 0;
+    w.secrets_n = 0;
     w.cwd_len = 0;
     w.is_oneshot = false;
     w.drop_uid = null;
@@ -438,10 +457,15 @@ pub fn spawn(
     const out_p = capture.makePipe();
     const err_p = capture.makePipe();
     const ready_p = if (ready_fd != null) capture.makePipe() else null;
-    // Merge parent env + per-worker extras BEFORE fork (no alloc, static
-    // scratch — spawns are serialized in the single-threaded supervisor).
-    const child_envp: [*:null]const ?[*:0]const u8 = if (w.extra_env_n > 0 or g_env_n > 0)
-        mergeEnv(envp, w)
+    // Build one inherited pipe per granted secret BEFORE fork (writes the
+    // value + records the child read fd and its `env=<fd>` C-string). Static
+    // per-spawn scratch, no alloc; fail-closed per secret (see prepSecrets).
+    const nsec = prepSecrets(w);
+    // Merge parent env + per-worker extras + secret fd envs BEFORE fork (no
+    // alloc, static scratch — spawns are serialized in the single-threaded
+    // supervisor). Secret envs must be included even with no other extras.
+    const child_envp: [*:null]const ?[*:0]const u8 = if (w.extra_env_n > 0 or g_env_n > 0 or nsec > 0)
+        mergeEnv(envp, w, nsec)
     else
         envp;
     const supervisor_pid = linux.getpid(); // must be pre-fork for the guard
@@ -450,6 +474,7 @@ pub fn spawn(
         closePair(out_p);
         closePair(err_p);
         closePair(ready_p);
+        closeSecrets(nsec); // mirror closePair cleanup: no leaked secret fds
         return error.ForkFailed;
     }
     if (rc == 0) {
@@ -502,6 +527,13 @@ pub fn spawn(
             }
         }
         applyHardening(w);
+        // Generalized `keep_fd`: clear FD_CLOEXEC on each granted secret's read
+        // end so exactly those fds survive execve. The write ends stay CLOEXEC
+        // and auto-close, so the child can only read (never re-write) its value.
+        {
+            var si: usize = 0;
+            while (si < nsec) : (si += 1) _ = linux.fcntl(secret_r[si], linux.F.SETFD, 0);
+        }
         execChild(w, child_envp, path_env);
     }
     // Parent sets it too — whichever side wins the race, the group exists
@@ -520,6 +552,11 @@ pub fn spawn(
         _ = linux.close(p.w);
         w.ready_r = p.r;
     }
+    // Parent (long-lived PID 1) keeps NEITHER end of any secret pipe: the child
+    // kept its CLOEXEC-cleared read copy. Closing both here avoids leaking an fd
+    // per respawn (write end) and holding a reader that would hide the child's
+    // EOF (read end).
+    closeSecrets(nsec);
     w.ready = false;
     w.pid = @intCast(rc);
     w.status = .running;
@@ -565,9 +602,11 @@ fn resolveExe(w: *Worker, path_env: []const u8) void {
     }
 }
 
-var merged_env: [513 + 17]?[*:0]const u8 = undefined;
+// Parent env (cap 480) + g_env (32) + extra_env (16) + secret fd envs
+// (cli.max_secrets) + null terminator.
+var merged_env: [513 + 17 + cli.max_secrets]?[*:0]const u8 = undefined;
 
-fn mergeEnv(envp: [*:null]const ?[*:0]const u8, w: *const Worker) [*:null]const ?[*:0]const u8 {
+fn mergeEnv(envp: [*:null]const ?[*:0]const u8, w: *const Worker, nsec: usize) [*:null]const ?[*:0]const u8 {
     var n: usize = 0;
     while (envp[n] != null and n < 480) : (n += 1) merged_env[n] = envp[n];
     for (g_env[0..g_env_n]) |e| {
@@ -578,8 +617,102 @@ fn mergeEnv(envp: [*:null]const ?[*:0]const u8, w: *const Worker) [*:null]const 
         merged_env[n] = e;
         n += 1;
     }
+    // Secret fd envs (`env=<read_fd>`) built by prepSecrets into static scratch.
+    for (secret_env[0..nsec]) |e| {
+        merged_env[n] = e;
+        n += 1;
+    }
     merged_env[n] = null;
     return @ptrCast(&merged_env);
+}
+
+// -------------------------------------------------------- secret delivery
+//
+// Per-spawn secret scratch. Serialized single-threaded spawns let these be
+// static (same rationale as merged_env) — zero heap, no secret bytes copied
+// (grants hold slices into the mlock'd registry; only value bytes transit the
+// pipe). `secret_r`/`secret_w` are index-aligned; `secret_env[i]` points into
+// `secret_env_buf[i]`.
+var secret_r: [cli.max_secrets]i32 = undefined; // child read ends (CLOEXEC-cleared pre-exec)
+var secret_w: [cli.max_secrets]i32 = undefined; // parent write ends (stay CLOEXEC)
+var secret_env_buf: [cli.max_secrets][64]u8 = undefined;
+var secret_env: [cli.max_secrets]?[*:0]const u8 = undefined;
+var secret_n: usize = 0; // secrets delivered this spawn (also prepSecrets' return)
+
+/// Format "<env>=<fd>\0" into `out`, returning the null-terminated slice. Pure
+/// (no syscalls) so the env formatting is testable without a pipe. Returns null
+/// on overflow — the caller treats that as a skip (fail-closed), never a panic.
+fn fmtFdEnv(env: []const u8, fd: i32, out: []u8) ?[:0]const u8 {
+    return std.fmt.bufPrintZ(out, "{s}={d}", .{ env, fd }) catch null;
+}
+
+/// Write `bytes` in full to `fd`. Handles short writes; false on any error or a
+/// zero-length write (fail-closed). Secret values are ≤ ~5.5KB < the 64KB pipe
+/// capacity, so a pre-fork write never blocks even with no reader yet.
+fn writeFull(fd: i32, bytes: []const u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.write(fd, bytes.ptr + off, bytes.len - off);
+        if (posix.errno(rc) != .SUCCESS) return false;
+        if (rc == 0) return false;
+        off += rc;
+    }
+    return true;
+}
+
+fn secretSkip() void {
+    const msg = "[mandor] secret pipe failed; worker will not receive it (fail-closed)\n";
+    _ = linux.write(2, msg, msg.len);
+}
+
+/// Record one delivered secret into the per-spawn scratch: its child read fd,
+/// parent write fd, and the `env=<fd>` C-string. Pure (no syscalls) so the
+/// fd/env list assembly is testable without a pipe. Returns false if the env
+/// string overflows its slot (caller skips — fail-closed).
+fn recordSecret(env: []const u8, read_fd: i32, write_fd: i32) bool {
+    const env_z = fmtFdEnv(env, read_fd, &secret_env_buf[secret_n]) orelse return false;
+    secret_r[secret_n] = read_fd;
+    secret_w[secret_n] = write_fd;
+    secret_env[secret_n] = env_z.ptr;
+    secret_n += 1;
+    return true;
+}
+
+/// Build one CLOEXEC pipe per granted secret, write its value (+ '\n' unless
+/// raw), and record the child read fd + `env=<fd>`. Static scratch, zero heap.
+/// Fail-closed: a makePipe failure, a short/failed write, or an env overflow for
+/// ONE secret logs + skips it (the child never gets that env → the worker's own
+/// read fails) and NEVER aborts the spawn. Returns the count delivered.
+fn prepSecrets(w: *const Worker) usize {
+    secret_n = 0;
+    for (w.secrets[0..w.secrets_n]) |g| {
+        const p = capture.makePipe() orelse {
+            secretSkip();
+            continue;
+        };
+        if (!writeFull(p.w, g.value) or (!g.raw and !writeFull(p.w, "\n"))) {
+            _ = linux.close(p.r);
+            _ = linux.close(p.w);
+            secretSkip();
+            continue;
+        }
+        if (!recordSecret(g.env, p.r, p.w)) {
+            _ = linux.close(p.r);
+            _ = linux.close(p.w);
+            secretSkip();
+            continue;
+        }
+    }
+    return secret_n;
+}
+
+/// Close BOTH ends of the first `n` secret pipes recorded this spawn.
+fn closeSecrets(n: usize) void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        _ = linux.close(secret_r[i]);
+        _ = linux.close(secret_w[i]);
+    }
 }
 
 /// Post-drop, pre-exec hardening (child only). cap_drop shrinks the
@@ -742,4 +875,34 @@ test "name override rejects empty and all-invalid" {
 test "findPath falls back to default" {
     const empty_env = [_:null]?[*:0]const u8{};
     try std.testing.expectEqualStrings(default_path, findPath(&empty_env));
+}
+
+test "fmtFdEnv formats env=fd, null-terminated" {
+    var buf: [64]u8 = undefined;
+    const s = fmtFdEnv("CONFD_X", 7, &buf).?;
+    try std.testing.expectEqualStrings("CONFD_X=7", s);
+    try std.testing.expectEqual(@as(usize, 9), s.len);
+    try std.testing.expectEqual(@as(u8, 0), buf[s.len]); // C-string terminator
+}
+
+test "fmtFdEnv handles a multi-digit fd" {
+    var buf: [64]u8 = undefined;
+    const s = fmtFdEnv("CONFD_X", 123, &buf).?;
+    try std.testing.expectEqualStrings("CONFD_X=123", s);
+    try std.testing.expectEqual(@as(usize, 11), s.len);
+    try std.testing.expectEqual(@as(u8, 0), buf[s.len]);
+}
+
+test "secret fd/env list assembles in order" {
+    // Drive the pure assembler with fake fds — no pipe, no fork.
+    secret_n = 0;
+    try std.testing.expect(recordSecret("CONFD_A", 11, 21));
+    try std.testing.expect(recordSecret("CONFD_B", 123, 22));
+    try std.testing.expectEqual(@as(usize, 2), secret_n);
+    // Two read-fd entries recorded, in order.
+    try std.testing.expectEqual(@as(i32, 11), secret_r[0]);
+    try std.testing.expectEqual(@as(i32, 123), secret_r[1]);
+    // Two env strings appended, in order, each carrying its own read fd.
+    try std.testing.expectEqualStrings("CONFD_A=11", std.mem.span(secret_env[0].?));
+    try std.testing.expectEqualStrings("CONFD_B=123", std.mem.span(secret_env[1].?));
 }
