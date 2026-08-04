@@ -3,6 +3,36 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.8.0] - 2026-08-04
+
+### Added
+- **App-shared secrets (`[secret.NAME]` sections).** mandor mints a per-session
+  secret at boot and delivers it **only to granted workers** over an inherited
+  pipe fd — the value never touches ENV, argv, or disk; only the fd *number*
+  rides in `$CONFD_<NAME>` (or a configured `env`). A worker reads it with
+  `secret=$(cat /proc/self/fd/$CONFD_NAME)` (Go/TS one-liners in
+  [docs/CONFIG.md](docs/CONFIG.md)). Fully opt-in and TOML-only: with no
+  `[secret.*]` section mandor behaves exactly as before, and the offline-by-
+  default guarantee and 4-flag CLI are unchanged.
+  - **Deny-by-default is structural** — only workers listed in a secret's
+    `workers` receive it; every other worker's spawn injects nothing.
+  - **Minted once, mlock'd, re-delivered.** Generated with getrandom, held in an
+    `mlock`ed buffer, re-delivered identically on every restart, secure-zeroed at
+    shutdown. Formats: `hex` (default), `b10`, `b32`, `b64`, `b64url`, `raw`;
+    `bytes` 1..4096 (digit count for `b10`), default 32.
+  - **Fail-closed.** A getrandom failure at boot refuses to start the fleet; a
+    single secret's pipe/write failure skips only that secret; `mlock` failure
+    degrades quietly. The `secret_store` is BSS — no binary-size or idle-RSS cost
+    when unused.
+
+### Changed
+- **CI parser fuzzing is now tiered.** push/PR run a 2-seed smoke (both optimize
+  modes) instead of 12 seeds (~42 min → ~10 min); the full 12-seed sweep runs
+  nightly on a `schedule:` cron. No change to fuzz coverage over time.
+- **Config-surface budget raised 32 → 36** to admit the four `[secret.NAME]`
+  keys (`workers`, `bytes`, `format`, `env`). A deliberate, one-time bump for a
+  new feature, keeping the same one-slot headroom.
+
 ## [1.7.2] - 2026-08-03
 
 ### Changed
