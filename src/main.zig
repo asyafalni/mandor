@@ -395,6 +395,7 @@ test {
     _ = @import("caps.zig");
     _ = @import("cost.zig");
     _ = @import("fuzz.zig");
+    _ = @import("secret.zig");
     // relay.zig is only @imported inside a subcommand branch, so it never
     // reaches the test graph on its own — which is exactly why it shipped
     // with no coverage. Reference it explicitly.
