@@ -222,10 +222,13 @@ full container restart, defeating mandor's purpose.
 
 mandor guarantees the secret is in **no** process's environ, argv, or on disk at
 handoff, and that only designated workers can obtain it. What a worker does after
-reading is its own exposure: `proxy.sh` today does
-`export VITE_INTEGRATION_SIGNATURE_SECRET=…`, which puts it back into that
-worker's *own* environ (and a served `config.js`). The migration note shows a
-no-`export` `envsubst` pattern that keeps it out of the FE's environ.
+reading is its own exposure: for a secret you keep server-side, avoid re-exporting
+it into your own environ (pass it in-process, or pipe the fd straight into the
+tool that needs it). For a secret you deliberately ship client-side — like the
+`proxy.sh` case that folds it into a browser-served `config.js` — re-`export`-ing
+for `envsubst` is correct and the value is public to SPA users by design; see the
+migration section's caveat. Either way, mandor's job is the **server-side**
+channel up to handoff.
 
 ## Error handling (fail-closed, mandor discipline)
 
@@ -240,18 +243,43 @@ no-`export` `envsubst` pattern that keeps it out of the FE's environ.
 
 ## `proxy.sh` migration (before → after)
 
-```sh
-# BEFORE — BE generates + writes a file; FE polls + reads it:
-#   SECRET_FILE=/run/integration-lock/secret
-#   while [ ! -f "$SECRET_FILE" ]; do sleep 1; done
-#   export VITE_INTEGRATION_SIGNATURE_SECRET="$(cat "$SECRET_FILE")"
+Config: `[secret.integration] workers = ["gateway", "proxy"]`, `format = "hex"`.
 
-# AFTER — mandor delivers it on a private fd; no file, no poll, no generator:
-IFS= read -r VITE_INTEGRATION_SIGNATURE_SECRET <&"$CONFD_INTEGRATION"
+`proxy.sh` (nginx FE) — replace the file-wait block (current lines 17–33) with an
+fd read; **everything downstream (`export` → `envsubst` → `config.js` →
+`window.ENV`) is unchanged, so the SPA digests the value identically:**
+
+```sh
+# BEFORE: SECRET_FILE=/run/integration-lock/secret; poll for it; cat + export.
+# AFTER — mandor delivers it on a private fd; no file, no poll, no generator.
+if [ -z "$CONFD_INTEGRATION" ]; then
+    echo "ERROR: CONFD_INTEGRATION not set (not granted the integration secret); exiting" >&2
+    exit 1                       # same failure behavior as today -> mandor restarts the container
+fi
+# proxy.sh is /bin/sh (dash/busybox): `<&"$var"` is not portable, so eval the fd number in.
+eval "IFS= read -r VITE_INTEGRATION_SIGNATURE_SECRET <&$CONFD_INTEGRATION"
 export VITE_INTEGRATION_SIGNATURE_SECRET
-# (or, to keep it out of the FE's environ, feed the fd straight into envsubst.)
+
+# envsubst -> config.js (window.ENV) below is UNCHANGED; the SPA sees the same value.
 ```
-The BE gateway drops its generation/file-write and reads the same fd.
+
+The BE gateway lists in the same secret's `workers`, so it reads the **identical**
+mandor-generated value from **its** `CONFD_INTEGRATION` fd and signs with it —
+BE-signs / SPA-verifies stays consistent — and drops its old
+generate-and-write-file code.
+
+**Caveat — the SPA case intentionally exposes this value to browsers.** `proxy.sh`
+folds `VITE_INTEGRATION_SIGNATURE_SECRET` into the nginx-served `config.js`
+(`window.ENV`), so any SPA end user can read it via DevTools. That is true today
+and unchanged here. mandor's fd channel protects the **server-side** handoff (no
+other container process, env, or disk snoop can grab it) — which is the stated
+threat — but it cannot hide a value the app deliberately ships to the browser.
+Because this value *is* going to the browser, the FE re-`export` above is correct
+(the "don't re-export / feed straight into envsubst" advice in the consumer guide
+applies to secrets you do **not** ship client-side; it does not apply here). If
+hiding the value from end users were also a goal, that is a different
+architecture (keep it server-side; the SPA calls the BE, which uses it
+internally) — out of scope for this store.
 
 ## Testing
 
