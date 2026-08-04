@@ -38,18 +38,24 @@ format  = "b10"                    # a 6-digit numeric code
 | `workers` | string list | — (required) | which workers receive this secret. Every name must be a defined worker (else hard config error). Empty list → error. |
 | `bytes` | int | `32` | length knob (see per-format below). Range **1–4096**; out of range → error. |
 | `format` | string | `"hex"` | one of `hex` \| `b10` \| `b32` \| `b64` \| `b64url` \| `raw`. Unknown → error. |
+| `env` | string | `CONFD_<NAME>` | the env var mandor sets to this secret's **fd number**. Override to blend with your app's own env (e.g. `APP_CHANNEL`, `RUNTIME_HANDLE`). Validated `^[A-Z_][A-Z0-9_]*$`; a value colliding with another secret's env → error. |
 
 Multiple `[secret.*]` sections are independent secrets, each with its own value,
 `bytes`, `format`, and worker set. A worker may belong to several secrets.
 
-Secret names: `[a-z0-9-]` (lowercase); uppercased + `-`→`_` for the env var
-(`integration` → `MANDOR_SECRET_FD_INTEGRATION`). A name that collides with
-another after this mapping → hard config error.
+**Env var naming.** By default the fd number lands in `CONFD_<NAME>` — `<NAME>`
+uppercased with `-`→`_` (`integration` → `CONFD_INTEGRATION`). `CONFD` reads as
+"config fd" (privately: *confidential*) — deliberately unremarkable, so a glance
+at a process's environ shows nothing flagged like `SECRET`/`MANDOR`. It carries
+only the fd number, never the value; the actual lock is the fd inheritance, not
+the name — obscuring the name is defense-in-depth, not the protection. Set `env`
+per secret to make it indistinguishable from your app's own config vars. Derived
+names that collide (two secrets → the same env var) → hard config error.
 
 ## Access model (grants + deny-by-default)
 
 A secret's `workers` list **is** its access grant. mandor can hold many secrets;
-each worker receives an fd (and its `MANDOR_SECRET_FD_<NAME>` env var) **only**
+each worker receives an fd (and its `CONFD_<NAME>` env var) **only**
 for the secrets whose `workers` list names it. Everything else is denied.
 
 ```toml
@@ -114,8 +120,8 @@ For each designated worker, on **every (re)spawn**:
    the read end only**, so exactly this worker inherits it (the `keep_fd` trick
    the telemetry daemon already uses, generalized to a *list* of fds — a worker
    in N secrets keeps N read ends).
-4. Sets `MANDOR_SECRET_FD_<NAME>=<fd>` in that worker's env — the fd **number**,
-   which is not sensitive.
+4. Sets the secret's env var to `<fd>` in that worker's env — `CONFD_<NAME>` by
+   default, or the configured `env` name — the fd **number**, not sensitive.
 5. mandor closes **both** ends in the parent after the fork. The child reads the
    buffered value then gets EOF; no other process ever holds the read end.
 
@@ -128,9 +134,9 @@ See the consumer guide below for reading it from any language.
 
 The contract is language-agnostic, three rules:
 
-1. **Find the fd.** Read the number from env `MANDOR_SECRET_FD_<NAME>` — `<NAME>`
+1. **Find the fd.** Read the number from env `CONFD_<NAME>` — `<NAME>`
    is the secret name **uppercased** with `-` → `_` (`integration` →
-   `MANDOR_SECRET_FD_INTEGRATION`). **Absent var = you were not granted this
+   `CONFD_INTEGRATION`). **Absent var = you were not granted this
    secret** (deny-by-default) — fail/exit; do not proceed without it.
 2. **Read it once, at startup, to EOF.** Printable formats (`hex`/`b10`/`b32`/
    `b64`/`b64url`) arrive as a single `\n`-terminated line — strip the trailing
@@ -141,7 +147,7 @@ The contract is language-agnostic, three rules:
 
 **POSIX shell (`sh`/`dash`/busybox — e.g. `proxy.sh`):**
 ```sh
-FD="$MANDOR_SECRET_FD_INTEGRATION"
+FD="$CONFD_INTEGRATION"
 [ -n "$FD" ] || { echo "not granted the 'integration' secret" >&2; exit 1; }
 # `<&"$var"` isn't portable in dash, so eval the fd number in:
 eval "IFS= read -r SECRET <&$FD"     # bash/zsh can use: IFS= read -r SECRET <&\"$FD\"
@@ -150,7 +156,7 @@ eval "exec $FD<&-"                    # close (optional)
 
 **Go:**
 ```go
-v := os.Getenv("MANDOR_SECRET_FD_INTEGRATION")
+v := os.Getenv("CONFD_INTEGRATION")
 if v == "" { log.Fatal("not granted the 'integration' secret") }
 fd, _ := strconv.Atoi(v)
 f := os.NewFile(uintptr(fd), "mandor-secret")
@@ -162,7 +168,7 @@ secret := strings.TrimRight(string(raw), "\n") // omit TrimRight for format="raw
 **TypeScript / Node:**
 ```ts
 import { readFileSync, closeSync } from "node:fs";
-const v = process.env.MANDOR_SECRET_FD_INTEGRATION;
+const v = process.env.CONFD_INTEGRATION;
 if (!v) throw new Error("not granted the 'integration' secret");
 const fd = Number(v);
 const buf = readFileSync(fd);                       // reads the pipe to EOF
@@ -172,7 +178,7 @@ const secret = buf.toString("utf8").replace(/\n$/, ""); // for "raw", keep `buf`
 
 **Python:**
 ```python
-v = os.environ.get("MANDOR_SECRET_FD_INTEGRATION")
+v = os.environ.get("CONFD_INTEGRATION")
 if not v: raise SystemExit("not granted the 'integration' secret")
 with os.fdopen(int(v), "rb", closefd=True) as f:
     secret = f.read().rstrip(b"\n")   # for format="raw", keep f.read() as-is
@@ -241,7 +247,7 @@ no-`export` `envsubst` pattern that keeps it out of the FE's environ.
 #   export VITE_INTEGRATION_SIGNATURE_SECRET="$(cat "$SECRET_FILE")"
 
 # AFTER — mandor delivers it on a private fd; no file, no poll, no generator:
-IFS= read -r VITE_INTEGRATION_SIGNATURE_SECRET <&"$MANDOR_SECRET_FD_INTEGRATION"
+IFS= read -r VITE_INTEGRATION_SIGNATURE_SECRET <&"$CONFD_INTEGRATION"
 export VITE_INTEGRATION_SIGNATURE_SECRET
 # (or, to keep it out of the FE's environ, feed the fd straight into envsubst.)
 ```
@@ -257,7 +263,7 @@ The BE gateway drops its generation/file-write and reads the same fd.
 - **Harness (integration):** a designated worker reads its fd and echoes the
   length/charset — assert it matches the configured format; **two** workers in
   one secret receive the **identical** value; a **non-designated** worker has
-  **no** `MANDOR_SECRET_FD_*` in its environ; a worker **restart** re-delivers
+  **no** `CONFD_*` in its environ; a worker **restart** re-delivers
   the **same** value; **two mandor runs** yield **different** values; the
   `getrandom`/pipe failure path fails closed (worker sees EOF, exits).
 - **Mutation:** break the `b10` rejection bound (250 → 256) and confirm the
