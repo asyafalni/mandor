@@ -215,6 +215,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.expected_pairs_n = file_cfg.expected_pairs_n;
             cfg.name_pairs = file_cfg.name_pairs;
             cfg.name_pairs_n = file_cfg.name_pairs_n;
+            cfg.secrets = file_cfg.secrets;
+            cfg.secrets_n = file_cfg.secrets_n;
+            // [secret.*] grants are resolved (in config.parse) against the
+            // config file's own worker list. CLI-supplied workers override that
+            // list, which would leave the resolved grant indices pointing at
+            // the wrong process — a silent mis-grant in a deny-by-default
+            // feature. Refuse the mix: secrets are TOML-only, so define the
+            // workers there too.
+            if (cfg.secrets_n > 0 and cfg.commands.len > 0) {
+                logmod.print("[mandor] [secret.*] requires workers defined in the config file, not on the CLI\n", .{});
+                return 2;
+            }
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
         }
         if (cfg.env_file) |path| {

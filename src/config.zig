@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
+const secret = @import("secret.zig");
 
 pub const FileConfig = struct {
     backoff_max_ms: ?u64 = null,
@@ -60,9 +61,30 @@ pub const FileConfig = struct {
     prestop_pairs: [16]cli.HealthSpec = undefined,
     prestop_pairs_n: u8 = 0,
     commands: []const []const u8 = &.{},
+    /// `[secret.NAME]` sections. `name`/`env`/`fmt`/`n` and the resolved worker
+    /// indices are filled here and copied into cli.Config verbatim.
+    secrets: [cli.max_secrets]cli.SecretDef = undefined,
+    secrets_n: usize = 0,
+    /// Per-secret worker-name refs (slices into `text`), collected during
+    /// parse and resolved to indices in `resolveSecrets` at the end. Transient:
+    /// never copied into cli.Config, so `secrets[*].workers` holds indices only.
+    secret_refs: [cli.max_secrets][cli.max_secret_workers][]const u8 = undefined,
 };
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, user, cap_drop, oom, nice, max_rss, lifetime, expected, pre_stop, name };
+/// Backing store for derived `CONFD_<NAME>` env names (used only when a secret
+/// omits `env`). Module-level so the `SecretDef.env` slice survives a by-value
+/// `FileConfig` return — a slice into `FileConfig`'s own storage would dangle.
+/// Boot-only writes, read-only thereafter.
+var env_store: [cli.max_secrets][64]u8 = undefined;
+
+/// Mirrors `spawner.name_cap`. Kept as a local const so config.zig stays a pure,
+/// dependency-free module (it must not import the OS-coupled spawner). Worker
+/// name derivation below reproduces `spawner.setName` so a `[secret.*]` grant
+/// resolves to exactly the worker `start_after` and the other name refs see.
+const worker_name_cap = 32;
+const worker_max_args = 64; // mirrors spawner.max_args
+
+const ArrayTarget = enum { none, workers, health, start_after, env, cwd, user, cap_drop, oom, nice, max_rss, lifetime, expected, pre_stop, name, secret_workers };
 
 /// Per-worker settings all land in `worker -> value` pair arrays; map the
 /// section key to its slot.
@@ -102,7 +124,9 @@ pub fn parse(
     var ncmd: usize = 0;
     var target: ArrayTarget = .none; // open multiline array
     var array_worker: ?[]const u8 = null; // worker owning that array, if any
+    var array_secret: ?usize = null; // secret owning an open workers array, if any
     var cur_worker: ?[]const u8 = null; // active [worker.NAME] section
+    var cur_secret: ?usize = null; // active [secret.NAME] section (index)
 
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw_line| {
@@ -117,14 +141,28 @@ pub fn parse(
             const item = std.mem.trim(u8, line, " \t,");
             if (item.len == 0) continue;
             const s = parseString(item) orelse return error.Syntax;
-            try appendItem(cfg, cmd_storage, &ncmd, target, array_worker, s);
+            if (target == .secret_workers) {
+                const si = array_secret orelse return error.Syntax;
+                try appendSecretRef(cfg, si, s);
+            } else {
+                try appendItem(cfg, cmd_storage, &ncmd, target, array_worker, s);
+            }
             if (std.mem.endsWith(u8, line, "]")) target = .none;
             continue;
         }
 
-        // [worker.NAME] — every key below it scopes to that worker.
+        // [worker.NAME] / [secret.NAME] — every key below scopes to it.
         if (line[0] == '[') {
-            cur_worker = try sectionWorker(line);
+            switch (try sectionHeader(line)) {
+                .worker => |nm| {
+                    cur_worker = nm;
+                    cur_secret = null;
+                },
+                .secret => |nm| {
+                    cur_worker = null;
+                    cur_secret = try beginSecret(cfg, nm);
+                },
+            }
             continue;
         }
 
@@ -134,6 +172,11 @@ pub fn parse(
 
         if (cur_worker) |w| {
             try workerSetting(cfg, cmd_storage, &ncmd, &target, &array_worker, w, key, value);
+            continue;
+        }
+
+        if (cur_secret) |si| {
+            try secretSetting(cfg, si, &target, &array_secret, key, value);
             continue;
         }
 
@@ -205,6 +248,7 @@ pub fn parse(
     }
     if (target != .none) return error.Syntax;
     cfg.commands = cmd_storage[0..ncmd];
+    try resolveSecrets(cfg);
 }
 
 /// Keys valid inside a `[worker.NAME]` section.
@@ -224,21 +268,209 @@ fn workerKey(key: []const u8) ?ArrayTarget {
     return null;
 }
 
-/// `[worker.NAME]` -> NAME. Any other section header is a hard error: configs
-/// are small, so a typo should stop startup rather than be silently ignored.
-fn sectionWorker(line: []const u8) ParseError!?[]const u8 {
+const Section = union(enum) { worker: []const u8, secret: []const u8 };
+
+/// `[worker.NAME]` / `[secret.NAME]` -> the section kind + NAME. Any other
+/// header is a hard error: configs are small, so a typo should stop startup
+/// rather than be silently ignored.
+fn sectionHeader(line: []const u8) ParseError!Section {
     if (line[line.len - 1] != ']') return error.Syntax;
     const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
-    const prefix = "worker.";
-    if (!std.mem.startsWith(u8, inner, prefix)) return error.Syntax;
+    if (sectionName(inner, "worker.")) |nm| return .{ .worker = nm };
+    if (sectionName(inner, "secret.")) |nm| return .{ .secret = nm };
+    return error.Syntax;
+}
+
+/// `<prefix>NAME` -> NAME, else null (unknown prefix or empty name).
+fn sectionName(inner: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, inner, prefix)) return null;
     var name = std.mem.trim(u8, inner[prefix.len..], " \t");
     // A TOML-quoted key lets a name with a dot read naturally —
     // `[worker."start.sh"]` — since a bare dot would otherwise look like a
     // nested table. The subset takes the literal remainder either way.
     if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"')
         name = name[1 .. name.len - 1];
-    if (name.len == 0) return error.Syntax;
+    if (name.len == 0) return null;
     return name;
+}
+
+/// Start a `[secret.NAME]` section: validate the name, reject a duplicate, then
+/// seed defaults (hex / 32 bytes) and the derived `CONFD_<NAME>` env. Returns
+/// the new secret's index.
+fn beginSecret(cfg: *FileConfig, name: []const u8) ParseError!usize {
+    if (!validSecretName(name)) return error.Syntax;
+    for (cfg.secrets[0..cfg.secrets_n]) |*s| {
+        if (std.mem.eql(u8, s.name, name)) return error.BadValue; // duplicate secret
+    }
+    if (cfg.secrets_n == cfg.secrets.len) return error.BadValue; // too many secrets
+    const idx = cfg.secrets_n;
+    cfg.secrets[idx] = .{
+        .name = name,
+        .env = try deriveEnv(idx, name),
+        .fmt = .hex,
+        .n = 32,
+        .workers = undefined,
+        .workers_len = 0,
+    };
+    cfg.secrets_n += 1;
+    return idx;
+}
+
+/// Apply one `key = value` inside `[secret.NAME]`.
+fn secretSetting(
+    cfg: *FileConfig,
+    si: usize,
+    target: *ArrayTarget,
+    array_secret: *?usize,
+    key: []const u8,
+    value: []const u8,
+) ParseError!void {
+    if (std.mem.eql(u8, key, "workers")) {
+        if (value.len == 0 or value[0] != '[') return error.BadValue;
+        var rest = std.mem.trim(u8, value[1..], " \t");
+        const closed = std.mem.endsWith(u8, rest, "]");
+        if (closed) rest = std.mem.trim(u8, rest[0 .. rest.len - 1], " \t");
+        var items = std.mem.splitScalar(u8, rest, ',');
+        while (items.next()) |item_raw| {
+            const item = std.mem.trim(u8, item_raw, " \t");
+            if (item.len == 0) continue;
+            const s = parseString(item) orelse return error.BadValue;
+            try appendSecretRef(cfg, si, s);
+        }
+        if (!closed) {
+            target.* = .secret_workers;
+            array_secret.* = si;
+        }
+    } else if (std.mem.eql(u8, key, "bytes")) {
+        const nbytes = std.fmt.parseInt(usize, value, 10) catch return error.BadValue;
+        if (nbytes == 0 or nbytes > secret.max_bytes) return error.BadValue; // range 1..4096
+        cfg.secrets[si].n = nbytes;
+    } else if (std.mem.eql(u8, key, "format")) {
+        const s = parseString(value) orelse return error.BadValue;
+        cfg.secrets[si].fmt = secret.parseFormat(s) orelse return error.BadValue; // unknown format
+    } else if (std.mem.eql(u8, key, "env")) {
+        const s = parseString(value) orelse return error.BadValue;
+        if (!validEnvName(s)) return error.BadValue; // ^[A-Z_][A-Z0-9_]*$
+        cfg.secrets[si].env = s; // slice into `text`
+    } else {
+        return error.Syntax; // unknown key inside a [secret.*] section
+    }
+}
+
+/// Record one worker-name ref for a secret (resolved to an index at parse end).
+fn appendSecretRef(cfg: *FileConfig, si: usize, name: []const u8) ParseError!void {
+    const len = cfg.secrets[si].workers_len;
+    if (len == cfg.secret_refs[si].len) return error.BadValue; // too many workers
+    cfg.secret_refs[si][len] = name;
+    cfg.secrets[si].workers_len = len + 1;
+}
+
+fn validSecretName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-')) return false;
+    }
+    return true;
+}
+
+/// `^[A-Z_][A-Z0-9_]*$` — the env-var naming rule for an `env` override.
+fn validEnvName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!((s[0] >= 'A' and s[0] <= 'Z') or s[0] == '_')) return false;
+    for (s[1..]) |c| {
+        if (!((c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_')) return false;
+    }
+    return true;
+}
+
+/// Default env var name: `CONFD_` + NAME uppercased with `-` -> `_`. Written
+/// into `env_store[idx]`; the derived name always matches `validEnvName`.
+fn deriveEnv(idx: usize, name: []const u8) ParseError![]const u8 {
+    const prefix = "CONFD_";
+    if (prefix.len + name.len > env_store[idx].len) return error.BadValue; // name too long
+    var w: usize = 0;
+    for (prefix) |c| {
+        env_store[idx][w] = c;
+        w += 1;
+    }
+    for (name) |c| {
+        env_store[idx][w] = if (c == '-') '_' else std.ascii.toUpper(c);
+        w += 1;
+    }
+    return env_store[idx][0..w];
+}
+
+/// End-of-parse pass: resolve each secret's worker-name refs to indices, reject
+/// an empty grant or an unknown worker, and reject two secrets sharing an env
+/// var. Every failure is a hard error — a mis-grant must stop startup, never be
+/// applied silently (deny-by-default is only safe if the grant is exact).
+fn resolveSecrets(cfg: *FileConfig) ParseError!void {
+    if (cfg.secrets_n == 0) return;
+
+    // Worker display names, derived once (basename + cap + dedup + neutralize)
+    // exactly as spawner.setName does, so a grant keys on the same pre-override
+    // name that start_after and the other name refs resolve against.
+    var name_bufs: [cli.max_workers][worker_name_cap]u8 = undefined;
+    var names: [cli.max_workers][]const u8 = undefined;
+    for (cfg.commands, 0..) |cmd, i| names[i] = deriveWorkerName(cmd, name_bufs[i][0..], names[0..i]);
+    const resolved = names[0..cfg.commands.len];
+
+    var si: usize = 0;
+    while (si < cfg.secrets_n) : (si += 1) {
+        const sec = &cfg.secrets[si];
+        if (sec.workers_len == 0) return error.BadValue; // empty workers
+        var k: usize = 0;
+        while (k < sec.workers_len) : (k += 1) {
+            sec.workers[k] = matchWorker(resolved, cfg.secret_refs[si][k]) orelse
+                return error.BadValue; // unknown worker in `workers`
+        }
+    }
+    // Env collisions: derived or overridden, two secrets must not share an env.
+    var a: usize = 0;
+    while (a < cfg.secrets_n) : (a += 1) {
+        var b: usize = a + 1;
+        while (b < cfg.secrets_n) : (b += 1) {
+            if (std.mem.eql(u8, cfg.secrets[a].env, cfg.secrets[b].env)) return error.BadValue;
+        }
+    }
+}
+
+/// Reproduces spawner.setName: basename of argv0, length cap (room for a `-NN`
+/// dedup suffix), dedup against prior workers, then Prometheus-unsafe bytes ->
+/// `_`. Returns the finalized name written into `out`.
+fn deriveWorkerName(cmd: []const u8, out: []u8, prior: []const []const u8) []const u8 {
+    var tokbuf: [4096]u8 = undefined; // matches spawner.Worker.cmd_buf
+    var toks: [worker_max_args][]const u8 = undefined;
+    const argv = cli.tokenize(cmd, &tokbuf, &toks) catch return out[0..0];
+    var base = argv[0];
+    if (std.mem.lastIndexOfScalar(u8, base, '/')) |slash| base = base[slash + 1 ..];
+    if (base.len > worker_name_cap - 4) base = base[0 .. worker_name_cap - 4];
+    var dupes: usize = 0;
+    for (prior) |pn| {
+        if (std.mem.eql(u8, pn, base) or
+            (pn.len > base.len + 1 and std.mem.startsWith(u8, pn, base) and pn[base.len] == '-'))
+        {
+            dupes += 1;
+        }
+    }
+    @memcpy(out[0..base.len], base);
+    var n: usize = base.len;
+    if (dupes != 0) {
+        const suffix = std.fmt.bufPrint(out[base.len..], "-{d}", .{dupes + 1}) catch out[base.len..base.len];
+        n = base.len + suffix.len;
+    }
+    for (out[0..n]) |*c| {
+        if (c.* == '"' or c.* == '\\' or c.* < 0x20) c.* = '_';
+    }
+    return out[0..n];
+}
+
+/// Match a grant's worker-name ref to a worker index by the derived names.
+fn matchWorker(names: []const []const u8, ref: []const u8) ?u8 {
+    for (names, 0..) |nm, i| {
+        if (nm.len != 0 and std.mem.eql(u8, nm, ref)) return @as(u8, @intCast(i));
+    }
+    return null;
 }
 
 /// A quoted string, or a bare token (integers, `true`/`false`).
@@ -523,4 +755,140 @@ test "hash inside quoted string is not a comment" {
     var storage: [cli.max_workers][]const u8 = undefined;
     const cfg = try parseTest("workers = [\"./api #not-a-comment\"]", &storage);
     try t.expectEqualStrings("./api #not-a-comment", cfg.commands[0]);
+}
+
+test "secret section: defaults and worker index resolution" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\workers = ["gateway", "proxy"]
+        \\
+        \\[secret.integration]
+        \\workers = ["gateway", "proxy"]
+    ;
+    const cfg = try parseTest(text, &storage);
+    try t.expectEqual(@as(usize, 1), cfg.secrets_n);
+    const s = cfg.secrets[0];
+    try t.expectEqualStrings("integration", s.name);
+    try t.expectEqualStrings("CONFD_INTEGRATION", s.env);
+    try t.expectEqual(secret.Format.hex, s.fmt);
+    try t.expectEqual(@as(usize, 32), s.n);
+    try t.expectEqual(@as(usize, 2), s.workers_len);
+    // "gateway" is worker 0, "proxy" is worker 1 (order = commands order).
+    try t.expectEqual(@as(u8, 0), s.workers[0]);
+    try t.expectEqual(@as(u8, 1), s.workers[1]);
+}
+
+test "secret section: bytes/format/env overrides" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\workers = ["gateway"]
+        \\
+        \\[secret.otp]
+        \\workers = ["gateway"]
+        \\bytes = 6
+        \\format = "b10"
+        \\env = "APP_CODE"
+    ;
+    const cfg = try parseTest(text, &storage);
+    try t.expectEqual(@as(usize, 1), cfg.secrets_n);
+    const s = cfg.secrets[0];
+    try t.expectEqual(@as(usize, 6), s.n);
+    try t.expectEqual(secret.Format.b10, s.fmt);
+    try t.expectEqualStrings("APP_CODE", s.env);
+}
+
+test "secret section: default env derives from a hyphenated name" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\workers = ["db"]
+        \\
+        \\[secret.db-signing]
+        \\workers = ["db"]
+    ;
+    const cfg = try parseTest(text, &storage);
+    try t.expectEqualStrings("db-signing", cfg.secrets[0].name);
+    try t.expectEqualStrings("CONFD_DB_SIGNING", cfg.secrets[0].env);
+}
+
+test "secret section: multiline workers array resolves" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\workers = ["gateway", "proxy"]
+        \\
+        \\[secret.integration]
+        \\workers = [
+        \\  "gateway",
+        \\  "proxy",
+        \\]
+    ;
+    const cfg = try parseTest(text, &storage);
+    try t.expectEqual(@as(usize, 2), cfg.secrets[0].workers_len);
+    try t.expectEqual(@as(u8, 0), cfg.secrets[0].workers[0]);
+    try t.expectEqual(@as(u8, 1), cfg.secrets[0].workers[1]);
+}
+
+test "secret section: two secrets are independent" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\workers = ["gateway", "proxy", "cron"]
+        \\
+        \\[secret.integration]
+        \\workers = ["gateway", "proxy"]
+        \\
+        \\[secret.cron-token]
+        \\workers = ["cron"]
+    ;
+    const cfg = try parseTest(text, &storage);
+    try t.expectEqual(@as(usize, 2), cfg.secrets_n);
+    try t.expectEqualStrings("CONFD_INTEGRATION", cfg.secrets[0].env);
+    try t.expectEqualStrings("CONFD_CRON_TOKEN", cfg.secrets[1].env);
+    try t.expectEqual(@as(u8, 2), cfg.secrets[1].workers[0]); // "cron" is worker 2
+}
+
+test "secret section: every rejection is a hard error" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const W = "workers = [\"gateway\"]\n";
+    // unknown worker in `workers`
+    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"nope\"]", &storage));
+    // empty `workers`
+    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = []", &storage));
+    // bytes == 0 and bytes > 4096
+    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"gateway\"]\nbytes = 0", &storage));
+    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"gateway\"]\nbytes = 4097", &storage));
+    // unknown format
+    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"gateway\"]\nformat = \"base58\"", &storage));
+    // env not matching ^[A-Z_][A-Z0-9_]*$ (lowercase, and a space)
+    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"gateway\"]\nenv = \"lower\"", &storage));
+    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"gateway\"]\nenv = \"HAS SPACE\"", &storage));
+    // two secrets resolving to the same env (collision)
+    try t.expectError(error.BadValue, parseTest(
+        W ++ "[secret.a]\nworkers = [\"gateway\"]\nenv = \"SHARED\"\n[secret.b]\nworkers = [\"gateway\"]\nenv = \"SHARED\"",
+        &storage,
+    ));
+    // unknown key inside a [secret.*] section
+    try t.expectError(error.Syntax, parseTest(W ++ "[secret.s]\nworkers = [\"gateway\"]\nbogus = \"x\"", &storage));
+    // duplicate secret name
+    try t.expectError(error.BadValue, parseTest(
+        W ++ "[secret.dup]\nworkers = [\"gateway\"]\n[secret.dup]\nworkers = [\"gateway\"]",
+        &storage,
+    ));
+}
+
+test "secret section: bare (non-derived) collision between two default envs" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // `foo-bar` and `foo_bar` are distinct names, but both derive to
+    // CONFD_FOO_BAR — the collision check must catch derived-vs-derived too.
+    // (`foo_bar` is not a valid secret name — '_' is disallowed — so use an
+    // override that lands on a derived name instead.)
+    const text =
+        \\workers = ["gateway"]
+        \\
+        \\[secret.foo-bar]
+        \\workers = ["gateway"]
+        \\
+        \\[secret.other]
+        \\workers = ["gateway"]
+        \\env = "CONFD_FOO_BAR"
+    ;
+    try t.expectError(error.BadValue, parseTest(text, &storage));
 }

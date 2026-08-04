@@ -1,12 +1,31 @@
 //! CLI parsing for mandor. Pure code — no OS calls — so it unit-tests on any host.
 
 const std = @import("std");
+const secret = @import("secret.zig");
 
 pub const max_workers = 64;
 pub const max_health = 8;
 pub const default_state_dir = "/var/lib/mandor";
 
+/// `[secret.NAME]` sections (TOML-only). A secret may be granted to every
+/// worker, so its grant list is capped at the worker cap.
+pub const max_secrets = 16;
+pub const max_secret_workers = max_workers;
+
 pub const HealthSpec = struct { worker: []const u8, cmd: []const u8 };
+
+/// One `[secret.NAME]` app-shared secret. mandor mints the value at boot and
+/// delivers it only to the granted workers over an inherited pipe fd (env
+/// `env`); `workers` holds the resolved worker indices (deny-by-default). See
+/// secret.zig for the value/encoders and the design doc for the fd channel.
+pub const SecretDef = struct {
+    name: []const u8, // lowercase [a-z0-9-]
+    env: []const u8, // resolved env var: `env` override or CONFD_<UPPER(name,'-'->'_')>
+    fmt: secret.Format = .hex,
+    n: usize = 32, // entropy bytes, or digit count for b10
+    workers: [max_secret_workers]u8 = undefined, // resolved worker indices
+    workers_len: usize = 0,
+};
 
 pub const Mode = enum { supervise, report, validate };
 
@@ -97,6 +116,10 @@ pub const Config = struct {
     prestop_pairs_n: u8 = 0,
     /// Optional KEY=VAL file loaded into every worker's environment.
     env_file: ?[]const u8 = null,
+    /// `[secret.NAME]` app-shared secrets (TOML-only): worker refs already
+    /// resolved to indices, defaults/overrides applied, validated.
+    secrets: [max_secrets]SecretDef = undefined,
+    secrets_n: usize = 0,
 };
 
 /// "143,129" -> set the listed codes (on top of the always-clean 0).
