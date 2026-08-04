@@ -1098,6 +1098,103 @@ elif [ "$late_min" -le "$((early_min + 1))" ]; then
   ok "fd floor stays flat across restarts (early=$early_min late=$late_min, $restarts73 restarts)"
 else bad "fd growth across restarts" "floor rose $early_min -> $late_min over $restarts73 restarts"; fi
 
+# ---------------------------------------------------------------------------
+# App-shared secrets ([secret.NAME]): mandor mints a per-session value and
+# delivers it only to granted workers over an inherited pipe fd. Scripts are
+# files (mandor's TOML strings are not unescaped, so a literal quote / $() can't
+# live inside one); the worker reads its fd via /proc/self/fd/$CONFD_<NAME>.
+# ---------------------------------------------------------------------------
+
+# 74. granted + deny-by-default in one run. Worker `sh` is granted secret `s`
+# (hex default: 32 bytes -> 64 hex chars); worker `sh-2` is NOT — its $CONFD_S
+# is unset. Two "sh ..." commands derive the names `sh` and `sh-2`.
+cat > "$TMP/sec_granted.sh" <<'SH'
+s=$(cat /proc/self/fd/$CONFD_S)
+echo "SGOT len=${#s} val=$s"
+SH
+cat > "$TMP/sec_denied.sh" <<'SH'
+echo "BHAS=${CONFD_S:-none}"
+SH
+cat > "$TMP/sec74.toml" <<TOML
+workers = ["sh $TMP/sec_granted.sh", "sh $TMP/sec_denied.sh"]
+[secret.s]
+workers = ["sh"]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/sec74.toml" >"$TMP/74" 2>&1
+c=$?
+if [ $c -eq 0 ] \
+   && grep -Eq '^\[sh\] SGOT len=64 val=[0-9a-f]{64}$' "$TMP/74" \
+   && grep -q '^\[sh-2\] BHAS=none$' "$TMP/74"; then
+  ok "secret granted (64 hex chars) + deny-by-default (ungranted worker has no CONFD_S)"
+else bad "secret grant/deny" "exit $c: $(grep -E '^\[sh(-2)?\] ' "$TMP/74" | head -4)"; fi
+
+# 75. shared value: two granted workers read the SAME secret bytes.
+cat > "$TMP/sec_share.sh" <<'SH'
+s=$(cat /proc/self/fd/$CONFD_S)
+echo "V=$s"
+SH
+cat > "$TMP/sec75.toml" <<TOML
+workers = ["sh $TMP/sec_share.sh", "sh $TMP/sec_share.sh"]
+[secret.s]
+workers = ["sh", "sh-2"]
+TOML
+timeout 10 "$MANDOR" --config="$TMP/sec75.toml" >"$TMP/75" 2>&1
+c=$?
+v1=$(grep -o '^\[sh\] V=[0-9a-f]*' "$TMP/75" | head -1 | sed 's/^\[sh\] V=//')
+v2=$(grep -o '^\[sh-2\] V=[0-9a-f]*' "$TMP/75" | head -1 | sed 's/^\[sh-2\] V=//')
+if [ $c -eq 0 ] && [ -n "$v1" ] && [ "$v1" = "$v2" ]; then
+  ok "two granted workers receive the identical secret value"
+else bad "shared secret value" "exit $c: v1=[$v1] v2=[$v2]"; fi
+
+# 76. restart re-delivers the SAME value. A granted worker prints its secret
+# then exits 1; under max_restarts=1 it spawns twice, so the value prints twice
+# and must be identical (minted once per mandor process, redelivered per spawn).
+cat > "$TMP/sec_restart.sh" <<'SH'
+s=$(cat /proc/self/fd/$CONFD_S)
+echo "R=$s"
+exit 1
+SH
+cat > "$TMP/sec76.toml" <<TOML
+max_restarts = 1
+workers = ["sh $TMP/sec_restart.sh"]
+[secret.s]
+workers = ["sh"]
+TOML
+timeout 15 "$MANDOR" --config="$TMP/sec76.toml" >"$TMP/76" 2>&1
+c=$?
+vals=$(grep -o '^\[sh\] R=[0-9a-f]*' "$TMP/76" | sed 's/^\[sh\] R=//')
+n=$(printf '%s\n' "$vals" | grep -c .)
+u=$(printf '%s\n' "$vals" | sort -u | grep -c .)
+if [ $c -eq 1 ] && [ "$n" -eq 2 ] && [ "$u" -eq 1 ]; then
+  ok "restart re-delivers the same secret value (printed twice, identical)"
+else bad "secret restart re-delivery" "exit $c, prints $n, distinct $u"; fi
+
+# 77. formats: b10 with bytes=6 -> exactly 6 digit chars; raw round-trips as
+# exactly `bytes` bytes to EOF (no trailing newline). One worker granted both.
+cat > "$TMP/sec_fmt.sh" <<'SH'
+o=$(cat /proc/self/fd/$CONFD_OTP)
+bc=$(cat /proc/self/fd/$CONFD_BLOB | wc -c)
+echo "OTP len=${#o} val=$o"
+echo "BLOB bytes=$bc"
+SH
+cat > "$TMP/sec77.toml" <<TOML
+workers = ["sh $TMP/sec_fmt.sh"]
+[secret.otp]
+workers = ["sh"]
+format = "b10"
+bytes = 6
+[secret.blob]
+workers = ["sh"]
+format = "raw"
+TOML
+timeout 10 "$MANDOR" --config="$TMP/sec77.toml" >"$TMP/77" 2>&1
+c=$?
+if [ $c -eq 0 ] \
+   && grep -Eq '^\[sh\] OTP len=6 val=[0-9]{6}$' "$TMP/77" \
+   && grep -q '^\[sh\] BLOB bytes=32$' "$TMP/77"; then
+  ok "formats: b10 yields 6 digits, raw round-trips 32 bytes to EOF"
+else bad "secret formats" "exit $c: $(grep -E '^\[sh\] (OTP|BLOB)' "$TMP/77")"; fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

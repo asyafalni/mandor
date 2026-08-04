@@ -127,6 +127,87 @@ of the binary. `max_restarts` is a *policy decision* — "how hard should the
 supervisor try" is a property of the deployment. Descriptions belong to the
 worker; policy belongs to the fleet.
 
+## App-shared secrets — `[secret.NAME]` sections
+
+mandor can mint a per-session secret at boot and hand it only to the workers you
+name, over a private inherited pipe fd — never in any process's environment
+value, argv, or on disk. This replaces the "generate a value and drop it on a
+shared file" pattern. `[secret.*]` is **TOML-only** (the everyday CLI stays at
+four flags), and it requires workers **defined in the config file** — a secret
+grants to workers by name, so those workers must exist in `workers = [...]`.
+
+```toml
+workers = ["./gateway", "./proxy", "./cron"]
+
+[secret.integration]
+workers = ["gateway", "proxy"]   # both receive the SAME value
+
+[secret.otp]
+workers = ["gateway"]
+bytes   = 6
+format  = "b10"                  # a 6-digit numeric code
+env     = "APP_OTP_FD"           # blend in with your own config vars
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `workers` | string list | — (**required**) | Which workers receive this secret. Every name must be a defined worker; an empty list is an error |
+| `bytes` | int | `32` | Length knob. Range **1–4096**; out of range is an error. Entropy bytes for every format **except `b10`, where it is the digit count** |
+| `format` | string | `"hex"` | One of `hex` \| `b10` \| `b32` \| `b64` \| `b64url` \| `raw`. Unknown is an error |
+| `env` | string | `CONFD_<NAME>` | The env var mandor sets to this secret's **fd number** (never the value). `<NAME>` uppercased with `-`→`_` (`db-signing` → `CONFD_DB_SIGNING`). Override to blend with your app's own env. Validated `^[A-Z_][A-Z0-9_]*$`; two secrets resolving to the same env var is an error |
+
+**Formats.** `hex` (lowercase, 2 chars/byte), `b32` (RFC 4648, uppercase, no
+padding), `b64` (RFC 4648 §4, `=` padded), `b64url` (RFC 4648 §5, URL-safe, no
+padding), `b10` (uniform decimal digits, `bytes` = digit count), `raw` (the raw
+bytes, no newline). Printable formats arrive as one `\n`-terminated line; `raw`
+is the bytes then EOF.
+
+**Deny-by-default is structural.** A secret's `workers` list *is* its access
+grant. Each worker receives an fd (and its `env` var) **only** for the secrets
+whose `workers` names it — everything else is denied. The denial is not a
+runtime check: the pipe's read end is `O_CLOEXEC` and is un-set (kept open across
+`execve`) *only* for granted workers, and mandor closes its own ends after the
+fork. An ungranted worker holds no descriptor to the pipe at all, and there is no
+file/socket/API fallback.
+
+**Lifecycle.** The value is minted once per mandor process (one `getrandom`
+draw), held in an `mlock`'d buffer for the session, and **re-delivered on every
+(re)spawn** — a restarted worker gets the same value back. It is renewed only on
+container restart (a new mandor process), and best-effort zeroed at exit. If
+`getrandom` fails at boot, mandor fails closed: it logs and exits **without
+spawning any worker** rather than run a fleet missing its secrets.
+
+### Consuming a secret
+
+The env var (`CONFD_<NAME>` by default, or your `env`) holds the **fd number**;
+read that fd once at startup, to EOF, and strip a trailing `\n` for printable
+formats. An **absent** var means you were not granted the secret — fail rather
+than proceed.
+
+**POSIX shell** (`sh`/`dash`/busybox):
+```sh
+[ -n "$CONFD_S" ] || { echo "not granted the 's' secret" >&2; exit 1; }
+secret=$(cat /proc/self/fd/$CONFD_S)
+```
+
+**Go:**
+```go
+fd, _ := strconv.Atoi(os.Getenv("CONFD_S"))
+f := os.NewFile(uintptr(fd), "confd")
+raw, _ := io.ReadAll(f)                 // read to EOF
+secret := strings.TrimRight(string(raw), "\n") // omit TrimRight for format="raw"
+```
+
+**TypeScript / Node:**
+```ts
+const fd = parseInt(process.env.CONFD_S, 10);
+const secret = fs.readFileSync(fd).toString("utf8").replace(/\n$/, "");
+```
+
+Reading via the fd does **not** put the value in your environ; if you then
+`export` it, it re-enters *your* process's environ — avoid that unless you
+deliberately ship the value onward.
+
 ## Signals & exit codes
 
 TERM/INT: graceful shutdown (forwarded to process groups, `pre_stop` hooks

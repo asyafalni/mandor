@@ -7,6 +7,7 @@ const logmod = @import("log.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 const cli = @import("cli.zig");
+const secret = @import("secret.zig");
 const backoff = @import("backoff.zig");
 const detector = @import("detector.zig");
 const signals = @import("signals.zig");
@@ -34,6 +35,21 @@ var self_stats: sampler.Window = .{};
 // Node host-metrics sampler: one fixed struct held across ticks so it keeps the
 // prior CPU/net reading for delta derivation. Only sampled when telemetry is on.
 var host_sampler: hostmetrics.Sampler = .{};
+
+// App-shared secret registry (v1.8). Each `[secret.NAME]` value is generated
+// ONCE at boot into `secret_store` (mlock'd, never swapped), held for the life
+// of the process, and re-delivered to its granted workers on every (re)spawn.
+// The store is `undefined` BSS — no binary-size cost, zero heap. Slots are sized
+// to the worst-case encoding so `generate` can never overflow: hex (2 chars/byte)
+// dominates across the formats at `max_bytes`.
+const secret_slot = blk: {
+    var m: usize = 0;
+    for (std.enums.values(secret.Format)) |f| m = @max(m, secret.encodedLen(f, secret.max_bytes));
+    break :blk m;
+};
+var secret_store: [cli.max_secrets][secret_slot]u8 = undefined; // mlock'd, wiped at exit
+var secret_val_len: [cli.max_secrets]usize = undefined;
+var secret_count: usize = 0;
 
 pub fn nowMs() u64 {
     var ts: linux.timespec = undefined;
@@ -249,11 +265,56 @@ fn planLine(w: *const spawner.Worker, note: []const u8) void {
     logmod.print("[mandor]   {s}: {s}\n", .{ w.nameSlice(), note });
 }
 
+/// Mint every configured secret once, into the mlock'd registry, and stamp a
+/// Grant onto each of its granted workers so the spawn path delivers it on every
+/// (re)spawn. Called from `run` only — never validate (no spawning there) — AFTER
+/// applyConfig has resolved the worker table.
+///
+/// Stability leads: a `getrandom` failure at boot is a HARD, fail-closed error —
+/// we return a non-null exit code and `run` refuses to spawn any worker rather
+/// than run a fleet missing its secrets. `mlock` is best-effort defense-in-depth
+/// (values never swapped to disk), so its failure is ignored. Deny-by-default is
+/// structural: only `def.workers` indices receive a Grant; every other worker
+/// keeps `secrets_n == 0` and its spawn injects no CONFD env at all.
+fn initSecrets(cfg: *const cli.Config, workers: []spawner.Worker) ?u8 {
+    secret_count = 0;
+    for (cfg.secrets[0..cfg.secrets_n], 0..) |def, si| {
+        const val = secret.generate(secret_store[si][0..], def.fmt, def.n) catch {
+            logmod.print("[mandor] cannot generate secret {s}\n", .{def.name});
+            return 2; // fail-closed: don't start the fleet without it
+        };
+        secret_val_len[si] = val.len;
+        secret_count = si + 1;
+        // Best-effort: keep the value off swap. Failure (no privilege, RLIMIT)
+        // is not a correctness problem, so it is ignored — never a trap.
+        _ = linux.mlock(val.ptr, val.len);
+        for (def.workers[0..def.workers_len]) |wi| {
+            const w = &workers[wi];
+            if (w.secrets_n < w.secrets.len) {
+                w.secrets[w.secrets_n] = .{ .value = val, .env = def.env, .raw = (def.fmt == .raw) };
+                w.secrets_n += 1;
+            }
+        }
+    }
+    return null;
+}
+
+/// Best-effort secure-zero of the used secret store at shutdown, so values do
+/// not linger in freed pages. `secureZero` writes through a `volatile` slice so
+/// the compiler cannot elide it. Process death frees the memory regardless.
+fn wipeSecrets() void {
+    var si: usize = 0;
+    while (si < secret_count) : (si += 1) {
+        std.crypto.secureZero(u8, secret_store[si][0..secret_val_len[si]]);
+    }
+}
+
 pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
     const workers = workers_buf[0..cfg.commands.len];
     var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
     var oneshot_count: usize = 0;
     if (applyConfig(cfg, workers, &dep_of, &oneshot_count)) |code| return code;
+    if (initSecrets(cfg, workers)) |code| return code;
     printPlan(cfg, workers, &dep_of);
 
     tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
@@ -475,6 +536,9 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     }
 
     emitDigest(workers, run_start_ms);
+
+    // Best-effort secure-zero of the minted secrets before we exit.
+    wipeSecrets();
 
     var worst: u8 = 0;
     for (workers) |*w| worst = @max(worst, w.final_code);
