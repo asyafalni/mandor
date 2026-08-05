@@ -620,10 +620,31 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     };
     const dp_mem_limit = [_]HDp{.{ .value_bits = h.mem_total, .is_double = false, .attrs = &a_none }};
     const dp_mem_util = [_]HDp{.{ .value_bits = mem_util_bits, .is_double = true, .attrs = &a_none }};
-    const dp_net = [_]HDp{
-        .{ .value_bits = h.net_rx, .is_double = false, .attrs = &a_dir_rx },
-        .{ .value_bits = h.net_tx, .is_double = false, .attrs = &a_dir_tx },
-    };
+
+    // system.network.io carries one receive + one transmit datapoint PER
+    // interface (attrs device=<if> + direction), mirroring the per-mount path:
+    // all backing storage is fixed-size on the stack (zero heap) and sized to
+    // max_ifaces — the per-interface HAttr pairs and the HDp array outlive the
+    // sizing/write passes. It stays a monotonic cumulative Sum in bytes (By),
+    // unchanged type; only the datapoint set is per-device now. The device
+    // string points into h.ifaces[i].name, which lives for the whole call (h is
+    // a by-value copy).
+    const max_ifaces = hostmetrics.max_ifaces;
+    var net_rx_attr_buf: [max_ifaces][2]HAttr = undefined;
+    var net_tx_attr_buf: [max_ifaces][2]HAttr = undefined;
+    var dp_net_buf: [2 * max_ifaces]HDp = undefined;
+    const niface: u32 = if (h.iface_n > max_ifaces) max_ifaces else h.iface_n;
+    {
+        var ii: u32 = 0;
+        while (ii < niface) : (ii += 1) {
+            const dev: []const u8 = h.ifaces[ii].name[0..h.ifaces[ii].name_len];
+            net_rx_attr_buf[ii] = .{ .{ .k = "device", .v = dev }, a_dir_rx[0] };
+            net_tx_attr_buf[ii] = .{ .{ .k = "device", .v = dev }, a_dir_tx[0] };
+            dp_net_buf[2 * ii] = .{ .value_bits = h.ifaces[ii].rx, .is_double = false, .attrs = net_rx_attr_buf[ii][0..] };
+            dp_net_buf[2 * ii + 1] = .{ .value_bits = h.ifaces[ii].tx, .is_double = false, .attrs = net_tx_attr_buf[ii][0..] };
+        }
+    }
+    const dp_net = dp_net_buf[0 .. 2 * niface];
 
     // system.filesystem.usage / .utilization carry one datapoint per real mount
     // (attr mountpoint=<path>), mirroring the per-core cpu path: all backing
@@ -660,7 +681,7 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
         .{ .name = "system.memory.usage", .unit = "By", .kind = .gauge, .dps = &dp_mem },
         .{ .name = "system.memory.limit", .unit = "By", .kind = .gauge, .dps = &dp_mem_limit },
         .{ .name = "system.memory.utilization", .unit = "1", .kind = .gauge, .dps = &dp_mem_util },
-        .{ .name = "system.network.io", .unit = "By", .kind = .sum, .dps = &dp_net },
+        .{ .name = "system.network.io", .unit = "By", .kind = .sum, .dps = dp_net },
         .{ .name = "system.filesystem.usage", .unit = "By", .kind = .gauge, .dps = dp_fs_usage },
         .{ .name = "system.filesystem.utilization", .unit = "1", .kind = .gauge, .dps = dp_fs_util },
     };
@@ -1499,16 +1520,21 @@ test "buildOtlpMetrics rejects a batch too large for body_buf" {
 }
 
 test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can walk" {
-    const h = hostmetrics.HostSample{
+    var h = hostmetrics.HostSample{
         .mem_total = 1000,
         .mem_used = 400,
         .cpu_total_delta = 100,
         .cpu_idle_delta = 25, // utilization = 0.75
         .logical_cpus = 8,
         .load1_milli = 1250,
-        .net_rx = 5000,
-        .net_tx = 7000,
     };
+    // One interface so the network section has a receive datapoint to walk.
+    h.iface_n = 1;
+    const ifn = "eth0";
+    @memcpy(h.ifaces[0].name[0..ifn.len], ifn);
+    h.ifaces[0].name_len = ifn.len;
+    h.ifaces[0].rx = 5000;
+    h.ifaces[0].tx = 7000;
     const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
 
     // Resource identity: host.name first, then host.id, then os.type=linux.
@@ -1566,7 +1592,8 @@ test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can w
     try testing.expectApproxEqAbs(@as(f64, 0.75), util, 1e-9);
 
     // system.network.io is a Sum (field 7, not a Gauge), monotonic cumulative,
-    // and its first datapoint has a direction attribute.
+    // and its first datapoint carries device + direction attributes (per-device
+    // now, unchanged Sum type).
     try testing.expect(Fields.get(net_io, 5) == null); // not a gauge
     const sum = Fields.get(net_io, 7).?.bytes;
     try testing.expectEqual(@as(u64, 2), Fields.get(sum, 2).?.int); // CUMULATIVE
@@ -1579,10 +1606,20 @@ test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can w
             break;
         }
     }
-    const dir_kv = Fields.get(first_sdp, 7).?.bytes; // NumberDataPoint.attributes
-    try testing.expectEqualStrings("direction", Fields.get(dir_kv, 1).?.bytes);
-    try testing.expectEqualStrings("receive", avStr(Fields.get(dir_kv, 2).?.bytes));
-    try testing.expectEqual(@as(u64, 5000), Fields.get(first_sdp, 6).?.int); // net_rx
+    // Collect the datapoint's attributes (repeated field 7): device + direction.
+    var kit = Fields{ .b = first_sdp };
+    var dev: []const u8 = &.{};
+    var dir: []const u8 = &.{};
+    while (kit.next()) |kf| {
+        if (kf.num != 7) continue; // NumberDataPoint.attributes (repeated)
+        const k = Fields.get(kf.bytes, 1).?.bytes;
+        const v = avStr(Fields.get(kf.bytes, 2).?.bytes);
+        if (std.mem.eql(u8, k, "device")) dev = v;
+        if (std.mem.eql(u8, k, "direction")) dir = v;
+    }
+    try testing.expectEqualStrings("eth0", dev);
+    try testing.expectEqualStrings("receive", dir);
+    try testing.expectEqual(@as(u64, 5000), Fields.get(first_sdp, 6).?.int); // iface rx
 }
 
 test "buildOtlpHostMetrics emits per-core cpu.utilization datapoints" {
@@ -1715,6 +1752,88 @@ test "buildOtlpHostMetrics emits per-mount filesystem usage/utilization datapoin
     }
     try testing.expectApproxEqAbs(@as(f64, 0.25), root_util.?, 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 0.5), data_util.?, 1e-9);
+}
+
+test "buildOtlpHostMetrics emits per-interface network.io + a free memory datapoint" {
+    // Two interfaces: eth0 (rx 1000/tx 2000) and wlan0 (rx 30/tx 40). Each emits
+    // a receive + transmit datapoint keyed by device=<if> + direction — never
+    // one aggregate. Plus system.memory.usage carries a state="free" datapoint
+    // = mem_total - mem_used.
+    var h = hostmetrics.HostSample{ .mem_total = 1000, .mem_used = 400 };
+    h.iface_n = 2;
+    const n0 = "eth0";
+    @memcpy(h.ifaces[0].name[0..n0.len], n0);
+    h.ifaces[0].name_len = n0.len;
+    h.ifaces[0].rx = 1000;
+    h.ifaces[0].tx = 2000;
+    const n1 = "wlan0";
+    @memcpy(h.ifaces[1].name[0..n1.len], n1);
+    h.ifaces[1].name_len = n1.len;
+    h.ifaces[1].rx = 30;
+    h.ifaces[1].tx = 40;
+    const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
+
+    const rm = Fields.get(body, 1).?.bytes; // resource_metrics
+    const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
+    var mit = Fields{ .b = sm };
+    var net_io: []const u8 = &.{};
+    var mem_usage: []const u8 = &.{};
+    while (mit.next()) |f| {
+        if (f.num != 2) continue; // Metric
+        const name = Fields.get(f.bytes, 1).?.bytes;
+        if (std.mem.eql(u8, name, "system.network.io")) net_io = f.bytes;
+        if (std.mem.eql(u8, name, "system.memory.usage")) mem_usage = f.bytes;
+    }
+    try testing.expect(net_io.len > 0);
+    try testing.expect(mem_usage.len > 0);
+
+    // network.io stays a Sum (field 7), monotonic cumulative — unchanged type,
+    // per-device now. Walk every datapoint; match (device, direction) -> value.
+    try testing.expect(Fields.get(net_io, 5) == null); // not a gauge
+    const sum = Fields.get(net_io, 7).?.bytes;
+    try testing.expectEqual(@as(u64, 2), Fields.get(sum, 2).?.int); // CUMULATIVE
+    try testing.expectEqual(@as(u64, 1), Fields.get(sum, 3).?.int); // is_monotonic
+    var sdps = Fields{ .b = sum };
+    var eth_rx: ?u64 = null;
+    var eth_tx: ?u64 = null;
+    var wlan_rx: ?u64 = null;
+    var wlan_tx: ?u64 = null;
+    while (sdps.next()) |f| {
+        if (f.num != 1) continue; // data_points
+        const dp = f.bytes;
+        var kit = Fields{ .b = dp };
+        var dev: []const u8 = &.{};
+        var dir: []const u8 = &.{};
+        while (kit.next()) |kf| {
+            if (kf.num != 7) continue; // NumberDataPoint.attributes (repeated)
+            const k = Fields.get(kf.bytes, 1).?.bytes;
+            const v = avStr(Fields.get(kf.bytes, 2).?.bytes);
+            if (std.mem.eql(u8, k, "device")) dev = v;
+            if (std.mem.eql(u8, k, "direction")) dir = v;
+        }
+        const val = Fields.get(dp, 6).?.int; // as_int bytes
+        if (std.mem.eql(u8, dev, "eth0") and std.mem.eql(u8, dir, "receive")) eth_rx = val;
+        if (std.mem.eql(u8, dev, "eth0") and std.mem.eql(u8, dir, "transmit")) eth_tx = val;
+        if (std.mem.eql(u8, dev, "wlan0") and std.mem.eql(u8, dir, "receive")) wlan_rx = val;
+        if (std.mem.eql(u8, dev, "wlan0") and std.mem.eql(u8, dir, "transmit")) wlan_tx = val;
+    }
+    try testing.expectEqual(@as(u64, 1000), eth_rx.?); // per-interface, not summed
+    try testing.expectEqual(@as(u64, 2000), eth_tx.?);
+    try testing.expectEqual(@as(u64, 30), wlan_rx.?);
+    try testing.expectEqual(@as(u64, 40), wlan_tx.?);
+
+    // system.memory.usage carries a state="free" datapoint = mem_total-mem_used.
+    const gauge = Fields.get(mem_usage, 5).?.bytes;
+    var gdps = Fields{ .b = gauge };
+    var free_bytes: ?u64 = null;
+    while (gdps.next()) |f| {
+        if (f.num != 1) continue; // data_points
+        const dp = f.bytes;
+        const kv = Fields.get(dp, 7).?.bytes; // state attr
+        const v = avStr(Fields.get(kv, 2).?.bytes);
+        if (std.mem.eql(u8, v, "free")) free_bytes = Fields.get(dp, 6).?.int;
+    }
+    try testing.expectEqual(@as(u64, 600), free_bytes.?); // 1000 - 400
 }
 
 test "Shipped set tracks names and sweeps entries no longer on disk" {

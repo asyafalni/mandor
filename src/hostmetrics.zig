@@ -34,6 +34,25 @@ pub const Mount = struct {
     used: u64 = 0,
 };
 
+/// Upper bound on per-interface network tracking. A host rarely exposes more
+/// than a handful of real NICs, but bridges/veth pairs in a container host can
+/// pile up; parseNetDev caps its output at this length (excess interfaces
+/// truncated, never an overrun) and HostSample carries a fixed array of this
+/// size.
+pub const max_ifaces = 16;
+
+/// One non-loopback network interface with its cumulative counters. Daemon-local
+/// (the name only ever becomes an OTLP `device` attribute), so a fixed-size
+/// stored name is fine. `name`/`name_len` hold the interface name (a name that
+/// will not fit is truncated to 31 bytes — the counters are still recorded);
+/// rx/tx are the cumulative byte counters from /proc/net/dev (saturating).
+pub const Iface = struct {
+    name: [32]u8 = [_]u8{0} ** 32,
+    name_len: u8 = 0,
+    rx: u64 = 0,
+    tx: u64 = 0,
+};
+
 pub const HostSample = struct {
     // memory (bytes)
     mem_total: u64 = 0,
@@ -48,9 +67,12 @@ pub const HostSample = struct {
     core_idle_delta: [max_cores]u64 = [_]u64{0} ** max_cores,
     core_n: u32 = 0,
     load1_milli: u32 = 0, // /proc/loadavg field1 * 1000 (integer, no float on wire)
-    // network (cumulative monotonic bytes across non-loopback ifaces)
-    net_rx: u64 = 0,
-    net_tx: u64 = 0,
+    // network — one entry per non-loopback interface, cumulative monotonic
+    // bytes. Only the first `iface_n` (<= max_ifaces) entries of `ifaces` are
+    // valid. Daemon-local, so the fixed-size stored names never touch the wire
+    // (they only become an OTLP `device` attribute in the encoder).
+    ifaces: [max_ifaces]Iface = [_]Iface{.{}} ** max_ifaces,
+    iface_n: u32 = 0,
     // filesystem — one entry per real (non-pseudo) mount, bytes. Only the first
     // `mount_n` (<= max_mounts) entries of `mounts` are valid. Daemon-local, so
     // the fixed-size stored paths never touch the wire.
@@ -166,30 +188,45 @@ pub fn parseLoadavg(text: []const u8) u32 {
     return whole *| 1000 +| frac;
 }
 
-pub const Net = struct { rx: u64 = 0, tx: u64 = 0 };
-
-/// /proc/net/dev: sum rx-bytes (col 1) and tx-bytes (col 9) across every
-/// NON-loopback interface (skip `lo`). Header lines have no ':' and are
-/// skipped. Sums saturate; garbage tokens parse to 0. O(input).
-pub fn parseNetDev(text: []const u8) Net {
-    var res: Net = .{};
+/// /proc/net/dev: capture rx-bytes (col 1) and tx-bytes (col 9) PER
+/// NON-loopback interface (skip `lo`) into `out`, returning the filled prefix.
+/// The interface name is the text before ':' (trimmed); a name longer than 31
+/// bytes has its STORED name truncated (the counters are still recorded).
+/// Header lines have no ':' and are skipped. Output is bounded to max_ifaces
+/// (excess interfaces truncated — never an overrun). Counters saturate; garbage
+/// tokens parse to 0. Pure: no syscalls, deterministically unit-testable with
+/// fixture strings. O(input): single pass.
+///
+/// MUTATION SENTINEL: dropping the `lo` skip lets loopback into the output —
+/// the "parseNetDev excludes lo" test then sees an extra interface and fails.
+pub fn parseNetDev(text: []const u8, out: *[max_ifaces]Iface) []const Iface {
+    var n: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
+        if (n >= max_ifaces) break; // bounded — truncate, never overrun
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " \t");
         if (std.mem.eql(u8, name, "lo")) continue; // loopback excluded
+        var rx: u64 = 0;
+        var tx: u64 = 0;
         var it = std.mem.tokenizeAny(u8, line[colon + 1 ..], " \t\r");
         var i: usize = 1;
         while (it.next()) |tok| : (i += 1) {
             if (i == 1) {
-                res.rx +|= std.fmt.parseInt(u64, tok, 10) catch 0;
+                rx = std.fmt.parseInt(u64, tok, 10) catch 0;
             } else if (i == 9) {
-                res.tx +|= std.fmt.parseInt(u64, tok, 10) catch 0;
+                tx = std.fmt.parseInt(u64, tok, 10) catch 0;
                 break; // nothing past tx-bytes matters
             }
         }
+        out[n] = .{ .rx = rx, .tx = tx };
+        // Truncate a too-long name to the stored buffer; counters are unaffected.
+        const keep = if (name.len > out[n].name.len - 1) out[n].name.len - 1 else name.len;
+        @memcpy(out[n].name[0..keep], name[0..keep]);
+        out[n].name_len = @intCast(keep);
+        n += 1;
     }
-    return res;
+    return out[0..n];
 }
 
 pub const MountRef = struct { mountpoint: []const u8, fstype: []const u8 };
@@ -394,10 +431,14 @@ pub const Sampler = struct {
         var load_buf: [128]u8 = undefined;
         out.load1_milli = parseLoadavg(readFile("/proc/loadavg", &load_buf) orelse "");
 
+        // Per-interface network counters. Read /proc/net/dev (8 KiB covers many
+        // interfaces; truncation is safe — we parse what we read) and fill the
+        // sample's interface array directly: each Iface owns its (copied) name,
+        // so there is no aliasing into the scratch buffer. parseNetDev bounds
+        // itself to max_ifaces, so iface_n can never exceed out.ifaces.
         var net_buf: [8192]u8 = undefined;
-        const net = parseNetDev(readFile("/proc/net/dev", &net_buf) orelse "");
-        out.net_rx = net.rx;
-        out.net_tx = net.tx;
+        const nifs = parseNetDev(readFile("/proc/net/dev", &net_buf) orelse "", &out.ifaces);
+        out.iface_n = @intCast(nifs.len);
 
         // Per-mount filesystem usage. Read /proc/self/mountinfo (64 KiB covers
         // hundreds of mounts; truncation is safe — we parse what we read),
@@ -510,10 +551,55 @@ test "per-core util: busy core -> ~1.0, idle core -> ~0.0" {
     try testing.expectApproxEqAbs(@as(f64, 0.0), util1, 1e-9); // fully idle
 }
 
-test "parseNetDev sums non-loopback rx/tx" {
-    const n = parseNetDev("Inter-|...\n face |...\n  lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n");
-    try testing.expectEqual(@as(u64, 1000), n.rx); // lo excluded
-    try testing.expectEqual(@as(u64, 2000), n.tx);
+test "parseNetDev excludes lo and reports per-interface rx/tx (not summed)" {
+    // Loopback + two real interfaces: lo must be dropped, and each real iface
+    // keeps its OWN rx/tx (col 1 / col 9) — never coalesced into one total.
+    var out: [max_ifaces]Iface = undefined;
+    const ifs = parseNetDev(
+        "Inter-|...\n face |...\n" ++
+            "  lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n" ++
+            " eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n" ++
+            " wlan0: 300 0 0 0 0 0 0 0 400 0 0 0 0 0 0 0\n",
+        &out,
+    );
+    try testing.expectEqual(@as(usize, 2), ifs.len); // lo excluded, not summed away
+    try testing.expectEqualStrings("eth0", ifs[0].name[0..ifs[0].name_len]);
+    try testing.expectEqual(@as(u64, 1000), ifs[0].rx);
+    try testing.expectEqual(@as(u64, 2000), ifs[0].tx);
+    try testing.expectEqualStrings("wlan0", ifs[1].name[0..ifs[1].name_len]);
+    try testing.expectEqual(@as(u64, 300), ifs[1].rx);
+    try testing.expectEqual(@as(u64, 400), ifs[1].tx);
+}
+
+// MUTATION TARGET: loosening the max_ifaces bound in parseNetDev
+// (`n >= max_ifaces` -> `n > max_ifaces`, or dropping the clamp) makes this test
+// overrun the out array and trap; and a name too long for the 32-byte buffer
+// must truncate the STORED name while still recording the counters.
+test "parseNetDev truncates beyond max_ifaces and truncates long names (no overrun)" {
+    var buf: [8192]u8 = undefined;
+    var w: usize = 0;
+    // More than max_ifaces distinct interfaces.
+    var i: usize = 0;
+    while (i < max_ifaces + 8) : (i += 1) {
+        const line = try std.fmt.bufPrint(buf[w..], " eth{d}: {d} 0 0 0 0 0 0 0 {d} 0\n", .{ i, i, i });
+        w += line.len;
+    }
+    var out: [max_ifaces]Iface = undefined;
+    const ifs = parseNetDev(buf[0..w], &out);
+    try testing.expectEqual(@as(usize, max_ifaces), ifs.len); // bounded, no overrun
+    try testing.expectEqualStrings("eth0", ifs[0].name[0..ifs[0].name_len]);
+
+    // A name longer than the 31-byte stored capacity: stored name truncates to
+    // 31 bytes, but the counters are still recorded intact.
+    const longname = "eth0123456789012345678901234567890abcdef"; // > 31 chars
+    var out2: [max_ifaces]Iface = undefined;
+    const line2 = try std.fmt.bufPrint(&buf, " {s}: 111 0 0 0 0 0 0 0 222 0\n", .{longname});
+    const ifs2 = parseNetDev(line2, &out2);
+    try testing.expectEqual(@as(usize, 1), ifs2.len);
+    try testing.expectEqual(@as(u8, 31), ifs2[0].name_len); // truncated to capacity
+    try testing.expectEqualStrings(longname[0..31], ifs2[0].name[0..ifs2[0].name_len]);
+    try testing.expectEqual(@as(u64, 111), ifs2[0].rx); // counters intact
+    try testing.expectEqual(@as(u64, 222), ifs2[0].tx);
 }
 
 test "parseMountinfo skips pseudo-fs, dedups, keeps real mounts in order" {
@@ -580,8 +666,9 @@ test "overflow-safe: a giant /proc number saturates, no trap" {
     try testing.expectEqual(@as(u64, 0), m.used);
     // A giant load average must also saturate its u32, not trap.
     _ = parseLoadavg("99999999999999999999.99999999999999 0 0");
-    // A giant net counter saturates u64 across many interfaces, not trap.
-    _ = parseNetDev(" eth0: 99999999999999999999 0 0 0 0 0 0 0 99999999999999999999 0\n");
+    // A giant net counter parses to 0 (parseInt overflow), not trap.
+    var net_out: [max_ifaces]Iface = undefined;
+    _ = parseNetDev(" eth0: 99999999999999999999 0 0 0 0 0 0 0 99999999999999999999 0\n", &net_out);
     // A giant cpu field saturates the running total, not trap.
     _ = parseStatCpu("cpu 99999999999999999999999 99999999999999999999999\n");
     // A giant per-core field also saturates (parseInt overflow -> 0), not trap.
@@ -624,4 +711,9 @@ test "sample reads live host values (validates statfs layout + /proc)" {
     try testing.expect(h.core_n > 0);
     try testing.expect(h.core_n <= h.logical_cpus);
     try testing.expect(h.core_n <= max_cores);
+    // Per-interface network: bounded by max_ifaces, and any captured interface
+    // has a non-empty name (loopback is excluded, so a host with only `lo`
+    // legitimately yields zero — hence `>= 0`, not `> 0`).
+    try testing.expect(h.iface_n <= max_ifaces);
+    if (h.iface_n > 0) try testing.expect(h.ifaces[0].name_len > 0);
 }
