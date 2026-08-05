@@ -132,17 +132,6 @@ pub fn emitLifecycle(e: frame.Lifecycle) void {
     writeFrame(bytes);
 }
 
-/// Emit one node host sample (drops silently if no daemon or the pipe is full).
-/// The host frame is ~75 bytes — well under PIPE_BUF — so the same fixed stack
-/// buffer + single non-blocking write as the other emitters applies; on any
-/// encode or write failure the sample is dropped, never retried.
-pub fn emitHost(h: frame.Host) void {
-    if (write_fd < 0) return;
-    var buf: [128]u8 = undefined;
-    const bytes = frame.encodeHost(&buf, h) catch return; // frame too large → drop
-    writeFrame(bytes);
-}
-
 /// One non-blocking write; drop on anything but a full success. Never blocks,
 /// never retries — the supervision loop outranks telemetry. Frames are far
 /// below PIPE_BUF (4096), so a pipe write is atomic: it either writes the whole

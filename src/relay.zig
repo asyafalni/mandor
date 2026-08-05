@@ -12,6 +12,7 @@ const resolve = @import("resolve.zig");
 const frame = @import("frame.zig");
 const spool = @import("spool.zig");
 const hostmetrics = @import("hostmetrics.zig");
+const sampler = @import("sampler.zig");
 
 /// Wall-clock ceiling on each blocking socket call. Generous enough that a
 /// merely slow collector still succeeds, short enough that a hung one cannot
@@ -568,7 +569,7 @@ fn ratioBits(num: u64, den: u64) u64 {
 /// buildOtlpMetrics: size innermost-first, refuse an oversize body, write, then
 /// assert the two passes agree. Timestamp is taken here (the frame carries no
 /// time), matching buildOtlp's clock read.
-pub fn buildOtlpHostMetrics(h: frame.Host, host_name: []const u8, host_id: []const u8) error{TooLarge}![]const u8 {
+pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, host_id: []const u8) error{TooLarge}![]const u8 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &ts);
     const ns: u64 = @as(u64, @intCast(ts.sec)) *| 1_000_000_000 +| @as(u64, @intCast(ts.nsec));
@@ -970,9 +971,10 @@ var metric_samples: [metric_batch_cap]frame.MetricSample = undefined;
 var metric_names: [metric_batch_cap][ship_name_cap]u8 = undefined;
 
 // Host identity for the `system.*` resource, read ONCE at daemon start (it does
-// not change for the daemon's life) into these fixed buffers; drainPipe ships
-// host samples with the slices below, so the drain path never re-reads /proc or
-// allocates. Default to "unknown" until runDaemon populates them.
+// not change for the daemon's life) into these fixed buffers; the node-sample
+// ship path (runDaemon) and the per-worker metric batch (drainPipe, host.name)
+// both reuse the slices below, so neither re-reads /proc or allocates. Default
+// to "unknown" until runDaemon populates them.
 var daemon_host_name_buf: [256]u8 = undefined;
 var daemon_host_id_buf: [256]u8 = undefined;
 var daemon_host_name: []const u8 = "unknown";
@@ -1021,17 +1023,6 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
                     // too large to encode → drop (routine telemetry is ephemeral)
                 }
             },
-            // Node host sample → one host-scoped ResourceMetrics on /v1/metrics.
-            // Same best-effort shape as lifecycle_event: build inline into
-            // body_buf, post, drop on any encode failure. daemon_host_name/id
-            // were read once at daemon start.
-            .host_sample => |h| {
-                if (buildOtlpHostMetrics(h, daemon_host_name, daemon_host_id)) |b| {
-                    _ = post(host, port, "/v1/metrics", b, token);
-                } else |_| {
-                    // too large to encode → drop (routine telemetry is ephemeral)
-                }
-            },
         }
         off += d.used;
     }
@@ -1056,6 +1047,15 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
         }
     }
     return eof;
+}
+
+/// CLOCK_MONOTONIC in milliseconds — the daemon's scheduling clock for the node
+/// sample deadline. Saturating so a bad clock read can never trap. Monotonic
+/// (not REALTIME) so a wall-clock step cannot skew the sample cadence.
+fn monoMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) *| 1000 +| @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 
 /// Non-blocking check: has a clean-shutdown signal (TERM/INT) arrived?
@@ -1107,9 +1107,19 @@ pub fn runDaemon(
     }
 
     // Host identity for the system.* resource attributes: read once here (it is
-    // stable for the daemon's life) so drainPipe's ship path never re-reads /proc.
+    // stable for the daemon's life) so the ship paths never re-read /proc.
     daemon_host_name = hostmetrics.hostName(&daemon_host_name_buf);
     daemon_host_id = hostmetrics.hostId(&daemon_host_id_buf);
+
+    // Node host-metric sampling lives HERE now (it used to run on PID 1 and cross
+    // the pipe): the daemon owns the hostmetrics.Sampler and a deadline. sample()
+    // never fails (unreadable /proc → zeros) and carries the prev-CPU reading for
+    // the utilization delta, so the FIRST tick only primes and emits nothing —
+    // exactly as the sampler behaved when it ran in the supervisor. Fixed struct,
+    // zero allocation; nothing about this touches the supervision path.
+    var node_sampler: hostmetrics.Sampler = .{};
+    var node_primed = false;
+    var next_node_sample_ms: u64 = monoMs() +| sampler.interval_ms;
 
     var shipped: Shipped = .{};
 
@@ -1132,7 +1142,41 @@ pub fn runDaemon(
             return 0;
         }
 
-        var ts = linux.timespec{ .sec = daemon_cycle_s, .nsec = 0 };
+        // Node host sample: due every sampler.interval_ms (5s). sample() cannot
+        // trap; the first (priming) tick emits nothing, then each tick re-encodes
+        // the fresh HostSample as one host-scoped ResourceMetrics and ships it on
+        // the SAME /v1/metrics path the per-worker metric batch uses. A build
+        // failure drops the sample (routine telemetry is ephemeral). The deadline
+        // advances by a FIXED interval (not relative to now), so the 5s cadence
+        // stays anchored to absolute time and self-corrects rather than drifting.
+        if (monoMs() >= next_node_sample_ms) {
+            const h = node_sampler.sample();
+            if (node_primed) {
+                if (buildOtlpHostMetrics(h, daemon_host_name, daemon_host_id)) |b| {
+                    _ = post(hp.host, hp.port, "/v1/metrics", b, token);
+                } else |_| {
+                    // too large to encode → drop (routine telemetry is ephemeral)
+                }
+            } else {
+                node_primed = true; // first tick primes the CPU delta only
+            }
+            next_node_sample_ms +|= sampler.interval_ms;
+        }
+
+        // Sleep the cycle, but never past the next node-sample deadline so the
+        // sample fires on time. next_node_sample_ms is in the future here (it was
+        // just advanced above if it was due), so the bound stays positive and the
+        // loop never busy-spins.
+        var sleep_ms: u64 = daemon_cycle_s * 1000;
+        const now_ms = monoMs();
+        if (next_node_sample_ms > now_ms) {
+            const until = next_node_sample_ms - now_ms;
+            if (until < sleep_ms) sleep_ms = until;
+        }
+        var ts = linux.timespec{
+            .sec = @intCast(sleep_ms / 1000),
+            .nsec = @intCast((sleep_ms % 1000) * 1_000_000),
+        };
         _ = linux.nanosleep(&ts, &ts);
     }
 }
@@ -1410,7 +1454,7 @@ test "buildOtlpMetrics rejects a batch too large for body_buf" {
 }
 
 test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can walk" {
-    const h = frame.Host{
+    const h = hostmetrics.HostSample{
         .mem_total = 1000,
         .mem_used = 400,
         .cpu_total_delta = 100,

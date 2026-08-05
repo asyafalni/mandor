@@ -23,7 +23,6 @@ const metrics = @import("metrics.zig");
 const cost = @import("cost.zig");
 const telemetry = @import("telemetry.zig");
 const frame = @import("frame.zig");
-const hostmetrics = @import("hostmetrics.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -31,10 +30,6 @@ var workers_buf: [cli.max_workers]spawner.Worker = undefined;
 
 // Supervisor self-metric sampling window (only touched when telemetry is on).
 var self_stats: sampler.Window = .{};
-
-// Node host-metrics sampler: one fixed struct held across ticks so it keeps the
-// prior CPU/net reading for delta derivation. Only sampled when telemetry is on.
-var host_sampler: hostmetrics.Sampler = .{};
 
 // App-shared secret registry (v1.8). Each `[secret.NAME]` value is generated
 // ONCE at boot into `secret_store` (mlock'd, never swapped), held for the life
@@ -976,26 +971,9 @@ fn runSamplerTick(
             .restarts = 0,
             .t_unix_ns = t_ns,
         });
-        // Node-level host metrics: one sample per tick so each worker is visible
-        // against the node total in photon's Infrastructure view. sample() never
-        // traps (unreadable /proc → zeros) and emitHost is a non-blocking write
-        // that drops on backpressure, so this cannot stall supervision. The wire
-        // type frame.Host mirrors hostmetrics.HostSample field-for-field; build
-        // it at the call site (as the per-worker emitMetric above does) since the
-        // two are distinct named structs and Zig does not coerce between them.
-        const hs = host_sampler.sample();
-        telemetry.emitHost(.{
-            .mem_total = hs.mem_total,
-            .mem_used = hs.mem_used,
-            .cpu_total_delta = hs.cpu_total_delta,
-            .cpu_idle_delta = hs.cpu_idle_delta,
-            .logical_cpus = hs.logical_cpus,
-            .load1_milli = hs.load1_milli,
-            .net_rx = hs.net_rx,
-            .net_tx = hs.net_tx,
-            .fs_total = hs.fs_total,
-            .fs_used = hs.fs_used,
-        });
+        // Node-level host metrics (system.*) are sampled inside the relay daemon
+        // now, not here: PID 1 no longer reads /proc for the node or crosses the
+        // pipe with a host frame. See relay.runDaemon's node-sample block.
     }
     // PSI stall is container-scoped: check once, attribute the
     // incident to the largest consumer of the pressured resource.
