@@ -3,6 +3,44 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.9.0] - 2026-08-05
+
+mandor absorbs the role of **photon-agent** (photon's standalone per-host
+resource agent): one static mandor binary now reports full node + GPU metrics
+*alongside* its per-worker process metrics, so photon shows each supervised
+process against the node it runs on — under one host, with zero photon changes.
+photon-agent can be retired (deletion is upstream's call). Node + GPU sampling
+lives entirely in the `mandor relay --daemon` child, never on the supervision
+path. All host metrics are node-scoped `/proc`/`sysfs`/`statfs` reads; see the
+node-monitor deployment note in `docs/CONFIG.md`.
+
+### Added
+- **Per-core CPU** — `system.cpu.utilization` now emits `cpu="total"` **and one
+  point per core** (`cpu=<n>`).
+- **Per-mount filesystem** — `system.filesystem.usage`/`utilization` for every
+  real (non-pseudo) mount (`mountpoint=<mp>`), from `/proc/self/mountinfo` +
+  `statfs`; was root `/` only.
+- **Per-interface network** — `system.network.io` per `device=<if>` (was summed).
+- **Memory free** — `system.memory.usage` gains a `state="free"` datapoint.
+- **GPU metrics** (opt-in, `[gpu] enabled`) — `system.gpu.{utilization,
+  memory.usage,memory.utilization,temperature,power}` per GPU (`gpu`,`gpu.name`).
+  NVIDIA via an `nvidia-smi` shell-out (mandor is static/libc-free, so it shells
+  out rather than linking NVML); AMD/Intel via DRM sysfs (`/sys/class/drm`).
+  Fail-closed: no `nvidia-smi`/no GPU ⇒ no points, no effect on anything else.
+  Configurable cadence (`[gpu] interval`, default 15s).
+- **More node metrics** — `system.disk.io` per device (`/proc/diskstats`),
+  `system.paging.usage` (swap), `system.cpu.load_average.5m`/`.15m`, and two
+  mandor-extension gauges `system.uptime` and `system.cpu.temperature` (hwmon).
+- **Node-monitor deployment** — documented running mandor with host `/proc`,
+  `/sys`, `/etc/machine-id` (+ `/dev/nvidia*`) mounted to report the host, node-
+  exporter style. Additive: the same binary still supervises its workers.
+
+### Changed
+- Node host metrics are now sampled **inside the relay daemon** (its own timer)
+  rather than sent from PID 1 over the telemetry pipe — keeps the supervision
+  path leaner and the new per-core/mount/interface data off the wire frame.
+- Config-surface budget 36 → 38 for the two `[gpu]` keys (`enabled`, `interval`).
+
 ## [1.8.1] - 2026-08-05
 
 ### Changed
