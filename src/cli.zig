@@ -29,6 +29,13 @@ pub const SecretDef = struct {
 
 pub const Mode = enum { supervise, report, validate };
 
+/// `[gpu]` section (TOML-only). OFF by default — GPU sampling is 100% opt-in.
+/// When enabled, the relay daemon shells out to `nvidia-smi` on `interval_ms`.
+pub const GpuConfig = struct {
+    enabled: bool = false,
+    interval_ms: u64 = 15_000,
+};
+
 pub const Config = struct {
     mode: Mode = .supervise,
     backoff_max_ms: u64 = 30_000,
@@ -120,6 +127,8 @@ pub const Config = struct {
     /// resolved to indices, defaults/overrides applied, validated.
     secrets: [max_secrets]SecretDef = undefined,
     secrets_n: usize = 0,
+    /// `[gpu]` NVIDIA GPU sampling (TOML-only): off by default, daemon-side.
+    gpu: GpuConfig = .{},
 };
 
 /// "143,129" -> set the listed codes (on top of the always-clean 0).

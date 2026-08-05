@@ -32,6 +32,7 @@ const cli = @import("cli.zig");
 const ring = @import("ring.zig");
 const backoff = @import("backoff.zig");
 const relay = @import("relay.zig");
+const gpu = @import("gpu.zig");
 
 /// Real crash output — the seeds worth mutating. Doubles as the fixture set
 /// CLAUDE.md calls for.
@@ -649,6 +650,21 @@ fn relayTarget(bytes: []const u8) void {
     std.debug.assert(protoWalk(body, 0));
 }
 
+/// GPU CSV is nvidia-smi's stdout — a subprocess mandor does not control, so it
+/// may be truncated, mis-columned, or garbage. The pure parser must never trap,
+/// and whatever it yields must always encode to a protobuf a collector decodes.
+fn gpuTarget(bytes: []const u8) void {
+    var out: [gpu.max_gpus]gpu.GpuSample = undefined;
+    const gsamples = gpu.parseNvidiaSmi(bytes, &out); // must not trap
+    if (gsamples.len == 0) return;
+    const body = relay.buildOtlpGpuMetrics(gsamples, "node", "id") catch return;
+    std.debug.assert(protoWalk(body, 0));
+}
+
+const gpu_seed =
+    "0, NVIDIA RTX 4090, 55, 2048, 24576, 61, 320.50\n" ++
+    "1, NVIDIA A100, 0, 100, 40960, 40, 55.00\n";
+
 test "seed valid: cli args" {
     var storage: [cli.max_workers][]const u8 = undefined;
     var slots: [24][]const u8 = undefined;
@@ -788,6 +804,24 @@ test "fuzz: relay bundle scanner survives a mutated incident file" {
     var p = prng();
     const rnd = p.random();
     for (0..iterations) |_| relayTarget(mutate(rnd, relay_seed, &buf));
+}
+
+test "seed valid: gpu csv" {
+    // Prove the seed builds a decodable payload before mutating it, and that
+    // buildOtlpGpuMetrics really emits the system.gpu.* names + gpu attrs.
+    var out: [gpu.max_gpus]gpu.GpuSample = undefined;
+    const gsamples = gpu.parseNvidiaSmi(gpu_seed, &out);
+    try std.testing.expectEqual(@as(usize, 2), gsamples.len);
+    const body = try relay.buildOtlpGpuMetrics(gsamples, "node", "id");
+    try std.testing.expect(protoWalk(body, 0));
+    try std.testing.expect(std.mem.indexOf(u8, body, "system.gpu.utilization") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "gpu.name") != null);
+}
+
+test "fuzz: gpu csv parser + otlp survive mutated nvidia-smi output" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |_| gpuTarget(mutate(rnd, gpu_seed, &buf));
 }
 
 test "fuzz: photon endpoint parser survives garbage" {

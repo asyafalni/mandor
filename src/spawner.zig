@@ -754,8 +754,10 @@ pub fn spawnDetached(
     return @intCast(rc);
 }
 
-/// exec with PATH candidates; never returns (127 on total failure).
-fn execArgv(
+/// exec with PATH candidates; never returns (127 on total failure). Public so
+/// the daemon's GPU sampler (gpu.zig) can reuse the exact same fork/exec idiom
+/// for its `nvidia-smi` subprocess instead of duplicating PATH resolution.
+pub fn execArgv(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,

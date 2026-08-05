@@ -52,6 +52,8 @@ pub fn nowNs() u64 {
 pub fn spawnDaemon(
     endpoint: []const u8,
     state_dir: []const u8,
+    gpu_enabled: bool,
+    gpu_interval_ms: u64,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
 ) void {
@@ -65,6 +67,8 @@ pub fn spawnDaemon(
     var fd_buf: [16]u8 = undefined;
     var ep_buf: [96]u8 = undefined;
     var sd_buf: [512]u8 = undefined;
+    var gpu_buf: [2]u8 = undefined;
+    var gi_buf: [24]u8 = undefined;
     const fd_str = std.fmt.bufPrintZ(&fd_buf, "{d}", .{read_fd}) catch {
         _ = linux.close(read_fd);
         _ = linux.close(write_end);
@@ -80,11 +84,22 @@ pub fn spawnDaemon(
         _ = linux.close(write_end);
         return;
     };
+    // GPU config as two trailing argv strings ("0"|"1" + interval ms).
+    const gpu_str = std.fmt.bufPrintZ(&gpu_buf, "{d}", .{@intFromBool(gpu_enabled)}) catch {
+        _ = linux.close(read_fd);
+        _ = linux.close(write_end);
+        return;
+    };
+    const gi_str = std.fmt.bufPrintZ(&gi_buf, "{d}", .{gpu_interval_ms}) catch {
+        _ = linux.close(read_fd);
+        _ = linux.close(write_end);
+        return;
+    };
 
-    // `mandor relay --daemon <endpoint> <state_dir> <read_fd>` — main.zig routes
-    // it. The string buffers live on this stack frame; spawnDetached forks and
-    // the child execs from its copy before this function returns, so they are
-    // valid for the exec.
+    // `mandor relay --daemon <endpoint> <state_dir> <read_fd> <gpu> <interval>` —
+    // main.zig routes it. The string buffers live on this stack frame;
+    // spawnDetached forks and the child execs from its copy before this function
+    // returns, so they are valid for the exec.
     const argv = [_:null]?[*:0]const u8{
         "/proc/self/exe",
         "relay",
@@ -92,6 +107,8 @@ pub fn spawnDaemon(
         @ptrCast(ep_str.ptr),
         @ptrCast(sd_str.ptr),
         @ptrCast(fd_str.ptr),
+        @ptrCast(gpu_str.ptr),
+        @ptrCast(gi_str.ptr),
     };
     const pid = spawner.spawnDetached(&argv, envp, path_env, read_fd);
     // The read end belongs to the daemon now; the core keeps only the write end.

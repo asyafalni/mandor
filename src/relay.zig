@@ -13,6 +13,7 @@ const frame = @import("frame.zig");
 const spool = @import("spool.zig");
 const hostmetrics = @import("hostmetrics.zig");
 const sampler = @import("sampler.zig");
+const gpu = @import("gpu.zig");
 
 /// Wall-clock ceiling on each blocking socket call. Generous enough that a
 /// merely slow collector still succeeds, short enough that a hung one cannot
@@ -713,6 +714,97 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     return body_buf[0..w.pos];
 }
 
+// ------------------------------------------------------- OTLP GPU metrics
+//
+// Node-level `system.gpu.*` metrics: ONE host-scoped ResourceMetrics (SAME
+// host.name/host.id/os.type identity as buildOtlpHostMetrics, so photon groups
+// GPU with the host's other node metrics). Five gauges, each carrying ONE
+// datapoint per GPU; every datapoint carries attrs gpu=<index> + gpu.name=<n>.
+// Reuses the host path's HAttr/HDp/HMetric datapoint machinery verbatim.
+//
+// Value encoding: memory.usage (By) and temperature (Cel) are as_int; the three
+// ratios/scaled values — utilization (util_pct/100), memory.utilization
+// (used/total, ratioBits-guarded), power (mW/1000 W) — are as_double f64 bits.
+
+/// Encode a batch of GpuSamples as one OTLP ExportMetricsServiceRequest holding
+/// a single host-scoped ResourceMetrics. Same two-pass sizing discipline as
+/// buildOtlpHostMetrics: size innermost-first, refuse an oversize body, write,
+/// then assert the passes agree. Timestamp is read here (samples carry none).
+/// All backing storage is fixed on the stack (zero heap), sized to max_gpus.
+pub fn buildOtlpGpuMetrics(samples: []const gpu.GpuSample, host_name: []const u8, host_id: []const u8) error{TooLarge}![]const u8 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    const ns: u64 = @as(u64, @intCast(ts.sec)) *| 1_000_000_000 +| @as(u64, @intCast(ts.nsec));
+
+    const max_gpus = gpu.max_gpus;
+    const ng: usize = if (samples.len > max_gpus) max_gpus else samples.len;
+
+    // Per-GPU backing: the decimal index string, the {gpu, gpu.name} attr pair,
+    // and one HDp per (metric × GPU). All outlive the sizing/write passes.
+    var idx_buf: [max_gpus][10]u8 = undefined; // u32 decimal fits in 10
+    var attr_buf: [max_gpus][2]HAttr = undefined;
+    var dp_util: [max_gpus]HDp = undefined;
+    var dp_mem_usage: [max_gpus]HDp = undefined;
+    var dp_mem_util: [max_gpus]HDp = undefined;
+    var dp_temp: [max_gpus]HDp = undefined;
+    var dp_power: [max_gpus]HDp = undefined;
+
+    var i: usize = 0;
+    while (i < ng) : (i += 1) {
+        const s = samples[i];
+        const idx_str: []const u8 = std.fmt.bufPrint(&idx_buf[i], "{d}", .{s.index}) catch "";
+        // gpu.name points into the CALLER's storage (samples[i]), which lives
+        // for the whole call — never into the by-value loop copy `s`, whose
+        // name buffer would dangle after this iteration ends.
+        attr_buf[i] = .{
+            .{ .k = "gpu", .v = idx_str },
+            .{ .k = "gpu.name", .v = samples[i].name[0..samples[i].name_len] },
+        };
+        const attrs = attr_buf[i][0..];
+        const util_bits: u64 = @bitCast(@as(f64, @floatFromInt(s.util_pct)) / 100.0);
+        const power_w: f64 = @as(f64, @floatFromInt(s.power_mw)) / 1000.0;
+        dp_util[i] = .{ .value_bits = util_bits, .is_double = true, .attrs = attrs };
+        dp_mem_usage[i] = .{ .value_bits = s.mem_used, .is_double = false, .attrs = attrs };
+        dp_mem_util[i] = .{ .value_bits = ratioBits(s.mem_used, s.mem_total), .is_double = true, .attrs = attrs };
+        dp_temp[i] = .{ .value_bits = s.temp_c, .is_double = false, .attrs = attrs };
+        dp_power[i] = .{ .value_bits = @bitCast(power_w), .is_double = true, .attrs = attrs };
+    }
+
+    const metrics = [_]HMetric{
+        .{ .name = "system.gpu.utilization", .unit = "1", .kind = .gauge, .dps = dp_util[0..ng] },
+        .{ .name = "system.gpu.memory.usage", .unit = "By", .kind = .gauge, .dps = dp_mem_usage[0..ng] },
+        .{ .name = "system.gpu.memory.utilization", .unit = "1", .kind = .gauge, .dps = dp_mem_util[0..ng] },
+        .{ .name = "system.gpu.temperature", .unit = "Cel", .kind = .gauge, .dps = dp_temp[0..ng] },
+        .{ .name = "system.gpu.power", .unit = "W", .kind = .gauge, .dps = dp_power[0..ng] },
+    };
+
+    // Pass 1: sizes, innermost first.
+    var scope_len: usize = 0;
+    for (metrics) |m| scope_len += delimLen(hMetricLen(m));
+    const resource_len =
+        delimLen(keyValueLen("host.name", host_name)) +
+        delimLen(keyValueLen("host.id", host_id)) +
+        delimLen(keyValueLen("os.type", "linux"));
+    const rm_len = delimLen(resource_len) + delimLen(scope_len);
+    const total = delimLen(rm_len); // ExportMetricsServiceRequest.resource_metrics
+    if (total > body_buf.len) return error.TooLarge;
+
+    // Pass 2: write.
+    var w = Writer{ .buf = &body_buf };
+    w.delim(1, rm_len); // resource_metrics
+    w.delim(1, resource_len); //   resource
+    putKeyValue(&w, 1, "host.name", host_name); //     attributes
+    putKeyValue(&w, 1, "host.id", host_id);
+    putKeyValue(&w, 1, "os.type", "linux");
+    w.delim(2, scope_len); //   scope_metrics
+    for (metrics) |m| {
+        w.delim(2, hMetricLen(m)); //   metrics (Metric)
+        putHMetric(&w, m, ns);
+    }
+    std.debug.assert(w.pos == total); // sizing and writing must agree
+    return body_buf[0..w.pos];
+}
+
 // ------------------------------------------------------- OTLP lifecycle event
 //
 // One LogRecord, same nesting as buildOtlp's logs path: the body is a rendered
@@ -1141,6 +1233,8 @@ pub fn runDaemon(
     endpoint: []const u8,
     spool_dir: []const u8,
     pipe_fd: i32,
+    gpu_enabled: bool,
+    gpu_interval_ms: u64,
     environ: [:null]const ?[*:0]const u8,
 ) u8 {
     // Resolve once up front; re-resolved on a send failure below because photon
@@ -1187,6 +1281,15 @@ pub fn runDaemon(
     var node_primed = false;
     var next_node_sample_ms: u64 = monoMs() +| sampler.interval_ms;
 
+    // GPU sampling ([gpu] enabled): its own timer on the daemon, off PID 1.
+    // gpu.sample() forks/execs nvidia-smi bounded + timed and is fail-closed
+    // (absent binary / error -> empty slice + one stderr log), so nothing here
+    // can affect supervision or the host/process telemetry. path_env resolves
+    // the bare `nvidia-smi`; envp is the daemon's own environment for the child.
+    const gpu_path_env = spawner.findPath(environ);
+    var gpu_samples: [gpu.max_gpus]gpu.GpuSample = undefined;
+    var next_gpu_sample_ms: u64 = if (gpu_enabled) monoMs() +| gpu_interval_ms else 0;
+
     var shipped: Shipped = .{};
 
     while (true) {
@@ -1229,6 +1332,24 @@ pub fn runDaemon(
             next_node_sample_ms +|= sampler.interval_ms;
         }
 
+        // GPU sample: due every [gpu] interval (default 15s) when enabled. Same
+        // shape as the node timer — sample(), ship on non-empty, advance the
+        // deadline by a FIXED interval so the cadence self-corrects. sample()
+        // is fail-closed (empty slice on any error), so a GPU-less node ships
+        // nothing here and never disturbs the other tiers. A build failure or
+        // an empty batch drops the sample (routine telemetry is ephemeral).
+        if (gpu_enabled and monoMs() >= next_gpu_sample_ms) {
+            const gs = gpu.sample(gpu_path_env, environ.ptr, &gpu_samples);
+            if (gs.len > 0) {
+                if (buildOtlpGpuMetrics(gs, daemon_host_name, daemon_host_id)) |b| {
+                    _ = post(hp.host, hp.port, "/v1/metrics", b, token);
+                } else |_| {
+                    // too large to encode -> drop (routine telemetry is ephemeral)
+                }
+            }
+            next_gpu_sample_ms +|= gpu_interval_ms;
+        }
+
         // Sleep the cycle, but never past the next node-sample deadline so the
         // sample fires on time. next_node_sample_ms is in the future here (it was
         // just advanced above if it was due), so the bound stays positive and the
@@ -1237,6 +1358,12 @@ pub fn runDaemon(
         const now_ms = monoMs();
         if (next_node_sample_ms > now_ms) {
             const until = next_node_sample_ms - now_ms;
+            if (until < sleep_ms) sleep_ms = until;
+        }
+        // Fold the GPU deadline into the sleep bound too, so an interval shorter
+        // than the node cadence still fires on time.
+        if (gpu_enabled and next_gpu_sample_ms > now_ms) {
+            const until = next_gpu_sample_ms - now_ms;
             if (until < sleep_ms) sleep_ms = until;
         }
         var ts = linux.timespec{
@@ -1834,6 +1961,87 @@ test "buildOtlpHostMetrics emits per-interface network.io + a free memory datapo
         if (std.mem.eql(u8, v, "free")) free_bytes = Fields.get(dp, 6).?.int;
     }
     try testing.expectEqual(@as(u64, 600), free_bytes.?); // 1000 - 400
+}
+
+test "buildOtlpGpuMetrics emits system.gpu.* photon can walk" {
+    // Two GPUs; a rename or wrong field mapping leaves a lookup empty and fails.
+    var s0 = gpu.GpuSample{ .index = 0, .util_pct = 55, .mem_used = 2048 * 1024 * 1024, .mem_total = 24576 * 1024 * 1024, .temp_c = 61, .power_mw = 320_500 };
+    const n0 = "NVIDIA RTX 4090";
+    @memcpy(s0.name[0..n0.len], n0);
+    s0.name_len = n0.len;
+    var s1 = gpu.GpuSample{ .index = 1, .util_pct = 0, .mem_used = 100 * 1024 * 1024, .mem_total = 40960 * 1024 * 1024, .temp_c = 40, .power_mw = 55_000 };
+    const n1 = "NVIDIA A100";
+    @memcpy(s1.name[0..n1.len], n1);
+    s1.name_len = n1.len;
+    const body = try buildOtlpGpuMetrics(&.{ s0, s1 }, "node-1", "abc123");
+
+    // Resource identity matches the host path: host.name/host.id/os.type.
+    const rm = Fields.get(body, 1).?.bytes; // resource_metrics
+    const res = Fields.get(rm, 1).?.bytes; // resource
+    var ra = Fields{ .b = res };
+    try testing.expectEqualStrings("host.name", Fields.get(ra.next().?.bytes, 1).?.bytes);
+
+    // All five metrics present, found by name.
+    const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
+    var mit = Fields{ .b = sm };
+    var util: []const u8 = &.{};
+    var mem_usage: []const u8 = &.{};
+    var mem_util: []const u8 = &.{};
+    var temp: []const u8 = &.{};
+    var power: []const u8 = &.{};
+    while (mit.next()) |f| {
+        if (f.num != 2) continue; // Metric
+        const name = Fields.get(f.bytes, 1).?.bytes;
+        if (std.mem.eql(u8, name, "system.gpu.utilization")) util = f.bytes;
+        if (std.mem.eql(u8, name, "system.gpu.memory.usage")) mem_usage = f.bytes;
+        if (std.mem.eql(u8, name, "system.gpu.memory.utilization")) mem_util = f.bytes;
+        if (std.mem.eql(u8, name, "system.gpu.temperature")) temp = f.bytes;
+        if (std.mem.eql(u8, name, "system.gpu.power")) power = f.bytes;
+    }
+    try testing.expect(util.len > 0 and mem_usage.len > 0 and mem_util.len > 0 and temp.len > 0 and power.len > 0);
+
+    // memory.usage: gauge; GPU 0's datapoint carries gpu + gpu.name attrs and
+    // as_int bytes. Walk datapoints and match by the gpu attribute.
+    const ug = Fields.get(mem_usage, 5).?.bytes; // gauge
+    var udps = Fields{ .b = ug };
+    var g0_mem: ?u64 = null;
+    var g0_name: []const u8 = &.{};
+    while (udps.next()) |f| {
+        if (f.num != 1) continue; // data_points
+        const dp = f.bytes;
+        var kit = Fields{ .b = dp };
+        var which: []const u8 = &.{};
+        var nm: []const u8 = &.{};
+        while (kit.next()) |kf| {
+            if (kf.num != 7) continue; // NumberDataPoint.attributes
+            const k = Fields.get(kf.bytes, 1).?.bytes;
+            const v = avStr(Fields.get(kf.bytes, 2).?.bytes);
+            if (std.mem.eql(u8, k, "gpu")) which = v;
+            if (std.mem.eql(u8, k, "gpu.name")) nm = v;
+        }
+        if (std.mem.eql(u8, which, "0")) {
+            g0_mem = Fields.get(dp, 6).?.int; // as_int bytes
+            g0_name = nm;
+        }
+    }
+    try testing.expectEqual(@as(u64, 2048 * 1024 * 1024), g0_mem.?);
+    try testing.expectEqualStrings("NVIDIA RTX 4090", g0_name);
+
+    // temperature is as_int Cel; GPU 0 -> 61 (this is the field the mutation
+    // sentinel protects against a temp/power swap in parseNvidiaSmi).
+    const tg = Fields.get(temp, 5).?.bytes;
+    try testing.expectEqual(@as(u64, 61), Fields.get(Fields.get(tg, 1).?.bytes, 6).?.int);
+
+    // power is as_double W: 320500 mW -> 320.5 W (not as_int).
+    const pg = Fields.get(power, 5).?.bytes;
+    const pdp = Fields.get(pg, 1).?.bytes;
+    try testing.expect(Fields.get(pdp, 6) == null); // as_double, not as_int
+    try testing.expectApproxEqAbs(@as(f64, 320.5), @as(f64, @bitCast(Fields.get(pdp, 4).?.int)), 1e-9);
+
+    // utilization is as_double: util_pct 55 -> 0.55.
+    const utg = Fields.get(util, 5).?.bytes;
+    const utdp = Fields.get(utg, 1).?.bytes;
+    try testing.expectApproxEqAbs(@as(f64, 0.55), @as(f64, @bitCast(Fields.get(utdp, 4).?.int)), 1e-9);
 }
 
 test "Shipped set tracks names and sweeps entries no longer on disk" {

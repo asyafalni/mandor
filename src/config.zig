@@ -23,6 +23,9 @@ pub const FileConfig = struct {
     health_start_period_ms: ?u64 = null,
     on_incident: ?[]const u8 = null,
     photon: ?[]const u8 = null,
+    /// `[gpu]` section: null = key absent (caller keeps the cli.Config default).
+    gpu_enabled: ?bool = null,
+    gpu_interval_ms: ?u64 = null,
     psi_mem_pct: ?u16 = null,
     psi_cpu_pct: ?u16 = null,
     /// "dependent=dependency" worker-name pairs.
@@ -127,6 +130,7 @@ pub fn parse(
     var array_secret: ?usize = null; // secret owning an open workers array, if any
     var cur_worker: ?[]const u8 = null; // active [worker.NAME] section
     var cur_secret: ?usize = null; // active [secret.NAME] section (index)
+    var cur_gpu = false; // active [gpu] section
 
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw_line| {
@@ -157,10 +161,17 @@ pub fn parse(
                 .worker => |nm| {
                     cur_worker = nm;
                     cur_secret = null;
+                    cur_gpu = false;
                 },
                 .secret => |nm| {
                     cur_worker = null;
+                    cur_gpu = false;
                     cur_secret = try beginSecret(cfg, nm);
+                },
+                .gpu => {
+                    cur_worker = null;
+                    cur_secret = null;
+                    cur_gpu = true;
                 },
             }
             continue;
@@ -177,6 +188,11 @@ pub fn parse(
 
         if (cur_secret) |si| {
             try secretSetting(cfg, si, &target, &array_secret, key, value);
+            continue;
+        }
+
+        if (cur_gpu) {
+            try gpuSetting(cfg, key, value);
             continue;
         }
 
@@ -268,17 +284,36 @@ fn workerKey(key: []const u8) ?ArrayTarget {
     return null;
 }
 
-const Section = union(enum) { worker: []const u8, secret: []const u8 };
+const Section = union(enum) { worker: []const u8, secret: []const u8, gpu };
 
-/// `[worker.NAME]` / `[secret.NAME]` -> the section kind + NAME. Any other
-/// header is a hard error: configs are small, so a typo should stop startup
-/// rather than be silently ignored.
+/// `[worker.NAME]` / `[secret.NAME]` / `[gpu]` -> the section kind (+ NAME for
+/// the first two). Any other header is a hard error: configs are small, so a
+/// typo should stop startup rather than be silently ignored.
 fn sectionHeader(line: []const u8) ParseError!Section {
     if (line[line.len - 1] != ']') return error.Syntax;
     const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
+    if (std.mem.eql(u8, inner, "gpu")) return .gpu;
     if (sectionName(inner, "worker.")) |nm| return .{ .worker = nm };
     if (sectionName(inner, "secret.")) |nm| return .{ .secret = nm };
     return error.Syntax;
+}
+
+/// Apply one `key = value` inside `[gpu]`. `enabled` is a bare bool; `interval`
+/// is a quoted duration string ("15s"). Unknown key -> hard Syntax error.
+fn gpuSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!void {
+    if (std.mem.eql(u8, key, "enabled")) {
+        cfg.gpu_enabled = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return error.BadValue;
+    } else if (std.mem.eql(u8, key, "interval")) {
+        const s = parseString(value) orelse return error.BadValue;
+        cfg.gpu_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
+    } else {
+        return error.Syntax; // unknown key inside a [gpu] section
+    }
 }
 
 /// `<prefix>NAME` -> NAME, else null (unknown prefix or empty name).
@@ -853,6 +888,34 @@ test "secret section: every rejection is a hard error" {
         W ++ "[secret.dup]\nworkers = [\"gateway\"]\n[secret.dup]\nworkers = [\"gateway\"]",
         &storage,
     ));
+}
+
+test "gpu section: enabled + interval" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\[gpu]
+        \\enabled = true
+        \\interval = "10s"
+    ;
+    const cfg = try parseTest(text, &storage);
+    try t.expectEqual(@as(?bool, true), cfg.gpu_enabled);
+    try t.expectEqual(@as(?u64, 10_000), cfg.gpu_interval_ms);
+}
+
+test "gpu section: absent keys stay null; bad values and unknown key rejected" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // No [gpu] section at all -> both fields null (caller keeps cli defaults).
+    const none = try parseTest("workers = [\"./a\"]", &storage);
+    try t.expectEqual(@as(?bool, null), none.gpu_enabled);
+    try t.expectEqual(@as(?u64, null), none.gpu_interval_ms);
+    // enabled defaults off when the section exists but omits it.
+    const off = try parseTest("[gpu]\ninterval = \"5s\"", &storage);
+    try t.expectEqual(@as(?bool, null), off.gpu_enabled);
+    try t.expectEqual(@as(?u64, 5_000), off.gpu_interval_ms);
+    // Bad bool, bad duration, unknown key.
+    try t.expectError(error.BadValue, parseTest("[gpu]\nenabled = yes", &storage));
+    try t.expectError(error.BadValue, parseTest("[gpu]\ninterval = \"soon\"", &storage));
+    try t.expectError(error.Syntax, parseTest("[gpu]\nbogus = \"x\"", &storage));
 }
 
 test "secret section: bare (non-derived) collision between two default envs" {

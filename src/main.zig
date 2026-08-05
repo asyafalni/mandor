@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Invisible subcommand: `mandor relay <bundle.json>` (photon bridge).
     // The supervisor path never networks; this runs only when invoked.
     if (vec.len >= 3 and std.mem.eql(u8, std.mem.span(vec[1]), "relay")) {
-        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd>`.
+        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [gpu] [interval]`.
         // Spawned by the supervisor when `photon=` is set (it owns the socket so
         // the supervision path never does). <spool_dir> is the mandor state dir
         // (the one holding incidents/); <pipe_fd> is the inherited read end.
@@ -96,7 +96,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const endpoint = std.mem.span(vec[3]);
             const spool_dir = std.mem.span(vec[4]);
             const pipe_fd = std.fmt.parseInt(i32, std.mem.span(vec[5]), 10) catch return 2;
-            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, init.environ.block.slice);
+            // GPU config is appended by spawnDaemon: vec[6]="0"|"1" enabled,
+            // vec[7]=interval ms. Absent (an older spawn) -> GPU off / 15s.
+            const gpu_enabled = vec.len >= 7 and std.mem.eql(u8, std.mem.span(vec[6]), "1");
+            const gpu_interval_ms: u64 = if (vec.len >= 8)
+                (std.fmt.parseInt(u64, std.mem.span(vec[7]), 10) catch 15_000)
+            else
+                15_000;
+            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_enabled, gpu_interval_ms, init.environ.block.slice);
         }
         const endpoint: ?[]const u8 = if (vec.len >= 4) std.mem.span(vec[3]) else null;
         return @import("relay.zig").run(vec[2], endpoint, init.environ.block.slice);
@@ -181,6 +188,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
             if (cfg.photon == null) cfg.photon = file_cfg.photon;
+            if (file_cfg.gpu_enabled) |v| cfg.gpu.enabled = v;
+            if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
             if (cfg.psi_mem_pct == 0) {
                 if (file_cfg.psi_mem_pct) |v| cfg.psi_mem_pct = v;
             }
@@ -417,6 +426,7 @@ test {
     _ = @import("frame.zig");
     _ = @import("telemetry.zig");
     _ = @import("hostmetrics.zig");
+    _ = @import("gpu.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");
