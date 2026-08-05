@@ -16,6 +16,24 @@ const builtin = @import("builtin");
 /// (counted toward `logical` but never captured), never an overrun.
 pub const max_cores = 256;
 
+/// Upper bound on per-mount filesystem tracking. /proc/self/mountinfo can list
+/// hundreds of entries (bind mounts, cgroup subtrees), but the real
+/// filesystems worth a usage/utilization gauge are few. parseMountinfo caps its
+/// output at this length (excess mounts truncated, never an overrun) and
+/// HostSample carries a fixed array of this size.
+pub const max_mounts = 32;
+
+/// One real (non-pseudo) filesystem mount with its measured bytes. Daemon-local
+/// (never on the wire), so a fixed-size stored path is fine. `path`/`path_len`
+/// hold the mountpoint; a mountpoint that will not fit is skipped upstream, so
+/// path_len is always <= path.len. total/used come from statfs (saturating).
+pub const Mount = struct {
+    path: [128]u8 = [_]u8{0} ** 128,
+    path_len: u8 = 0,
+    total: u64 = 0,
+    used: u64 = 0,
+};
+
 pub const HostSample = struct {
     // memory (bytes)
     mem_total: u64 = 0,
@@ -33,9 +51,11 @@ pub const HostSample = struct {
     // network (cumulative monotonic bytes across non-loopback ifaces)
     net_rx: u64 = 0,
     net_tx: u64 = 0,
-    // filesystem "/" (bytes)
-    fs_total: u64 = 0,
-    fs_used: u64 = 0,
+    // filesystem — one entry per real (non-pseudo) mount, bytes. Only the first
+    // `mount_n` (<= max_mounts) entries of `mounts` are valid. Daemon-local, so
+    // the fixed-size stored paths never touch the wire.
+    mounts: [max_mounts]Mount = [_]Mount{.{}} ** max_mounts,
+    mount_n: u32 = 0,
 };
 
 // ------------------------------------------------------ pure parsers
@@ -172,6 +192,75 @@ pub fn parseNetDev(text: []const u8) Net {
     return res;
 }
 
+pub const MountRef = struct { mountpoint: []const u8, fstype: []const u8 };
+
+/// Pseudo/virtual filesystem types whose "usage" is meaningless — never
+/// statfs'd, never emitted. Scanned per mount by isPseudoFs.
+///
+/// MUTATION SENTINEL: removing an entry here (or bypassing isPseudoFs in
+/// parseMountinfo) lets a pseudo mount slip into the output — the
+/// "parseMountinfo skips pseudo-fs" test then fails because a real mount is no
+/// longer the first/only survivor.
+const pseudo_fstypes = [_][]const u8{
+    "proc",       "sysfs",  "cgroup", "cgroup2",     "devtmpfs",
+    "devpts",     "tmpfs",  "mqueue", "debugfs",     "tracefs",
+    "securityfs", "pstore", "bpf",    "configfs",    "fusectl",
+    "hugetlbfs",  "ramfs",  "autofs", "binfmt_misc", "efivarfs",
+    "nsfs",
+};
+
+fn isPseudoFs(fstype: []const u8) bool {
+    for (pseudo_fstypes) |p| {
+        if (std.mem.eql(u8, p, fstype)) return true;
+    }
+    return false;
+}
+
+/// Parse /proc/self/mountinfo into real-filesystem (mountpoint, fstype) refs.
+/// Line layout: space-separated fields where the MOUNT POINT is field index 4
+/// (0-based) and the FSTYPE is the first field AFTER the standalone " - "
+/// separator. Only real filesystems survive: pseudo/virtual fstypes are
+/// dropped, a mountpoint already seen is skipped (dedup, first wins), and the
+/// output is bounded to max_mounts (excess lines truncated — never an overrun).
+/// A malformed line (no " - " separator, or fewer than 5 pre-separator fields)
+/// is skipped. Pure: every returned slice points into `text`; no syscalls, so
+/// it is deterministically unit-testable with fixture strings.
+pub fn parseMountinfo(text: []const u8, out: *[max_mounts]MountRef) []const MountRef {
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    scan: while (lines.next()) |line| {
+        if (n >= max_mounts) break; // bounded — truncate, never overrun
+        // Split on the standalone " - " token: pre holds fields 0..5+optional,
+        // post starts at the fstype. No separator -> malformed -> skip.
+        const sep = std.mem.indexOf(u8, line, " - ") orelse continue;
+        const pre = line[0..sep];
+        const post = line[sep + 3 ..];
+        // mount point = field index 4 (0-based) of the pre-separator fields.
+        var it = std.mem.tokenizeScalar(u8, pre, ' ');
+        var idx: usize = 0;
+        var mp: []const u8 = &.{};
+        while (it.next()) |f| : (idx += 1) {
+            if (idx == 4) {
+                mp = f;
+                break;
+            }
+        }
+        if (mp.len == 0) continue; // fewer than 5 fields -> malformed -> skip
+        // fstype = first field after the separator.
+        var pit = std.mem.tokenizeScalar(u8, post, ' ');
+        const fstype = pit.next() orelse continue;
+        if (isPseudoFs(fstype)) continue; // pseudo/virtual -> drop
+        // dedup by mountpoint (first occurrence wins).
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            if (std.mem.eql(u8, out[k].mountpoint, mp)) continue :scan;
+        }
+        out[n] = .{ .mountpoint = mp, .fstype = fstype };
+        n += 1;
+    }
+    return out[0..n];
+}
+
 /// First unsigned integer in a slice (e.g. "   65808388 kB"). parseInt
 /// overflow (a too-long digit run) -> 0. Saturating by construction.
 fn firstUint(s: []const u8) u64 {
@@ -217,14 +306,13 @@ fn readFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// statfs("/") -> (total, used) bytes. Raw syscall via linux.syscall2 (same
+/// statfs(path) -> (total, used) bytes. Raw syscall via linux.syscall2 (same
 /// idiom as spawner.zig:445's linux.syscall3(.setpriority, ...)). On any error
-/// or garbage, returns zeros. total = f_blocks*f_bsize; used =
-/// (f_blocks-f_bfree)*f_bsize — both saturating.
-fn readRootFs() struct { total: u64, used: u64 } {
+/// or garbage, returns zeros — callers skip a zero-total mount (fail-closed).
+/// total = f_blocks*f_bsize; used = (f_blocks-f_bfree)*f_bsize — both saturating.
+fn statfsPath(path_z: [*:0]const u8) struct { total: u64, used: u64 } {
     var sf: Statfs = undefined;
-    const path: [*:0]const u8 = "/";
-    const rc: usize = @intCast(linux.syscall2(.statfs, @intFromPtr(path), @intFromPtr(&sf)));
+    const rc: usize = @intCast(linux.syscall2(.statfs, @intFromPtr(path_z), @intFromPtr(&sf)));
     if (posix.errno(rc) != .SUCCESS) return .{ .total = 0, .used = 0 };
     const bsize: u64 = if (sf.f_bsize > 0) @intCast(sf.f_bsize) else 0;
     return .{
@@ -311,9 +399,32 @@ pub const Sampler = struct {
         out.net_rx = net.rx;
         out.net_tx = net.tx;
 
-        const fs = readRootFs();
-        out.fs_total = fs.total;
-        out.fs_used = fs.used;
+        // Per-mount filesystem usage. Read /proc/self/mountinfo (64 KiB covers
+        // hundreds of mounts; truncation is safe — we parse what we read),
+        // parse to real-fs refs, then statfs each mountpoint. Fail-closed: a
+        // mount whose statfs errors or reports total==0 (pseudo/unavailable) is
+        // skipped, and a mountpoint too long to form a NUL-terminated C string
+        // in the fixed buffer is skipped too (never a truncated wrong path).
+        var mi_buf: [65536]u8 = undefined;
+        const mi_text = readFile("/proc/self/mountinfo", &mi_buf) orelse "";
+        var refs: [max_mounts]MountRef = undefined;
+        const mounts = parseMountinfo(mi_text, &refs);
+        var mn: u32 = 0;
+        for (mounts) |ref| {
+            // Need room for the path plus a NUL terminator in a 128-byte buffer.
+            if (ref.mountpoint.len >= 128) continue; // will not fit -> skip (fail-closed)
+            var path_z: [128]u8 = undefined;
+            @memcpy(path_z[0..ref.mountpoint.len], ref.mountpoint);
+            path_z[ref.mountpoint.len] = 0;
+            const fs = statfsPath(@ptrCast(&path_z));
+            if (fs.total == 0) continue; // pseudo/unavailable -> skip (fail-closed)
+            out.mounts[mn].path_len = @intCast(ref.mountpoint.len);
+            @memcpy(out.mounts[mn].path[0..ref.mountpoint.len], ref.mountpoint);
+            out.mounts[mn].total = fs.total;
+            out.mounts[mn].used = fs.used;
+            mn += 1;
+        }
+        out.mount_n = mn;
 
         return out;
     }
@@ -405,6 +516,57 @@ test "parseNetDev sums non-loopback rx/tx" {
     try testing.expectEqual(@as(u64, 2000), n.tx);
 }
 
+test "parseMountinfo skips pseudo-fs, dedups, keeps real mounts in order" {
+    // Realistic mountinfo: pseudo lines (proc/sysfs/devtmpfs/devpts/tmpfs/
+    // cgroup2) interleaved with three real filesystems (/ ext4, /boot vfat,
+    // /data xfs), plus a duplicate /data line that must coalesce to one.
+    const text =
+        "21 30 0:20 / /proc rw,nosuid,noexec - proc proc rw\n" ++
+        "22 30 0:21 / /sys rw,nosuid,noexec - sysfs sysfs rw\n" ++
+        "23 30 0:5 / /dev rw,nosuid - devtmpfs devtmpfs rw\n" ++
+        "24 23 0:22 / /dev/pts rw,nosuid - devpts devpts rw\n" ++
+        "25 30 0:23 / /run rw,nosuid - tmpfs tmpfs rw\n" ++
+        "30 0 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n" ++
+        "40 30 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n" ++
+        "31 30 8:1 / /boot rw,relatime - vfat /dev/sda1 rw\n" ++
+        "32 30 8:3 / /data rw,relatime - xfs /dev/sda3 rw\n" ++
+        "33 30 8:3 / /data rw,relatime - xfs /dev/sda3 rw\n"; // duplicate mountpoint
+    var refs: [max_mounts]MountRef = undefined;
+    const got = parseMountinfo(text, &refs);
+    // Exactly the three real mounts, in order; every pseudo-fs dropped; the
+    // duplicate /data appears once. (MUTATION: bypassing the denylist makes
+    // got.len jump and got[0] become "/proc" — this assertion then fails.)
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqualStrings("/", got[0].mountpoint);
+    try testing.expectEqualStrings("ext4", got[0].fstype);
+    try testing.expectEqualStrings("/boot", got[1].mountpoint);
+    try testing.expectEqualStrings("vfat", got[1].fstype);
+    try testing.expectEqualStrings("/data", got[2].mountpoint);
+    try testing.expectEqualStrings("xfs", got[2].fstype);
+}
+
+test "parseMountinfo truncates beyond max_mounts and skips malformed lines" {
+    var buf: [8192]u8 = undefined;
+    var w: usize = 0;
+    // A malformed line first (no " - " separator) — must be skipped, not counted.
+    const bad = "99 30 8:9 / /bad rw noseparatorhere\n";
+    @memcpy(buf[0..bad.len], bad);
+    w += bad.len;
+    // More than max_mounts distinct real ext4 mounts.
+    var i: usize = 0;
+    while (i < max_mounts + 8) : (i += 1) {
+        const line = try std.fmt.bufPrint(buf[w..], "{d} 30 8:2 / /m{d} rw - ext4 /dev/sd{d} rw\n", .{ i, i, i });
+        w += line.len;
+    }
+    var refs: [max_mounts]MountRef = undefined;
+    const got = parseMountinfo(buf[0..w], &refs);
+    // Bounded to max_mounts (no overrun of the out array), and the malformed
+    // line was skipped so /m0 is the first captured mount.
+    try testing.expectEqual(@as(usize, max_mounts), got.len);
+    try testing.expectEqualStrings("/m0", got[0].mountpoint);
+    try testing.expectEqualStrings("ext4", got[0].fstype);
+}
+
 test "parseLoadavg reads the 1m field as milli" {
     try testing.expectEqual(@as(u32, 1250), parseLoadavg("1.25 0.80 0.66 1/234 5678"));
     try testing.expectEqual(@as(u32, 0), parseLoadavg("0.00 0.80 0.66"));
@@ -432,15 +594,30 @@ test "sample reads live host values (validates statfs layout + /proc)" {
     // The pure parsers are covered above; this exercises the file-reading path
     // and the hand-rolled `struct statfs` on real /proc + a real filesystem.
     // The asserts are ">0", true on any live Linux/WSL host, so it is stable —
-    // but a wrong statfs offset would make fs_total 0/garbage and fail here,
-    // which is the whole point (a compile cannot catch a bad struct layout).
+    // but a wrong statfs offset would make every mount total 0/garbage and fail
+    // here, which is the whole point (a compile cannot catch a bad struct layout).
     if (builtin.os.tag != .linux) return; // /proc + statfs are Linux-only
     var s = Sampler{};
     _ = s.sample(); // prime the prior CPU reading
     const h = s.sample();
     try testing.expect(h.mem_total > 0); // /proc/meminfo MemTotal parsed
-    try testing.expect(h.fs_total > 0); // statfs("/") struct offsets correct
-    try testing.expect(h.fs_used <= h.fs_total);
+    // Per-mount filesystem: at least one real mount, one with total>0 and
+    // used<=total (a wrong statfs offset would make every total 0/garbage and
+    // fail here — a compile cannot catch a bad struct layout), and "/" present.
+    try testing.expect(h.mount_n > 0);
+    var saw_root = false;
+    var saw_nonzero = false;
+    var mi: u32 = 0;
+    while (mi < h.mount_n) : (mi += 1) {
+        const m = h.mounts[mi];
+        if (std.mem.eql(u8, m.path[0..m.path_len], "/")) saw_root = true;
+        if (m.total > 0) {
+            saw_nonzero = true;
+            try testing.expect(m.used <= m.total);
+        }
+    }
+    try testing.expect(saw_root); // "/" is among the mounts
+    try testing.expect(saw_nonzero); // statfs offsets correct -> real bytes
     try testing.expect(h.logical_cpus > 0); // /proc/stat cpuN lines counted
     // per-core path primed + delta'd without overrun: core_n is bounded by both
     // the logical count and max_cores.

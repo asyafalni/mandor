@@ -577,7 +577,6 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     // Derived ratio/load values, as_double bit patterns.
     const cpu_util_bits = ratioBits(h.cpu_total_delta -| h.cpu_idle_delta, h.cpu_total_delta);
     const mem_util_bits = ratioBits(h.mem_used, h.mem_total);
-    const fs_util_bits = ratioBits(h.fs_used, h.fs_total);
     const load1_bits: u64 = @bitCast(@as(f64, @floatFromInt(h.load1_milli)) / 1000.0);
 
     // Datapoint attribute sets.
@@ -586,8 +585,6 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     const a_state_free = [_]HAttr{.{ .k = "state", .v = "free" }};
     const a_dir_rx = [_]HAttr{.{ .k = "direction", .v = "receive" }};
     const a_dir_tx = [_]HAttr{.{ .k = "direction", .v = "transmit" }};
-    const a_fs_used = [_]HAttr{ .{ .k = "mountpoint", .v = "/" }, .{ .k = "state", .v = "used" } };
-    const a_fs_root = [_]HAttr{.{ .k = "mountpoint", .v = "/" }};
     const a_none = [_]HAttr{};
 
     // Datapoints (one array per metric so the slices outlive the sizing/write
@@ -627,8 +624,34 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
         .{ .value_bits = h.net_rx, .is_double = false, .attrs = &a_dir_rx },
         .{ .value_bits = h.net_tx, .is_double = false, .attrs = &a_dir_tx },
     };
-    const dp_fs_usage = [_]HDp{.{ .value_bits = h.fs_used, .is_double = false, .attrs = &a_fs_used }};
-    const dp_fs_util = [_]HDp{.{ .value_bits = fs_util_bits, .is_double = true, .attrs = &a_fs_root }};
+
+    // system.filesystem.usage / .utilization carry one datapoint per real mount
+    // (attr mountpoint=<path>), mirroring the per-core cpu path: all backing
+    // storage is fixed-size on the stack (zero heap) and sized to max_mounts —
+    // the per-mount HAttr arrays and the HDp arrays outlive the sizing/write
+    // passes. usage is as_int bytes (mountpoint + state="used"); utilization is
+    // an as_double ratio (mountpoint), guarded by ratioBits (total==0 -> 0.0).
+    // The mountpoint string points into h.mounts[i].path, which lives for the
+    // whole call (h is a by-value copy).
+    const max_mounts = hostmetrics.max_mounts;
+    var fs_usage_attr_buf: [max_mounts][2]HAttr = undefined;
+    var fs_util_attr_buf: [max_mounts][1]HAttr = undefined;
+    var dp_fs_usage_buf: [max_mounts]HDp = undefined;
+    var dp_fs_util_buf: [max_mounts]HDp = undefined;
+    const nmount: u32 = if (h.mount_n > max_mounts) max_mounts else h.mount_n;
+    {
+        var mi: u32 = 0;
+        while (mi < nmount) : (mi += 1) {
+            const mp: []const u8 = h.mounts[mi].path[0..h.mounts[mi].path_len];
+            fs_usage_attr_buf[mi] = .{ .{ .k = "mountpoint", .v = mp }, .{ .k = "state", .v = "used" } };
+            fs_util_attr_buf[mi] = .{.{ .k = "mountpoint", .v = mp }};
+            dp_fs_usage_buf[mi] = .{ .value_bits = h.mounts[mi].used, .is_double = false, .attrs = fs_usage_attr_buf[mi][0..] };
+            const fs_util_bits = ratioBits(h.mounts[mi].used, h.mounts[mi].total);
+            dp_fs_util_buf[mi] = .{ .value_bits = fs_util_bits, .is_double = true, .attrs = fs_util_attr_buf[mi][0..] };
+        }
+    }
+    const dp_fs_usage = dp_fs_usage_buf[0..nmount];
+    const dp_fs_util = dp_fs_util_buf[0..nmount];
 
     const metrics = [_]HMetric{
         .{ .name = "system.cpu.utilization", .unit = "1", .kind = .gauge, .dps = dp_cpu_util },
@@ -638,8 +661,8 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
         .{ .name = "system.memory.limit", .unit = "By", .kind = .gauge, .dps = &dp_mem_limit },
         .{ .name = "system.memory.utilization", .unit = "1", .kind = .gauge, .dps = &dp_mem_util },
         .{ .name = "system.network.io", .unit = "By", .kind = .sum, .dps = &dp_net },
-        .{ .name = "system.filesystem.usage", .unit = "By", .kind = .gauge, .dps = &dp_fs_usage },
-        .{ .name = "system.filesystem.utilization", .unit = "1", .kind = .gauge, .dps = &dp_fs_util },
+        .{ .name = "system.filesystem.usage", .unit = "By", .kind = .gauge, .dps = dp_fs_usage },
+        .{ .name = "system.filesystem.utilization", .unit = "1", .kind = .gauge, .dps = dp_fs_util },
     };
 
     // Pass 1: sizes, innermost first.
@@ -1485,8 +1508,6 @@ test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can w
         .load1_milli = 1250,
         .net_rx = 5000,
         .net_tx = 7000,
-        .fs_total = 2000,
-        .fs_used = 500,
     };
     const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
 
@@ -1616,6 +1637,84 @@ test "buildOtlpHostMetrics emits per-core cpu.utilization datapoints" {
         }
     }
     try testing.expect(seen_total and seen_c0 and seen_c1);
+}
+
+test "buildOtlpHostMetrics emits per-mount filesystem usage/utilization datapoints" {
+    // Two real mounts: "/" (250/1000 -> util 0.25) and "/data" (1000/2000 ->
+    // util 0.5). usage carries as_int bytes + mountpoint + state="used";
+    // utilization carries an as_double ratio + mountpoint.
+    var h = hostmetrics.HostSample{};
+    h.mount_n = 2;
+    const p0 = "/";
+    @memcpy(h.mounts[0].path[0..p0.len], p0);
+    h.mounts[0].path_len = p0.len;
+    h.mounts[0].total = 1000;
+    h.mounts[0].used = 250;
+    const p1 = "/data";
+    @memcpy(h.mounts[1].path[0..p1.len], p1);
+    h.mounts[1].path_len = p1.len;
+    h.mounts[1].total = 2000;
+    h.mounts[1].used = 1000;
+    const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
+
+    const rm = Fields.get(body, 1).?.bytes; // resource_metrics
+    const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
+    var mit = Fields{ .b = sm };
+    var fs_usage: []const u8 = &.{};
+    var fs_util: []const u8 = &.{};
+    while (mit.next()) |f| {
+        if (f.num != 2) continue; // Metric
+        const name = Fields.get(f.bytes, 1).?.bytes;
+        if (std.mem.eql(u8, name, "system.filesystem.usage")) fs_usage = f.bytes;
+        if (std.mem.eql(u8, name, "system.filesystem.utilization")) fs_util = f.bytes;
+    }
+    try testing.expect(fs_usage.len > 0);
+    try testing.expect(fs_util.len > 0);
+
+    // usage: one gauge datapoint per mount; match by mountpoint attr.
+    const ug = Fields.get(fs_usage, 5).?.bytes;
+    var udps = Fields{ .b = ug };
+    var root_used: ?u64 = null;
+    var data_used: ?u64 = null;
+    while (udps.next()) |f| {
+        if (f.num != 1) continue; // data_points
+        const dp = f.bytes;
+        var kit = Fields{ .b = dp };
+        var mp: []const u8 = &.{};
+        var state: []const u8 = &.{};
+        while (kit.next()) |kf| {
+            if (kf.num != 7) continue; // NumberDataPoint.attributes (repeated)
+            const k = Fields.get(kf.bytes, 1).?.bytes;
+            const v = avStr(Fields.get(kf.bytes, 2).?.bytes);
+            if (std.mem.eql(u8, k, "mountpoint")) mp = v;
+            if (std.mem.eql(u8, k, "state")) state = v;
+        }
+        try testing.expectEqualStrings("used", state); // usage always state=used
+        const bytes = Fields.get(dp, 6).?.int; // as_int
+        if (std.mem.eql(u8, mp, "/")) root_used = bytes;
+        if (std.mem.eql(u8, mp, "/data")) data_used = bytes;
+    }
+    try testing.expectEqual(@as(u64, 250), root_used.?);
+    try testing.expectEqual(@as(u64, 1000), data_used.?);
+
+    // utilization: one as_double gauge datapoint per mount, keyed by mountpoint.
+    const utg = Fields.get(fs_util, 5).?.bytes;
+    var tdps = Fields{ .b = utg };
+    var root_util: ?f64 = null;
+    var data_util: ?f64 = null;
+    while (tdps.next()) |f| {
+        if (f.num != 1) continue;
+        const dp = f.bytes;
+        const kv = Fields.get(dp, 7).?.bytes; // single mountpoint attr
+        try testing.expectEqualStrings("mountpoint", Fields.get(kv, 1).?.bytes);
+        const mp = avStr(Fields.get(kv, 2).?.bytes);
+        try testing.expect(Fields.get(dp, 6) == null); // as_double, not as_int
+        const util: f64 = @bitCast(Fields.get(dp, 4).?.int);
+        if (std.mem.eql(u8, mp, "/")) root_util = util;
+        if (std.mem.eql(u8, mp, "/data")) data_util = util;
+    }
+    try testing.expectApproxEqAbs(@as(f64, 0.25), root_util.?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), data_util.?, 1e-9);
 }
 
 test "Shipped set tracks names and sweeps entries no longer on disk" {
