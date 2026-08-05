@@ -163,8 +163,10 @@ pub fn emitLifecycle(e: frame.Lifecycle) void {
 /// non-blocking pipe write is atomic (all-or-nothing): the write either lands
 /// the whole frame or writes nothing (EAGAIN), so a partial write can never
 /// desync the daemon's length-prefixed stream. A line whose frame would exceed
-/// this is refused by encodeLog and dropped (counted) — Task 12 adds a
-/// configurable line cap; near-max lines are rare and the stream tier is lossy.
+/// this is refused by encodeLog and dropped (counted); near-max lines are rare
+/// and the stream tier is lossy. This is a fixed per-line LENGTH bound; the
+/// `[logs] max_rate` cap (lines/sec, enforced supervisor-side before a frame is
+/// built) is the separate volume knob.
 const max_log_frame = 4096;
 
 /// Streamed log lines dropped: pipe full, daemon gone, or a frame too large for
@@ -176,6 +178,24 @@ var log_drops: u64 = 0;
 /// Number of streamed log lines dropped so far (for tests / diagnostics).
 pub fn logDrops() u64 {
     return log_drops;
+}
+
+/// Streamed log lines dropped by the `[logs] max_rate` cap: the operator asked
+/// mandor to shed load past N lines/sec, so these drops are deliberate, not
+/// backpressure. Kept a SIBLING of `log_drops` so the two causes stay
+/// distinguishable. Counted on the supervisor side (the frame is never built),
+/// never spooled. Saturating so a sustained storm cannot wrap-trap.
+var rate_drops: u64 = 0;
+
+/// Record one line dropped by the rate cap. Called from the supervisor's O(1)
+/// window limiter, which decides the drop before any frame is built.
+pub fn noteRateDrop() void {
+    rate_drops +|= 1;
+}
+
+/// Number of streamed log lines dropped by the rate cap (for tests / diagnostics).
+pub fn rateDrops() u64 {
+    return rate_drops;
 }
 
 /// Emit one streamed worker-log line (opt-in `[logs] stream`). No-op if no

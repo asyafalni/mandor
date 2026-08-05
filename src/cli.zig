@@ -43,6 +43,11 @@ pub const GpuConfig = struct {
 /// (best-effort, lossy — the ephemeral telemetry tier).
 pub const LogsConfig = struct {
     stream: bool = false,
+    /// Rate cap for streamed log lines, lines/sec. 0 = unlimited (the default):
+    /// the limiter is skipped entirely so streaming costs nothing beyond the
+    /// enqueue. When > 0, lines past the cap in a 1-second window are dropped
+    /// (counted, never spooled) before a frame is even built.
+    max_rate: u32 = 0,
 };
 
 pub const Config = struct {

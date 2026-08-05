@@ -194,6 +194,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (file_cfg.gpu_enabled) |v| cfg.gpu.enabled = v;
             if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
             if (file_cfg.logs_stream) |v| cfg.logs.stream = v;
+            if (file_cfg.logs_max_rate) |v| cfg.logs.max_rate = v;
             if (cfg.psi_mem_pct == 0) {
                 if (file_cfg.psi_mem_pct) |v| cfg.psi_mem_pct = v;
             }
@@ -434,6 +435,7 @@ test {
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");
+        _ = @import("supervisor.zig");
         _ = @import("reaper.zig");
         _ = @import("report.zig");
         _ = @import("spool.zig");

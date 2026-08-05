@@ -28,6 +28,7 @@ pub const FileConfig = struct {
     gpu_interval_ms: ?u64 = null,
     /// `[logs]` section: null = key absent (caller keeps the cli.Config default).
     logs_stream: ?bool = null,
+    logs_max_rate: ?u32 = null,
     psi_mem_pct: ?u16 = null,
     psi_cpu_pct: ?u16 = null,
     /// "dependent=dependency" worker-name pairs.
@@ -334,9 +335,9 @@ fn gpuSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!v
     }
 }
 
-/// Apply one `key = value` inside `[logs]`. `stream` is a bare bool. Unknown key
-/// -> hard Syntax error (a mistyped `max_rate` should stop startup, not be
-/// silently ignored; the rate cap is Task 12).
+/// Apply one `key = value` inside `[logs]`. `stream` is a bare bool; `max_rate`
+/// is a bare non-negative int (lines/sec, 0 = unlimited). Unknown key -> hard
+/// Syntax error (a mistyped key should stop startup, not be silently ignored).
 fn logsSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!void {
     if (std.mem.eql(u8, key, "stream")) {
         cfg.logs_stream = if (std.mem.eql(u8, value, "true"))
@@ -345,6 +346,11 @@ fn logsSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!
             false
         else
             return error.BadValue;
+    } else if (std.mem.eql(u8, key, "max_rate")) {
+        // Bare int, lines/sec. Range 0..u32-max; a negative or non-numeric value
+        // (parseInt rejects the sign for an unsigned type) is a hard BadValue so a
+        // typo cannot silently disable the cap.
+        cfg.logs_max_rate = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
     } else {
         return error.Syntax; // unknown key inside a [logs] section
     }
@@ -966,6 +972,25 @@ test "logs section: stream true/false and default-absent" {
     // Bad bool and unknown key inside [logs] are hard errors.
     try t.expectError(error.BadValue, parseTest("[logs]\nstream = yes", &storage));
     try t.expectError(error.Syntax, parseTest("[logs]\nbogus = \"x\"", &storage));
+}
+
+test "logs section: max_rate parses, defaults absent, rejects bad values" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // A positive cap parses as a bare int.
+    const cap = try parseTest("[logs]\nstream = true\nmax_rate = 500", &storage);
+    try t.expectEqual(@as(?u32, 500), cap.logs_max_rate);
+    // 0 = unlimited is a legal explicit value.
+    const unlimited = try parseTest("[logs]\nmax_rate = 0", &storage);
+    try t.expectEqual(@as(?u32, 0), unlimited.logs_max_rate);
+    // Absent -> null (caller keeps the cli.Config default of 0/unlimited).
+    const none = try parseTest("[logs]\nstream = true", &storage);
+    try t.expectEqual(@as(?u32, null), none.logs_max_rate);
+    // Non-numeric and negative are hard errors (parseInt rejects the sign for a
+    // u32), so a typo cannot silently disable the cap.
+    try t.expectError(error.BadValue, parseTest("[logs]\nmax_rate = fast", &storage));
+    try t.expectError(error.BadValue, parseTest("[logs]\nmax_rate = -1", &storage));
+    // A value past u32 overflows parseInt -> BadValue (guards the upper bound).
+    try t.expectError(error.BadValue, parseTest("[logs]\nmax_rate = 9999999999", &storage));
 }
 
 test "secret section: bare (non-derived) collision between two default envs" {

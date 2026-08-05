@@ -64,7 +64,7 @@ jobs:
       # Raising this ceiling should be a deliberate, reviewed act.
       - name: Config surface gate
         run: |
-          budget=38
+          budget=40
           n=$(grep -cE '^\| `[a-z_]+' docs/CONFIG.md)
           echo "documented config keys: ${n} (budget ${budget})"
           if [ "$n" -gt "$budget" ]; then

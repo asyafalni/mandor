@@ -1195,6 +1195,127 @@ if [ $c -eq 0 ] \
   ok "formats: b10 yields 6 digits, raw round-trips 32 bytes to EOF"
 else bad "secret formats" "exit $c: $(grep -E '^\[sh\] (OTP|BLOB)' "$TMP/77")"; fi
 
+# 78-79. Opt-in worker log streaming (`[logs] stream`). A fake OTLP listener --
+# the same shape as test 65 (ephemeral port, port-file readiness, reads
+# Content-Length, answers 200) -- records every /v1/logs body it receives, plus
+# every request path so a negative can be proven non-vacuous. The streamed line
+# travels as a UTF-8 log `body` and the worker name as the `service.name`
+# resource attribute, so a raw byte-substring check on the body is sufficient
+# (no full protobuf decode). Poll/readiness-based throughout: no fixed sleeps.
+MARK="MANDOR_STREAM_MARKER_7F3A9"
+cat > "$TMP/listen_logs.py" <<'PY'
+import socket, sys
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(16)
+srv.settimeout(60)
+with open(sys.argv[1], "w") as f:
+    f.write(str(srv.getsockname()[1]))
+paths = open(sys.argv[2], "ab")   # every request path (proves the daemon shipped)
+bodies = open(sys.argv[3], "ab")  # /v1/logs request bodies only
+while True:
+    try:
+        conn, _ = srv.accept()
+    except socket.timeout:
+        break
+    buf = b""; clen = 0; path = b""
+    while True:
+        head, sep, body = buf.partition(b"\r\n\r\n")
+        if sep:
+            reqline = head.split(b"\r\n", 1)[0]
+            parts = reqline.split(b" ")
+            path = parts[1] if len(parts) > 1 else b""
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    clen = int(line.split(b":", 1)[1])
+            if len(body) >= clen:
+                break
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    conn.close()
+    paths.write(path + b"\n"); paths.flush()
+    if path == b"/v1/logs":
+        bodies.write(buf.partition(b"\r\n\r\n")[2] + b"\n---FRAME---\n"); bodies.flush()
+PY
+
+# 78. stream ON: the worker's unique stdout line must land at photon /v1/logs,
+# carrying the worker's overridden service.name ("streamer").
+rm -f "$TMP/78port" "$TMP/78paths" "$TMP/78bodies"
+python3 "$TMP/listen_logs.py" "$TMP/78port" "$TMP/78paths" "$TMP/78bodies" >/dev/null 2>&1 &
+lpid=$!
+for _ in $(seq 1 100); do [ -s "$TMP/78port" ] && break; sleep 0.1; done
+p78=$(cat "$TMP/78port" 2>/dev/null)
+if [ -z "$p78" ]; then
+  bad "log streaming on" "listener never bound (harness setup)"
+  kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
+else
+cat > "$TMP/stream78.toml" <<TOML
+workers = ["sh -c 'echo $MARK; sleep 30'"]
+photon = "127.0.0.1:$p78"
+[logs]
+stream = true
+[worker.sh]
+name = "streamer"
+TOML
+PHOTON_TOKEN=any "$MANDOR" --config="$TMP/stream78.toml" >"$TMP/78out" 2>&1 &
+mpid=$!
+found=""
+for _ in $(seq 1 250); do
+  grep -q "$MARK" "$TMP/78bodies" 2>/dev/null && { found=1; break; }
+  kill -0 "$mpid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
+if [ -n "$found" ] && grep -q "streamer" "$TMP/78bodies" 2>/dev/null; then
+  ok "log streaming on: worker stdout line reaches photon /v1/logs with its service.name"
+else bad "log streaming on" \
+  "marker_in_body=[$found] logbody_bytes=$(wc -c < "$TMP/78bodies" 2>/dev/null) paths=[$(sort -u "$TMP/78paths" 2>/dev/null | tr '\n' ' ')]"; fi
+fi
+
+# 79. stream OFF (default, no [logs] section): the SAME worker line must NOT
+# reach photon. Incident/lifecycle logs still ship to /v1/logs (that is what
+# makes the /v1/logs body file non-empty and proves the log path is live), but
+# none of them carry the worker's stdout marker. Poll until the log path is
+# demonstrably live (a /v1/logs frame arrived) and the worker has printed
+# (supervisor echoes it regardless of streaming), so the negative is not vacuous.
+rm -f "$TMP/79port" "$TMP/79paths" "$TMP/79bodies"
+python3 "$TMP/listen_logs.py" "$TMP/79port" "$TMP/79paths" "$TMP/79bodies" >/dev/null 2>&1 &
+lpid=$!
+for _ in $(seq 1 100); do [ -s "$TMP/79port" ] && break; sleep 0.1; done
+p79=$(cat "$TMP/79port" 2>/dev/null)
+if [ -z "$p79" ]; then
+  bad "log streaming off" "listener never bound (harness setup)"
+  kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
+else
+cat > "$TMP/stream79.toml" <<TOML
+workers = ["sh -c 'echo $MARK; sleep 30'"]
+photon = "127.0.0.1:$p79"
+[worker.sh]
+name = "streamer"
+TOML
+PHOTON_TOKEN=any "$MANDOR" --config="$TMP/stream79.toml" >"$TMP/79out" 2>&1 &
+mpid=$!
+live=""
+for _ in $(seq 1 250); do
+  # log path live (a /v1/logs frame shipped: the 'started' lifecycle log) AND
+  # the worker has printed the marker to the supervisor's own stdout.
+  if [ -s "$TMP/79bodies" ] && grep -q "$MARK" "$TMP/79out" 2>/dev/null; then live=1; break; fi
+  kill -0 "$mpid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
+if [ -n "$live" ] && ! grep -q "$MARK" "$TMP/79bodies" 2>/dev/null; then
+  ok "log streaming off (default): worker stdout line is never shipped to photon"
+else bad "log streaming off" \
+  "log_path_live=[$live] leaked_marker=$(grep -c "$MARK" "$TMP/79bodies" 2>/dev/null) printed=$(grep -c "$MARK" "$TMP/79out" 2>/dev/null)"; fi
+fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

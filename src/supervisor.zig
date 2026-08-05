@@ -338,6 +338,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // operator set `[logs] stream` AND photon is configured (so a daemon
         // exists to drain it). Default off ⇒ the capture path stays untouched.
         stream_logs = cfg.logs.stream;
+        stream_max_rate = cfg.logs.max_rate;
     }
 
     var waiting: [cli.max_workers]bool = .{false} ** cli.max_workers;
@@ -1277,6 +1278,36 @@ const EchoCtx = struct { w: *spawner.Worker, err: bool, t_ms: u64 = 0 };
 /// costs the capture path nothing unless explicitly enabled.
 var stream_logs: bool = false;
 
+/// `[logs] max_rate`, lines/sec, armed alongside `stream_logs`. 0 = unlimited
+/// (the default) ⇒ `rateAllows` returns immediately with no window bookkeeping,
+/// so an uncapped stream pays nothing for the limiter.
+var stream_max_rate: u32 = 0;
+/// The current 1-second rate window (wall-clock second) and lines emitted in it.
+/// A cheap O(1) token counter: the window resets when the second rolls over,
+/// using the wall-clock timestamp already taken on the capture path.
+var rate_window_sec: u64 = 0;
+var rate_window_count: u32 = 0;
+
+/// True if a streamed line may go out under the rate cap. O(1), never blocks,
+/// never allocates. `max_rate == 0` ⇒ always true with zero bookkeeping. Else
+/// count lines in the current wall-clock second (`t_ms` is `ctx.t_ms`, taken once
+/// per pipe drain) and, once the count reaches the cap, DROP — counted via
+/// telemetry.noteRateDrop() — returning false so the caller never builds a frame.
+fn rateAllows(t_ms: u64) bool {
+    if (stream_max_rate == 0) return true; // unlimited: no window, no cost
+    const sec = t_ms / 1000;
+    if (sec != rate_window_sec) {
+        rate_window_sec = sec;
+        rate_window_count = 0;
+    }
+    if (rate_window_count >= stream_max_rate) {
+        telemetry.noteRateDrop(); // over cap: drop before building the frame
+        return false;
+    }
+    rate_window_count += 1;
+    return true;
+}
+
 /// Ring-record the line and echo it, `[name] `-prefixed, to our own
 /// stdout/stderr in a single write (atomic below PIPE_BUF).
 var tty_out = false;
@@ -1312,7 +1343,10 @@ fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     // a slow/absent photon or a log storm drops lines (counted in telemetry),
     // never stalls capture or supervision. iostream 0=stdout/1=stderr; severity
     // from the line's error/warn flag. The ring push + echo below are untouched.
-    if (stream_logs) telemetry.emitLog(
+    // `rateAllows` caps lines/sec (`[logs] max_rate`) BEFORE any frame is built:
+    // an over-cap line is dropped here without touching emitLog. `&&` short-
+    // circuits so an uncapped or disabled stream skips it at zero cost.
+    if (stream_logs and rateAllows(ctx.t_ms)) telemetry.emitLog(
         ctx.w.nameSlice(),
         @intFromBool(ctx.err),
         capture.severityFromFlags(flags),
@@ -1399,4 +1433,45 @@ fn closePipes(w: *spawner.Worker) void {
     capture.closeFd(&w.out_r);
     capture.closeFd(&w.err_r);
     capture.closeFd(&w.ready_r);
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test "rate limiter: caps lines per second, resets on window roll, unlimited at 0" {
+    // Save/restore the module globals the limiter touches so the test is
+    // order-independent and leaves the supervisor state clean.
+    const saved_rate = stream_max_rate;
+    const saved_sec = rate_window_sec;
+    const saved_count = rate_window_count;
+    defer {
+        stream_max_rate = saved_rate;
+        rate_window_sec = saved_sec;
+        rate_window_count = saved_count;
+    }
+
+    stream_max_rate = 2;
+    rate_window_sec = 0;
+    rate_window_count = 0;
+
+    const before = telemetry.rateDrops();
+    // Two lines in second 1000 pass; the third is over cap → dropped + counted.
+    try testing.expect(rateAllows(1_000));
+    try testing.expect(rateAllows(1_000));
+    try testing.expect(!rateAllows(1_000));
+    try testing.expectEqual(before + 1, telemetry.rateDrops());
+    // Rolling into the next second resets the window: lines flow again. (Dropping
+    // the window-reset in rateAllows makes these first two asserts fail.)
+    try testing.expect(rateAllows(2_000));
+    try testing.expect(rateAllows(2_000));
+    try testing.expect(!rateAllows(2_000));
+    try testing.expectEqual(before + 2, telemetry.rateDrops());
+
+    // max_rate == 0 is unlimited: never drops, never touches the window counter.
+    stream_max_rate = 0;
+    const before0 = telemetry.rateDrops();
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) try testing.expect(rateAllows(3_000));
+    try testing.expectEqual(before0, telemetry.rateDrops());
 }
