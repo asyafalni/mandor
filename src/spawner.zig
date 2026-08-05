@@ -11,9 +11,10 @@ const sampler = @import("sampler.zig");
 const detector = @import("detector.zig");
 const elf = @import("elf.zig");
 const caps = @import("caps.zig");
+const names = @import("names.zig");
 
 pub const max_args = 64;
-pub const name_cap = 32;
+pub const name_cap = names.cap;
 pub const log_ring_capacity = 256 * 1024;
 const default_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -358,51 +359,19 @@ pub fn addGlobalEnv(entry: []const u8) bool {
 }
 
 fn setName(w: *Worker, argv0: []const u8, prior: []const Worker) void {
-    var base = argv0;
-    if (std.mem.lastIndexOfScalar(u8, argv0, '/')) |i| base = argv0[i + 1 ..];
-    assignName(w, base, prior);
+    assignName(w, names.basename(argv0), prior);
 }
 
-/// Byte a name may not hold: the Prometheus exposition format has no escaping
-/// for label values, so a quote/backslash/control byte would silently corrupt
-/// every scrape. Neutralized to '_' before the name is stored.
-fn unsafeNameByte(c: u8) bool {
-    return c == '"' or c == '\\' or c < 0x20;
-}
-
-/// Write `base` into `w.name`: length-cap (room for a "-NN" dedup suffix),
-/// dedup against `prior`, then neutralize Prometheus-unsafe bytes. The one
-/// place a display/telemetry name is finalized — both basename derivation and
-/// the TOML `name` override flow through here so capping, dedup, and
-/// neutralization are identical.
+/// Finalize `raw` into `w.name` via the shared `names.finalize` (cap + dedup +
+/// neutralize). Both basename derivation and the TOML `name` override flow
+/// through here, and `config` resolves secret grants against the SAME
+/// `names.finalize`, so a worker's name and the name a grant matches on can
+/// never diverge.
 fn assignName(w: *Worker, raw: []const u8, prior: []const Worker) void {
-    var base = raw;
-    if (base.len > name_cap - 4) base = base[0 .. name_cap - 4]; // room for "-NN"
-    var dupes: usize = 0;
-    for (prior) |*p| {
-        const pn = p.nameSlice();
-        if (std.mem.eql(u8, pn, base) or
-            (pn.len > base.len + 1 and std.mem.startsWith(u8, pn, base) and pn[base.len] == '-'))
-        {
-            dupes += 1;
-        }
-    }
-    if (dupes == 0) {
-        @memcpy(w.name[0..base.len], base);
-        w.name_len = @intCast(base.len);
-    } else {
-        var fbs: []u8 = w.name[0..];
-        @memcpy(fbs[0..base.len], base);
-        const suffix = std.fmt.bufPrint(fbs[base.len..], "-{d}", .{dupes + 1}) catch
-            fbs[base.len..base.len];
-        w.name_len = @intCast(base.len + suffix.len);
-    }
-    // The name is a basename, so it can hold any byte a filename can. JSON
-    // sinks escape it, but the Prometheus format does not — neutralize once
-    // here rather than at each sink.
-    for (w.name[0..w.name_len]) |*c| {
-        if (unsafeNameByte(c.*)) c.* = '_';
-    }
+    var pn_buf: [cli.max_workers][]const u8 = undefined;
+    for (prior, 0..) |*p, i| pn_buf[i] = p.nameSlice();
+    const name = names.finalize(raw, pn_buf[0..prior.len], w.name[0..]);
+    w.name_len = @intCast(name.len);
 }
 
 /// Apply a TOML `name` override to an already-initialized worker, reusing the
@@ -417,7 +386,7 @@ pub fn setNameOverride(w: *Worker, override: []const u8, prior: []const Worker) 
     if (override.len > name_cap - 4) return false; // explicit intent: don't truncate
     var has_valid = false;
     for (override) |c| {
-        if (!unsafeNameByte(c)) {
+        if (!names.unsafeByte(c)) {
             has_valid = true;
             break;
         }
