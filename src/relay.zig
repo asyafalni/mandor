@@ -586,6 +586,8 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     const a_state_free = [_]HAttr{.{ .k = "state", .v = "free" }};
     const a_dir_rx = [_]HAttr{.{ .k = "direction", .v = "receive" }};
     const a_dir_tx = [_]HAttr{.{ .k = "direction", .v = "transmit" }};
+    const a_dir_read = [_]HAttr{.{ .k = "direction", .v = "read" }};
+    const a_dir_write = [_]HAttr{.{ .k = "direction", .v = "write" }};
     const a_none = [_]HAttr{};
 
     // Datapoints (one array per metric so the slices outlive the sizing/write
@@ -647,6 +649,30 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     }
     const dp_net = dp_net_buf[0 .. 2 * niface];
 
+    // system.disk.io carries one read + one write datapoint PER whole block
+    // device (attrs device=<dev> + direction), the SAME shape as
+    // system.network.io (read/write instead of receive/transmit): all backing
+    // storage is fixed-size on the stack (zero heap) and sized to max_disks — the
+    // per-device HAttr pairs and the HDp array outlive the sizing/write passes. A
+    // monotonic cumulative Sum in bytes (By). The device string points into
+    // h.disks[i].name, which lives for the whole call (h is a by-value copy).
+    const max_disks = hostmetrics.max_disks;
+    var disk_r_attr_buf: [max_disks][2]HAttr = undefined;
+    var disk_w_attr_buf: [max_disks][2]HAttr = undefined;
+    var dp_disk_buf: [2 * max_disks]HDp = undefined;
+    const ndisk: u32 = if (h.disk_n > max_disks) max_disks else h.disk_n;
+    {
+        var di: u32 = 0;
+        while (di < ndisk) : (di += 1) {
+            const dev: []const u8 = h.disks[di].name[0..h.disks[di].name_len];
+            disk_r_attr_buf[di] = .{ .{ .k = "device", .v = dev }, a_dir_read[0] };
+            disk_w_attr_buf[di] = .{ .{ .k = "device", .v = dev }, a_dir_write[0] };
+            dp_disk_buf[2 * di] = .{ .value_bits = h.disks[di].rbytes, .is_double = false, .attrs = disk_r_attr_buf[di][0..] };
+            dp_disk_buf[2 * di + 1] = .{ .value_bits = h.disks[di].wbytes, .is_double = false, .attrs = disk_w_attr_buf[di][0..] };
+        }
+    }
+    const dp_disk = dp_disk_buf[0 .. 2 * ndisk];
+
     // system.filesystem.usage / .utilization carry one datapoint per real mount
     // (attr mountpoint=<path>), mirroring the per-core cpu path: all backing
     // storage is fixed-size on the stack (zero heap) and sized to max_mounts —
@@ -683,6 +709,7 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
         .{ .name = "system.memory.limit", .unit = "By", .kind = .gauge, .dps = &dp_mem_limit },
         .{ .name = "system.memory.utilization", .unit = "1", .kind = .gauge, .dps = &dp_mem_util },
         .{ .name = "system.network.io", .unit = "By", .kind = .sum, .dps = dp_net },
+        .{ .name = "system.disk.io", .unit = "By", .kind = .sum, .dps = dp_disk },
         .{ .name = "system.filesystem.usage", .unit = "By", .kind = .gauge, .dps = dp_fs_usage },
         .{ .name = "system.filesystem.utilization", .unit = "1", .kind = .gauge, .dps = dp_fs_util },
     };
@@ -1973,6 +2000,70 @@ test "buildOtlpHostMetrics emits per-interface network.io + a free memory datapo
         if (std.mem.eql(u8, v, "free")) free_bytes = Fields.get(dp, 6).?.int;
     }
     try testing.expectEqual(@as(u64, 600), free_bytes.?); // 1000 - 400
+}
+
+test "buildOtlpHostMetrics emits per-device disk.io read/write datapoints" {
+    // Two whole disks: sda (read 1000/write 2000) and nvme0n1 (read 30/write 40).
+    // Each emits a read + write datapoint keyed by device=<dev> + direction —
+    // never one aggregate — as a monotonic cumulative Sum in bytes.
+    var h = hostmetrics.HostSample{};
+    h.disk_n = 2;
+    const d0 = "sda";
+    @memcpy(h.disks[0].name[0..d0.len], d0);
+    h.disks[0].name_len = d0.len;
+    h.disks[0].rbytes = 1000;
+    h.disks[0].wbytes = 2000;
+    const d1 = "nvme0n1";
+    @memcpy(h.disks[1].name[0..d1.len], d1);
+    h.disks[1].name_len = d1.len;
+    h.disks[1].rbytes = 30;
+    h.disks[1].wbytes = 40;
+    const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
+
+    const rm = Fields.get(body, 1).?.bytes; // resource_metrics
+    const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
+    var mit = Fields{ .b = sm };
+    var disk_io: []const u8 = &.{};
+    while (mit.next()) |f| {
+        if (f.num != 2) continue; // Metric
+        const name = Fields.get(f.bytes, 1).?.bytes;
+        if (std.mem.eql(u8, name, "system.disk.io")) disk_io = f.bytes;
+    }
+    try testing.expect(disk_io.len > 0);
+
+    // disk.io is a Sum (field 7, not a Gauge), monotonic cumulative, per-device.
+    try testing.expect(Fields.get(disk_io, 5) == null); // not a gauge
+    const sum = Fields.get(disk_io, 7).?.bytes;
+    try testing.expectEqual(@as(u64, 2), Fields.get(sum, 2).?.int); // CUMULATIVE
+    try testing.expectEqual(@as(u64, 1), Fields.get(sum, 3).?.int); // is_monotonic
+    var sdps = Fields{ .b = sum };
+    var sda_r: ?u64 = null;
+    var sda_w: ?u64 = null;
+    var nvme_r: ?u64 = null;
+    var nvme_w: ?u64 = null;
+    while (sdps.next()) |f| {
+        if (f.num != 1) continue; // data_points
+        const dp = f.bytes;
+        var kit = Fields{ .b = dp };
+        var dev: []const u8 = &.{};
+        var dir: []const u8 = &.{};
+        while (kit.next()) |kf| {
+            if (kf.num != 7) continue; // NumberDataPoint.attributes (repeated)
+            const k = Fields.get(kf.bytes, 1).?.bytes;
+            const v = avStr(Fields.get(kf.bytes, 2).?.bytes);
+            if (std.mem.eql(u8, k, "device")) dev = v;
+            if (std.mem.eql(u8, k, "direction")) dir = v;
+        }
+        const val = Fields.get(dp, 6).?.int; // as_int bytes
+        if (std.mem.eql(u8, dev, "sda") and std.mem.eql(u8, dir, "read")) sda_r = val;
+        if (std.mem.eql(u8, dev, "sda") and std.mem.eql(u8, dir, "write")) sda_w = val;
+        if (std.mem.eql(u8, dev, "nvme0n1") and std.mem.eql(u8, dir, "read")) nvme_r = val;
+        if (std.mem.eql(u8, dev, "nvme0n1") and std.mem.eql(u8, dir, "write")) nvme_w = val;
+    }
+    try testing.expectEqual(@as(u64, 1000), sda_r.?); // per-device, not summed
+    try testing.expectEqual(@as(u64, 2000), sda_w.?);
+    try testing.expectEqual(@as(u64, 30), nvme_r.?);
+    try testing.expectEqual(@as(u64, 40), nvme_w.?);
 }
 
 test "buildOtlpGpuMetrics emits system.gpu.* photon can walk" {

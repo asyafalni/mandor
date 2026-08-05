@@ -53,6 +53,26 @@ pub const Iface = struct {
     tx: u64 = 0,
 };
 
+/// Upper bound on per-block-device tracking. /proc/diskstats lists every block
+/// device the kernel knows (loop/ram/dm/partitions included), but only whole
+/// physical disks survive the filter; a handful is the norm. parseDiskstats caps
+/// its output at this length (excess disks truncated, never an overrun) and
+/// HostSample carries a fixed array of this size.
+pub const max_disks = 32;
+
+/// One whole (non-partition, non-virtual) block device with its cumulative
+/// byte counters. Daemon-local (the name only ever becomes an OTLP `device`
+/// attribute), so a fixed-size stored name is fine. `name`/`name_len` hold the
+/// device name (a name that will not fit is truncated to 31 bytes — the counters
+/// are still recorded); rbytes/wbytes are cumulative bytes derived from the
+/// sector counters in /proc/diskstats (sectors * 512, saturating).
+pub const Disk = struct {
+    name: [32]u8 = [_]u8{0} ** 32,
+    name_len: u8 = 0,
+    rbytes: u64 = 0,
+    wbytes: u64 = 0,
+};
+
 pub const HostSample = struct {
     // memory (bytes)
     mem_total: u64 = 0,
@@ -78,6 +98,12 @@ pub const HostSample = struct {
     // the fixed-size stored paths never touch the wire.
     mounts: [max_mounts]Mount = [_]Mount{.{}} ** max_mounts,
     mount_n: u32 = 0,
+    // block devices — one entry per whole (non-partition, non-virtual) disk,
+    // cumulative monotonic bytes. Only the first `disk_n` (<= max_disks) entries
+    // of `disks` are valid. Daemon-local, so the fixed-size stored names never
+    // touch the wire (they only become an OTLP `device` attribute in the encoder).
+    disks: [max_disks]Disk = [_]Disk{.{}} ** max_disks,
+    disk_n: u32 = 0,
 };
 
 // ------------------------------------------------------ pure parsers
@@ -220,6 +246,88 @@ pub fn parseNetDev(text: []const u8, out: *[max_ifaces]Iface) []const Iface {
             }
         }
         out[n] = .{ .rx = rx, .tx = tx };
+        // Truncate a too-long name to the stored buffer; counters are unaffected.
+        const keep = if (name.len > out[n].name.len - 1) out[n].name.len - 1 else name.len;
+        @memcpy(out[n].name[0..keep], name[0..keep]);
+        out[n].name_len = @intCast(keep);
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// True for a /proc/diskstats devname that is NOT a whole physical disk, so
+/// parseDiskstats drops it. A device is skipped iff (a) it carries a virtual /
+/// non-physical prefix (loop/ram/sr/fd/dm-/md), OR (b) it is an `sd`/`hd`/`vd`
+/// name ending in a digit (a partition like `sda1`; the whole disk `sda` has no
+/// trailing digit), OR (c) it is an `nvme`/`mmcblk` name whose trailing digit run
+/// is immediately preceded by `p` (a partition like `nvme0n1p1`/`mmcblk0p1`; the
+/// whole disks `nvme0n1`/`mmcblk0` end in a digit NOT preceded by `p`).
+///
+/// MUTATION SENTINEL: dropping the (b) `sd/hd/vd`+trailing-digit rule lets a
+/// partition like `sda1` through — the "parseDiskstats keeps only whole disks"
+/// test then sees an extra device and fails.
+fn skipDisk(name: []const u8) bool {
+    if (name.len == 0) return true;
+    // (a) virtual / non-physical prefixes.
+    const skip_prefixes = [_][]const u8{ "loop", "ram", "sr", "fd", "dm-", "md" };
+    for (skip_prefixes) |p| {
+        if (std.mem.startsWith(u8, name, p)) return true;
+    }
+    // (b) sd/hd/vd partition = base name ending in a digit.
+    if (std.mem.startsWith(u8, name, "sd") or
+        std.mem.startsWith(u8, name, "hd") or
+        std.mem.startsWith(u8, name, "vd"))
+    {
+        const last = name[name.len - 1];
+        if (last >= '0' and last <= '9') return true;
+    }
+    // (c) nvme/mmcblk partition = trailing digit run preceded by `p`.
+    if (std.mem.startsWith(u8, name, "nvme") or std.mem.startsWith(u8, name, "mmcblk")) {
+        var i: usize = name.len;
+        while (i > 0 and name[i - 1] >= '0' and name[i - 1] <= '9') i -= 1;
+        // digits exist iff i < name.len; a `p` must precede the run to be a partition.
+        if (i < name.len and i > 0 and name[i - 1] == 'p') return true;
+    }
+    return false;
+}
+
+/// /proc/diskstats: capture cumulative read/write BYTES per WHOLE physical block
+/// device into `out`, returning the filled prefix. Line layout is whitespace-
+/// separated `major minor devname ...`; token[2] is the devname, token[5] is
+/// sectors-read and token[9] is sectors-written (0-based over the line). Sectors
+/// are always 512 bytes in diskstats, so rbytes = sectors_read *| 512 and
+/// wbytes = sectors_written *| 512 (saturating; a garbage token parses to 0).
+/// Non-physical devices and partitions are dropped via skipDisk. A name longer
+/// than 31 bytes has its STORED name truncated (the counters are still recorded).
+/// A short/malformed line (fewer than 10 tokens) is skipped. Output is bounded to
+/// max_disks (excess devices truncated — never an overrun). Pure: no syscalls,
+/// deterministically unit-testable with fixture strings. O(input): single pass.
+pub fn parseDiskstats(text: []const u8, out: *[max_disks]Disk) []const Disk {
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (n >= max_disks) break; // bounded — truncate, never overrun
+        var it = std.mem.tokenizeAny(u8, line, " \t\r");
+        var idx: usize = 0;
+        var name: []const u8 = &.{};
+        var rsec: u64 = 0;
+        var wsec: u64 = 0;
+        var got_w = false;
+        while (it.next()) |tok| : (idx += 1) {
+            switch (idx) {
+                2 => name = tok,
+                5 => rsec = std.fmt.parseInt(u64, tok, 10) catch 0,
+                9 => {
+                    wsec = std.fmt.parseInt(u64, tok, 10) catch 0;
+                    got_w = true;
+                    break; // nothing past sectors-written matters
+                },
+                else => {},
+            }
+        }
+        if (!got_w) continue; // short/malformed line -> skip
+        if (skipDisk(name)) continue; // non-physical or partition -> drop
+        out[n] = .{ .rbytes = rsec *| 512, .wbytes = wsec *| 512 };
         // Truncate a too-long name to the stored buffer; counters are unaffected.
         const keep = if (name.len > out[n].name.len - 1) out[n].name.len - 1 else name.len;
         @memcpy(out[n].name[0..keep], name[0..keep]);
@@ -467,6 +575,15 @@ pub const Sampler = struct {
         }
         out.mount_n = mn;
 
+        // Per-block-device counters. Read /proc/diskstats (8 KiB covers many
+        // devices; truncation is safe — we parse what we read) and fill the
+        // sample's disk array directly: each Disk owns its (copied) name, so there
+        // is no aliasing into the scratch buffer. parseDiskstats bounds itself to
+        // max_disks, so disk_n can never exceed out.disks.
+        var disk_buf: [8192]u8 = undefined;
+        const nds = parseDiskstats(readFile("/proc/diskstats", &disk_buf) orelse "", &out.disks);
+        out.disk_n = @intCast(nds.len);
+
         return out;
     }
 };
@@ -602,6 +719,89 @@ test "parseNetDev truncates beyond max_ifaces and truncates long names (no overr
     try testing.expectEqual(@as(u64, 222), ifs2[0].tx);
 }
 
+// MUTATION TARGET: breaking the partition skip in skipDisk — e.g. dropping the
+// (b) `sd/hd/vd`+trailing-digit rule — lets `sda1` (and `nvme0n1p1` if (c) is
+// broken) leak in, so this "returns ONLY whole disks" test fails.
+test "parseDiskstats keeps only whole disks, sectors x512, not partitions" {
+    // Whole disks sda + nvme0n1 interleaved with their partitions (sda1,
+    // nvme0n1p1) and virtual devices (loop0, ram0). Only the whole disks survive,
+    // each with rbytes = sectors_read(token5)*512 and wbytes = sectors_written
+    // (token9)*512. Layout: major minor devname f3 f4 [sectors_read=t5] f6 f7 f8
+    // [sectors_written=t9] ...
+    var out: [max_disks]Disk = undefined;
+    const disks = parseDiskstats(
+        "   7       0 loop0 0 0 0 0 0 0 0 0 0 0 0\n" ++
+            "   1       0 ram0 0 0 0 0 0 0 0 0 0 0 0\n" ++
+            "   8       0 sda 100 0 200 0 0 0 300 0 0 0\n" ++ // read sectors 200, write 300
+            "   8       1 sda1 10 0 20 0 0 0 30 0 0 0\n" ++ // partition -> skipped
+            " 259       0 nvme0n1 5 0 40 0 0 0 50 0 0 0\n" ++ // read 40, write 50
+            " 259       1 nvme0n1p1 1 0 4 0 0 0 5 0 0 0\n", // partition -> skipped
+        &out,
+    );
+    try testing.expectEqual(@as(usize, 2), disks.len); // only sda + nvme0n1
+    try testing.expectEqualStrings("sda", disks[0].name[0..disks[0].name_len]);
+    try testing.expectEqual(@as(u64, 200 * 512), disks[0].rbytes);
+    try testing.expectEqual(@as(u64, 300 * 512), disks[0].wbytes);
+    try testing.expectEqualStrings("nvme0n1", disks[1].name[0..disks[1].name_len]);
+    try testing.expectEqual(@as(u64, 40 * 512), disks[1].rbytes);
+    try testing.expectEqual(@as(u64, 50 * 512), disks[1].wbytes);
+}
+
+// MUTATION TARGET: loosening the max_disks bound in parseDiskstats
+// (`n >= max_disks` -> `n > max_disks`, or dropping the clamp) makes this test
+// overrun the out array and trap; and a name too long for the 32-byte buffer
+// must truncate the STORED name while still recording the counters; a short line
+// must be skipped, not counted.
+test "parseDiskstats truncates beyond max_disks, truncates long names, skips short lines" {
+    var buf: [16384]u8 = undefined;
+    var w: usize = 0;
+    // A short/malformed line first (fewer than 10 tokens) — must be skipped.
+    const short = "   8       0 vda 1 2 3\n";
+    @memcpy(buf[0..short.len], short);
+    w += short.len;
+    // More than max_disks distinct whole disks. Use nvme<N>n1 names: they end in
+    // a digit NOT preceded by `p`, so skipDisk keeps them (a whole disk, not a
+    // partition), and varying N keeps them distinct.
+    var i: usize = 0;
+    while (i < max_disks + 8) : (i += 1) {
+        const line = try std.fmt.bufPrint(buf[w..], "259 {d} nvme{d}n1 0 0 {d} 0 0 0 {d} 0 0 0\n", .{ i, i, i, i });
+        w += line.len;
+    }
+    var out: [max_disks]Disk = undefined;
+    const disks = parseDiskstats(buf[0..w], &out);
+    try testing.expectEqual(@as(usize, max_disks), disks.len); // bounded, no overrun
+    // The malformed short line was skipped, so nvme0n1 is the first captured disk.
+    try testing.expectEqualStrings("nvme0n1", disks[0].name[0..disks[0].name_len]);
+
+    // A name longer than the 31-byte stored capacity: stored name truncates to
+    // 31 bytes, but the counters are still recorded intact.
+    const longname = "nvme0n9blahblahblahblahblahblahblahXYZ"; // > 31 chars, whole disk
+    var out2: [max_disks]Disk = undefined;
+    var buf2: [256]u8 = undefined;
+    const line2 = try std.fmt.bufPrint(&buf2, "259 0 {s} 0 0 7 0 0 0 9 0 0 0\n", .{longname});
+    const disks2 = parseDiskstats(line2, &out2);
+    try testing.expectEqual(@as(usize, 1), disks2.len);
+    try testing.expectEqual(@as(u8, 31), disks2[0].name_len); // truncated to capacity
+    try testing.expectEqualStrings(longname[0..31], disks2[0].name[0..disks2[0].name_len]);
+    try testing.expectEqual(@as(u64, 7 * 512), disks2[0].rbytes); // counters intact
+    try testing.expectEqual(@as(u64, 9 * 512), disks2[0].wbytes);
+}
+
+test "parseDiskstats overflow-safe: a giant sectors value saturates x512, no trap" {
+    var out: [max_disks]Disk = undefined;
+    const disks = parseDiskstats(
+        "8 0 sda 0 0 99999999999999999999999 0 0 0 99999999999999999999999 0 0 0\n",
+        &out,
+    );
+    // parseInt overflow -> 0, so the *|512 cannot trap.
+    try testing.expectEqual(@as(usize, 1), disks.len);
+    try testing.expectEqual(@as(u64, 0), disks[0].rbytes);
+    try testing.expectEqual(@as(u64, 0), disks[0].wbytes);
+    // A within-range but huge sector count saturates the multiply, not trap.
+    const big = parseDiskstats("8 0 sdb 0 0 18000000000000000000 0 0 0 1 0 0 0\n", &out);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), big[0].rbytes); // saturated
+}
+
 test "parseMountinfo skips pseudo-fs, dedups, keeps real mounts in order" {
     // Realistic mountinfo: pseudo lines (proc/sysfs/devtmpfs/devpts/tmpfs/
     // cgroup2) interleaved with three real filesystems (/ ext4, /boot vfat,
@@ -716,4 +916,9 @@ test "sample reads live host values (validates statfs layout + /proc)" {
     // legitimately yields zero — hence `>= 0`, not `> 0`).
     try testing.expect(h.iface_n <= max_ifaces);
     if (h.iface_n > 0) try testing.expect(h.ifaces[0].name_len > 0);
+    // Per-block-device: bounded by max_disks, and any captured whole disk has a
+    // non-empty name (a host with only virtual devices/partitions legitimately
+    // yields zero — hence `<=`, not `>`).
+    try testing.expect(h.disk_n <= max_disks);
+    if (h.disk_n > 0) try testing.expect(h.disks[0].name_len > 0);
 }
