@@ -49,18 +49,26 @@ never touches one. That child ships three things to photon:
   **non-blocking** pipe: best-effort, dropped under backpressure so telemetry
   can never stall supervision.
 - **Node / host metrics** → OTLP metrics (`/v1/metrics`). One host-scoped
-  resource (`host.name` / `host.id` / `os.type="linux"`) carrying the node total
+  resource (`host.name` / `host.id` / `os.type="linux"`) carrying the node totals
   so each worker is visible against its host baseline in photon's Infrastructure
   view. Emitted automatically whenever `photon` is set — there is **no separate
-  toggle** (same minimal-surface rule as the rest of telemetry), sampled on the
-  same 5 s cadence, over the same non-blocking, drop-under-backpressure pipe.
-  Metrics shipped: `system.cpu.utilization`, `system.cpu.logical.count`,
-  `system.cpu.load_average.1m`, `system.memory.usage` (`state=used|free`),
-  `system.memory.limit`, `system.memory.utilization`, `system.network.io`
-  (monotonic sum, `direction=receive|transmit`), `system.filesystem.usage` and
-  `system.filesystem.utilization` (`mountpoint=/`). Host identity comes from
-  `/proc/sys/kernel/hostname` and `/etc/machine-id` (falling back to `boot_id`,
-  then the literal `unknown`).
+  toggle** (same minimal-surface rule as the rest of telemetry), sampled every
+  5 s over the non-blocking, drop-under-backpressure pipe. Metrics shipped:
+  `system.cpu.utilization` (`cpu=total` **and one point per core** `cpu=<n>`),
+  `system.cpu.logical.count`, `system.cpu.load_average.1m`, `system.memory.usage`
+  (`state=used|free`), `system.memory.limit`, `system.memory.utilization`,
+  `system.network.io` (monotonic sum, **per interface** `device=<if>` ×
+  `direction=receive|transmit`), and `system.filesystem.usage` /
+  `system.filesystem.utilization` (**per mount** `mountpoint=<mp>`, real
+  filesystems only). Host identity comes from `/proc/sys/kernel/hostname` and
+  `/etc/machine-id` (falling back to `boot_id`, then the literal `unknown`).
+- **GPU metrics** (opt-in) → OTLP metrics (`/v1/metrics`). With `[gpu] enabled`,
+  the relay daemon shells out to `nvidia-smi` every `[gpu] interval` (default
+  15 s) and emits per-GPU `system.gpu.utilization`, `system.gpu.memory.usage`,
+  `system.gpu.memory.utilization`, `system.gpu.temperature`, `system.gpu.power`
+  (attrs `gpu=<i>`, `gpu.name=<n>`), same host identity as the node metrics.
+  Fail-closed: no `nvidia-smi`, any error, or no GPU ⇒ no GPU points and no
+  effect on supervision or other telemetry. NVIDIA only; no dynamic linking.
 - **Process-lifecycle events** → OTLP logs (`/v1/logs`): `started`, `exited`
   (ok / error / OOM), `restarting` (with backoff), `unhealthy`. Best-effort,
   same pipe.
@@ -72,6 +80,27 @@ fixed and intentionally not exposed as separate keys — `photon` is the whole
 telemetry surface, keeping to the four-CLI-flag / minimal-key rule. `PHOTON_TOKEN`
 (env, kept off the process cmdline) sets the bearer token when photon requires
 auth.
+
+### GPU metrics (the `[gpu]` section)
+
+Off by default. mandor is a static binary, so it collects GPU metrics by shelling
+out to `nvidia-smi` rather than linking NVML. The relay daemon samples on its own
+timer, off the supervision path, and is silent when `nvidia-smi` is absent.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Turn on GPU sampling (requires `nvidia-smi` on `PATH`) |
+| `interval` | duration | `15s` | GPU sample cadence |
+
+### Deploying mandor as a node monitor
+
+The `system.*` / `system.gpu.*` metrics describe the **node**, read from `/proc`,
+`/sys`, `statfs`, and `nvidia-smi`. mandor reports whatever those show: inside a
+normal container that is the container's cgroup-scoped view. To report the
+**host** (superseding a standalone node agent), run one mandor with the host
+mounted in — `/proc`, `/sys`, `/etc/machine-id`, and, for GPU, `/dev/nvidia*`
+plus `nvidia-smi` in the image — the node-exporter model. This is additive: the
+same binary still supervises its workers.
 
 ## Per-worker keys — `[worker.NAME]` sections
 
