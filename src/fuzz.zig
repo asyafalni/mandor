@@ -661,6 +661,26 @@ fn gpuTarget(bytes: []const u8) void {
     std.debug.assert(protoWalk(body, 0));
 }
 
+/// Streamed worker log lines are arbitrary process output — any bytes, any
+/// length, any severity byte. buildOtlpLogs must always emit a decodable
+/// protobuf (or refuse via TooLarge), never trap, whatever the name/line bytes.
+fn logsTarget(bytes: []const u8) void {
+    const half = bytes.len / 2;
+    var name = bytes[0..half];
+    if (name.len > 255) name = name[0..255]; // frame caps the worker name at 255
+    const recs = [_]relay.LogRecord{.{
+        .name = name,
+        .line = bytes[half..],
+        .iostream = if (bytes.len > 0) bytes[bytes.len - 1] & 1 else 0,
+        .severity = if (bytes.len > 0) bytes[0] % 3 else 0,
+        .t_ns = bytes.len,
+    }};
+    const body = relay.buildOtlpLogs(&recs, "node", "id") catch return;
+    std.debug.assert(protoWalk(body, 0));
+}
+
+const logs_seed = "api\npanic: runtime error: invalid memory address or nil pointer dereference";
+
 const gpu_seed =
     "0, NVIDIA RTX 4090, 55, 2048, 24576, 61, 320.50\n" ++
     "1, NVIDIA A100, 0, 100, 40960, 40, 55.00\n";
@@ -804,6 +824,26 @@ test "fuzz: relay bundle scanner survives a mutated incident file" {
     var p = prng();
     const rnd = p.random();
     for (0..iterations) |_| relayTarget(mutate(rnd, relay_seed, &buf));
+}
+
+test "seed valid: relay log batch" {
+    // Prove the seed builds a decodable /v1/logs payload before mutating it, and
+    // that buildOtlpLogs really emits the service.name + log.iostream + body.
+    const recs = [_]relay.LogRecord{
+        .{ .name = "api", .line = "listening on :8080", .iostream = 0, .severity = 0, .t_ns = 1 },
+        .{ .name = "worker", .line = "panic: boom", .iostream = 1, .severity = 2, .t_ns = 2 },
+    };
+    const body = try relay.buildOtlpLogs(&recs, "node", "id");
+    try std.testing.expect(protoWalk(body, 0));
+    try std.testing.expect(std.mem.indexOf(u8, body, "service.name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "log.iostream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "panic: boom") != null);
+}
+
+test "fuzz: relay log encoder survives mutated log lines" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |_| logsTarget(mutate(rnd, logs_seed, &buf));
 }
 
 test "seed valid: gpu csv" {

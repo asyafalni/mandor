@@ -983,6 +983,121 @@ pub fn buildOtlpEvent(e: frame.Lifecycle) error{TooLarge}![]const u8 {
     return body_buf[0..w.pos];
 }
 
+// ------------------------------------------------------- OTLP streamed logs
+//
+// Opt-in full worker-log streaming (P3). Each batched log line becomes ONE
+// LogRecord, same nesting/encoding as buildOtlp/buildOtlpEvent: resource
+// {service.name=<worker>, host.name, host.id, os.type} (the SAME identity as the
+// worker's process.* metrics and the node's host metrics, so photon lines a
+// worker's logs up with its metrics), scope_logs{log_records[one]} with body =
+// the line text, severity from the frame's tier, and attribute log.iostream.
+// One resource_logs entry per record: correct, and cheap enough at the bounded
+// batch sizes here (see the arena/cap in drainPipe). Reuses the Writer and the
+// putKeyValue/putAnyValue helpers verbatim — no new log_record layout.
+
+/// One batched log line, resolved to slices that outlive the sizing/write passes
+/// (drainPipe copies name+line into log_arena; the fuzz/unit tests pass literals).
+pub const LogRecord = struct {
+    name: []const u8, // worker name → service.name
+    line: []const u8, // captured line bytes → body
+    iostream: u8, // 0 = stdout, 1 = stderr
+    severity: u8, // 0 = info, 1 = warn, 2 = error (frame tier)
+    t_ns: u64,
+};
+
+/// Frame severity tier (0/1/2) → OTLP severity_number + text. Anything outside
+/// 0..2 (a corrupt frame byte) maps to INFO rather than trapping.
+fn logSeverity(sev: u8) struct { num: u64, text: []const u8 } {
+    return switch (sev) {
+        1 => .{ .num = sev_warn, .text = "WARN" },
+        2 => .{ .num = sev_error, .text = "ERROR" },
+        else => .{ .num = sev_info, .text = "INFO" },
+    };
+}
+
+fn ioStreamName(io: u8) []const u8 {
+    return if (io == 1) "stderr" else "stdout";
+}
+
+/// Bytes of the resource_logs entry for one record (one resource per record).
+fn logRlLen(r: LogRecord, host_name: []const u8, host_id: []const u8) usize {
+    const sev = logSeverity(r.severity);
+    const rec_len =
+        9 + // time_unix_nano (fixed64, field 1)
+        9 + // observed_time_unix_nano (fixed64, field 11)
+        (1 + varintLen(sev.num)) + // severity_number (field 2)
+        delimLen(sev.text.len) + // severity_text (field 3)
+        delimLen(anyValueLen(r.line)) + // body (field 5)
+        delimLen(keyValueLen("log.iostream", ioStreamName(r.iostream))); // attributes (field 6)
+    const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
+    const resource_len =
+        delimLen(keyValueLen("service.name", r.name)) +
+        delimLen(keyValueLen("host.name", host_name)) +
+        delimLen(keyValueLen("host.id", host_id)) +
+        delimLen(keyValueLen("os.type", "linux"));
+    const rl_len = delimLen(resource_len) + delimLen(scope_len);
+    return delimLen(rl_len); // ExportLogsServiceRequest.resource_logs
+}
+
+/// Encode a batch of streamed log lines as one OTLP ExportLogsServiceRequest,
+/// one resource_logs per record. Same two-pass sizing discipline as the metric
+/// encoders: size innermost-first, and — because this is the lossy ephemeral
+/// tier — if the whole batch will not fit body_buf, encode as many records as
+/// fit and DROP the rest (counting them in `log_drops`) rather than refusing the
+/// batch. Only a first record too large to fit alone yields error.TooLarge (the
+/// caller then drops the batch). The frame decoder caps a line at 4095 bytes and
+/// drainPipe's arena caps the batch, so in practice the whole batch always fits.
+pub fn buildOtlpLogs(records: []const LogRecord, host_name: []const u8, host_id: []const u8) error{TooLarge}![]const u8 {
+    // Pass 1: how many records fit, sizes innermost-first.
+    var total: usize = 0;
+    var nfit: usize = 0;
+    for (records) |r| {
+        const rl = logRlLen(r, host_name, host_id);
+        if (total + rl > body_buf.len) break;
+        total += rl;
+        nfit += 1;
+    }
+    if (nfit == 0) return error.TooLarge; // not even one record fits
+    if (nfit < records.len) log_drops +|= records.len - nfit; // ephemeral: drop the tail
+
+    // Pass 2: write.
+    var w = Writer{ .buf = &body_buf };
+    for (records[0..nfit]) |r| {
+        const sev = logSeverity(r.severity);
+        const rec_len =
+            9 +
+            9 +
+            (1 + varintLen(sev.num)) +
+            delimLen(sev.text.len) +
+            delimLen(anyValueLen(r.line)) +
+            delimLen(keyValueLen("log.iostream", ioStreamName(r.iostream)));
+        const scope_len = delimLen(rec_len);
+        const resource_len =
+            delimLen(keyValueLen("service.name", r.name)) +
+            delimLen(keyValueLen("host.name", host_name)) +
+            delimLen(keyValueLen("host.id", host_id)) +
+            delimLen(keyValueLen("os.type", "linux"));
+        const rl_len = delimLen(resource_len) + delimLen(scope_len);
+
+        w.delim(1, rl_len); // resource_logs
+        w.delim(1, resource_len); //   resource
+        putKeyValue(&w, 1, "service.name", r.name); //     attributes
+        putKeyValue(&w, 1, "host.name", host_name); //     (SAME identity as the worker's metrics)
+        putKeyValue(&w, 1, "host.id", host_id);
+        putKeyValue(&w, 1, "os.type", "linux");
+        w.delim(2, scope_len); //   scope_logs
+        w.delim(2, rec_len); //     log_records
+        w.fixed64(1, r.t_ns); //       time_unix_nano
+        w.fixed64(11, r.t_ns); //       observed_time_unix_nano
+        w.uint(2, sev.num); //       severity_number
+        w.string(3, sev.text); //       severity_text
+        putAnyValue(&w, 5, r.line); //       body
+        putKeyValue(&w, 6, "log.iostream", ioStreamName(r.iostream)); // attributes
+    }
+    std.debug.assert(w.pos == total); // sizing and writing must agree
+    return body_buf[0..w.pos];
+}
+
 /// True only for a genuine HTTP status line reporting 2xx.
 ///
 /// The `HTTP/` prefix check is the point: without it, any reply at least 12
@@ -1204,10 +1319,64 @@ const metric_batch_cap = 64;
 var metric_samples: [metric_batch_cap]frame.MetricSample = undefined;
 var metric_names: [metric_batch_cap][ship_name_cap]u8 = undefined;
 
-/// Streamed log frames seen on the pipe. THIS task only drains + counts them so
-/// the wire stream stays in sync; Task 11 replaces this arm with an OTLP
-/// `/v1/logs` batch ship. Written-only for now (a diagnostic hook for Task 11).
+// Streamed-log batch (P3, opt-in) — bounded, daemon-local, zero-alloc. Each
+// drain cycle accumulates the cycle's log lines here and ships them in ONE
+// /v1/logs POST after the loop (same one-cycle lifetime as the metric batch, so
+// no cross-call state or flush timer). This is the LOSSY ephemeral tier: names
+// and lines are copied into a fixed arena as they are drained (a decoded frame's
+// slices point into pipe_buf/scratch, both reused on the next decode), and when
+// the record cap OR the arena is exhausted the line is DROPPED with a counter —
+// never spooled, never blocking. Sizing: 128 records × up to ~4KB lines would
+// overflow the arena, so the 64KB arena is the real bound and body_buf (320KB)
+// always fits a full batch.
+const max_log_batch = 128;
+var log_arena: [64 * 1024]u8 = undefined;
+var log_arena_used: usize = 0;
+var log_records: [max_log_batch]LogRecord = undefined;
+var n_logs: usize = 0;
+
+/// Streamed log frames seen on the pipe (diagnostic). Every decoded log frame
+/// bumps this; the subset that could not be batched bumps `log_drops` too.
 var log_frames_seen: u64 = 0;
+
+/// Streamed log lines dropped on the floor: batch full / arena full during
+/// drain, or the encoder's body_buf overflow tail. Ephemeral tier — dropping is
+/// correct, and this counter is the only trace they left.
+var log_drops: u64 = 0;
+
+/// Clear the log batch for a new drain cycle. Zeroes the record count and the
+/// arena high-water mark; the backing storage is reused (no free, no alloc).
+fn resetLogBatch() void {
+    n_logs = 0;
+    log_arena_used = 0;
+}
+
+/// Append one decoded log line to the current batch, copying its name+line into
+/// the arena (the frame's slices borrow buffers reused on the next decode). The
+/// two bounds — the record cap and the arena capacity — are the batch's ONLY
+/// backstop against unbounded growth: if either would be exceeded the line is
+/// refused (returns false) and the arena is left untouched, so the caller drops
+/// it. Dropping these checks lets the @memcpy below run off the end of the fixed
+/// buffers — a safe-mode trap — which is exactly what the batch-bound tests pin.
+fn batchLog(l: frame.LogLine) bool {
+    if (n_logs >= max_log_batch) return false;
+    const need = l.name.len + l.line.len;
+    if (log_arena_used + need > log_arena.len) return false;
+    const name_off = log_arena_used;
+    @memcpy(log_arena[name_off..][0..l.name.len], l.name);
+    const line_off = name_off + l.name.len;
+    @memcpy(log_arena[line_off..][0..l.line.len], l.line);
+    log_arena_used = line_off + l.line.len;
+    log_records[n_logs] = .{
+        .name = log_arena[name_off..][0..l.name.len],
+        .line = log_arena[line_off..][0..l.line.len],
+        .iostream = l.iostream,
+        .severity = l.severity,
+        .t_ns = l.t_unix_ns,
+    };
+    n_logs += 1;
+    return true;
+}
 
 // Host identity for the `system.*` resource, read ONCE at daemon start (it does
 // not change for the daemon's life) into these fixed buffers; the node-sample
@@ -1242,6 +1411,7 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
     }
 
     var n_samples: usize = 0;
+    resetLogBatch(); // one cycle's log lines only
     var scratch: [256]u8 = undefined;
     var off: usize = 0;
     while (true) {
@@ -1262,12 +1432,12 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
                     // too large to encode → drop (routine telemetry is ephemeral)
                 }
             },
-            .log_line => {
-                // Task 11 batches these into an OTLP /v1/logs POST. For now we
-                // only count and drop: the frame is fully consumed (off advances
-                // by d.used below) so the stream never desyncs, and streamed logs
-                // are the lossy tier anyway (nothing durable is lost).
+            .log_line => |l| {
+                // Accumulate into the batch shipped after the loop (mirrors the
+                // metric path). Streamed logs are the lossy tier: a full batch or
+                // arena drops the line with a counter, never blocking or spooling.
                 log_frames_seen +|= 1;
+                if (!batchLog(l)) log_drops +|= 1;
             },
         }
         off += d.used;
@@ -1290,6 +1460,16 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
             _ = post(host, port, "/v1/metrics", b, token);
         } else |_| {
             // batch too large → drop
+        }
+    }
+
+    // Streamed logs (opt-in): one /v1/logs POST for the whole cycle's batch.
+    // Ephemeral — an encode or send failure drops the batch (no retry, no spool).
+    if (n_logs > 0) {
+        if (buildOtlpLogs(log_records[0..n_logs], daemon_host_name, daemon_host_id)) |b| {
+            _ = post(host, port, "/v1/logs", b, token);
+        } else |_| {
+            // whole batch too large to encode → drop (ephemeral tier)
         }
     }
     return eof;
@@ -1326,10 +1506,11 @@ pub fn runDaemon(
     logs_stream: bool,
     environ: [:null]const ?[*:0]const u8,
 ) u8 {
-    // Task 11 gates log-frame shipping on this. This task's daemon only DRAINS
-    // and counts log frames (drainPipe), so the flag is threaded through but not
-    // yet acted on — streaming stays off unless the supervisor emits log frames,
-    // which it only does when the operator set `[logs] stream`.
+    // Log-line frames are drained, batched, and shipped to /v1/logs by drainPipe.
+    // The operator's `[logs] stream` toggle is the real gate: the SUPERVISOR only
+    // writes log frames when it is on, so with it off no frames reach the pipe and
+    // the batch stays empty (nothing ships). The flag is threaded through for
+    // symmetry and future daemon-side use; the gate lives at the frame source.
     _ = logs_stream;
     // Resolve once up front; re-resolved on a send failure below because photon
     // may restart with a new IP under compose. A literal IP short-circuits with
@@ -1750,6 +1931,131 @@ test "buildOtlpMetrics rejects a batch too large for body_buf" {
     }.arr;
     for (many) |*s| s.* = .{ .name = "api", .rss_kb = 1, .cpu_pct = 1, .fds = 1, .threads = 1, .restarts = 1, .t_unix_ns = 1 };
     try testing.expectError(error.TooLarge, buildOtlpMetrics(many, "host"));
+}
+
+test "buildOtlpLogs emits one OTLP LogRecord per line photon can walk" {
+    // photon decodes protobuf only; walk the payload the way its mapping layer
+    // does so a wrong field number / wire type / severity fails here, not at
+    // ingest. One resource_logs entry per record (field 1, repeated).
+    const recs = [_]LogRecord{
+        .{ .name = "api", .line = "listening on :8080", .iostream = 0, .severity = 0, .t_ns = 1_700_000_000_000_000_000 },
+        .{ .name = "worker", .line = "panic: nil map write", .iostream = 1, .severity = 2, .t_ns = 1_700_000_000_000_000_111 },
+        .{ .name = "cron", .line = "slow tick", .iostream = 1, .severity = 1, .t_ns = 1_700_000_000_000_000_222 },
+    };
+    const body = try buildOtlpLogs(&recs, "node-1", "abc123");
+
+    var it = Fields{ .b = body };
+    var idx: usize = 0;
+    while (it.next()) |f| {
+        if (f.num != 1) continue; // resource_logs (repeated, one per record)
+        const rl = f.bytes;
+        const res = Fields.get(rl, 1).?.bytes; // resource
+        // Resource attrs in order: service.name, host.name, host.id, os.type —
+        // the SAME host identity the worker's process metrics carry.
+        var ra = Fields{ .b = res };
+        const a_svc = ra.next().?.bytes;
+        const a_hn = ra.next().?.bytes;
+        const a_hid = ra.next().?.bytes;
+        const a_os = ra.next().?.bytes;
+        try testing.expectEqualStrings("service.name", Fields.get(a_svc, 1).?.bytes);
+        try testing.expectEqualStrings(recs[idx].name, avStr(Fields.get(a_svc, 2).?.bytes));
+        try testing.expectEqualStrings("host.name", Fields.get(a_hn, 1).?.bytes);
+        try testing.expectEqualStrings("node-1", avStr(Fields.get(a_hn, 2).?.bytes));
+        try testing.expectEqualStrings("host.id", Fields.get(a_hid, 1).?.bytes);
+        try testing.expectEqualStrings("abc123", avStr(Fields.get(a_hid, 2).?.bytes));
+        try testing.expectEqualStrings("os.type", Fields.get(a_os, 1).?.bytes);
+        try testing.expectEqualStrings("linux", avStr(Fields.get(a_os, 2).?.bytes));
+
+        const sl = Fields.get(rl, 2).?.bytes; // scope_logs
+        const rec = Fields.get(sl, 2).?.bytes; // log_records
+        // time_unix_nano + observed_time_unix_nano are fixed64, both = t_ns.
+        try testing.expectEqual(@as(u8, 1), Fields.get(rec, 1).?.wire);
+        try testing.expectEqual(recs[idx].t_ns, Fields.get(rec, 1).?.int);
+        try testing.expectEqual(recs[idx].t_ns, Fields.get(rec, 11).?.int);
+        // body = the raw line text.
+        try testing.expectEqualStrings(recs[idx].line, avStr(Fields.get(rec, 5).?.bytes));
+        // attribute log.iostream = stdout|stderr.
+        const kv = Fields.get(rec, 6).?.bytes;
+        try testing.expectEqualStrings("log.iostream", Fields.get(kv, 1).?.bytes);
+        const want_stream: []const u8 = if (recs[idx].iostream == 1) "stderr" else "stdout";
+        try testing.expectEqualStrings(want_stream, avStr(Fields.get(kv, 2).?.bytes));
+        // severity_number + severity_text per frame tier (0→INFO/9, 1→WARN/13, 2→ERROR/17).
+        var want_num: u64 = sev_info;
+        var want_text: []const u8 = "INFO";
+        if (recs[idx].severity == 1) {
+            want_num = sev_warn;
+            want_text = "WARN";
+        }
+        if (recs[idx].severity == 2) {
+            want_num = sev_error;
+            want_text = "ERROR";
+        }
+        try testing.expectEqual(want_num, Fields.get(rec, 2).?.int);
+        try testing.expectEqualStrings(want_text, Fields.get(rec, 3).?.bytes);
+        idx += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), idx); // all three records present
+}
+
+test "buildOtlpLogs encodes the fitting prefix and counts the overflow drops" {
+    // Lines large enough that the whole set overflows body_buf: the ephemeral
+    // encoder must ship the prefix that fits and drop the rest with a counter,
+    // never trap and never refuse the whole batch.
+    const big = &struct {
+        var b: [5000]u8 = undefined;
+    }.b;
+    @memset(big, 'x');
+    var recs: [200]LogRecord = undefined;
+    for (&recs) |*r| r.* = .{ .name = "svc", .line = big, .iostream = 0, .severity = 0, .t_ns = 1 };
+    log_drops = 0;
+    const body = try buildOtlpLogs(&recs, "node", "id");
+    try testing.expect(body.len > 0 and body.len <= body_buf.len);
+    try testing.expect(log_drops > 0); // the tail that did not fit was dropped
+    // The encoded prefix is still a decodable protobuf.
+    const rl = Fields.get(body, 1).?.bytes;
+    const sl = Fields.get(rl, 2).?.bytes;
+    const rec = Fields.get(sl, 2).?.bytes;
+    try testing.expectEqualStrings(big, avStr(Fields.get(rec, 5).?.bytes));
+}
+
+test "log batch stops at the record cap" {
+    // Tiny lines so the RECORD cap (not the arena) is the binding bound. An
+    // off-by-one on the cap would write past log_records[] (a safe-mode trap);
+    // dropping the check would over-count. Exactly max_log_batch must be taken.
+    resetLogBatch();
+    var added: usize = 0;
+    var i: usize = 0;
+    while (i < max_log_batch + 8) : (i += 1) {
+        if (batchLog(.{ .name = "a", .iostream = 0, .severity = 0, .t_unix_ns = 1, .line = "hi" }))
+            added += 1;
+    }
+    try testing.expectEqual(@as(usize, max_log_batch), added);
+    try testing.expectEqual(@as(usize, max_log_batch), n_logs);
+}
+
+test "log batch refuses lines once the arena is full" {
+    // Big lines so the ARENA (not the record cap) is the binding bound. Dropping
+    // the "arena can't fit → refuse" check lets batchLog's @memcpy run off
+    // log_arena — a safe-mode trap — so this test pins that bound. The accepted
+    // prefix must still encode cleanly, proving the arena copies are intact.
+    resetLogBatch();
+    const big = "y" ** 4000;
+    var added: usize = 0;
+    var refused = false;
+    var i: usize = 0;
+    while (i < max_log_batch) : (i += 1) {
+        if (batchLog(.{ .name = "svc", .iostream = 0, .severity = 0, .t_unix_ns = 1, .line = big })) {
+            added += 1;
+        } else {
+            refused = true;
+            break;
+        }
+    }
+    try testing.expect(refused); // hit the arena bound before the record cap
+    try testing.expect(added > 0 and added < max_log_batch);
+    try testing.expect(log_arena_used <= log_arena.len); // never overran the arena
+    const body = try buildOtlpLogs(log_records[0..n_logs], "node", "id");
+    try testing.expect(body.len > 0);
 }
 
 test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can walk" {
