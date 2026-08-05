@@ -103,7 +103,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 (std.fmt.parseInt(u64, std.mem.span(vec[7]), 10) catch 15_000)
             else
                 15_000;
-            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_enabled, gpu_interval_ms, init.environ.block.slice);
+            // Log-streaming toggle appended after GPU: vec[8]="0"|"1". Absent
+            // (an older spawn) -> streaming off. Task 11 uses it to ship logs.
+            const logs_stream = vec.len >= 9 and std.mem.eql(u8, std.mem.span(vec[8]), "1");
+            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_enabled, gpu_interval_ms, logs_stream, init.environ.block.slice);
         }
         const endpoint: ?[]const u8 = if (vec.len >= 4) std.mem.span(vec[3]) else null;
         return @import("relay.zig").run(vec[2], endpoint, init.environ.block.slice);
@@ -190,6 +193,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (cfg.photon == null) cfg.photon = file_cfg.photon;
             if (file_cfg.gpu_enabled) |v| cfg.gpu.enabled = v;
             if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
+            if (file_cfg.logs_stream) |v| cfg.logs.stream = v;
             if (cfg.psi_mem_pct == 0) {
                 if (file_cfg.psi_mem_pct) |v| cfg.psi_mem_pct = v;
             }

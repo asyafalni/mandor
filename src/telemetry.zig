@@ -54,6 +54,7 @@ pub fn spawnDaemon(
     state_dir: []const u8,
     gpu_enabled: bool,
     gpu_interval_ms: u64,
+    logs_stream: bool,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
 ) void {
@@ -69,6 +70,7 @@ pub fn spawnDaemon(
     var sd_buf: [512]u8 = undefined;
     var gpu_buf: [2]u8 = undefined;
     var gi_buf: [24]u8 = undefined;
+    var ls_buf: [2]u8 = undefined;
     const fd_str = std.fmt.bufPrintZ(&fd_buf, "{d}", .{read_fd}) catch {
         _ = linux.close(read_fd);
         _ = linux.close(write_end);
@@ -95,8 +97,15 @@ pub fn spawnDaemon(
         _ = linux.close(write_end);
         return;
     };
+    // Log-streaming toggle as one trailing argv string ("0"|"1"), so Task 11's
+    // daemon knows whether to ship the log frames it drains.
+    const ls_str = std.fmt.bufPrintZ(&ls_buf, "{d}", .{@intFromBool(logs_stream)}) catch {
+        _ = linux.close(read_fd);
+        _ = linux.close(write_end);
+        return;
+    };
 
-    // `mandor relay --daemon <endpoint> <state_dir> <read_fd> <gpu> <interval>` —
+    // `mandor relay --daemon <endpoint> <state_dir> <read_fd> <gpu> <interval> <logs>` —
     // main.zig routes it. The string buffers live on this stack frame;
     // spawnDetached forks and the child execs from its copy before this function
     // returns, so they are valid for the exec.
@@ -109,6 +118,7 @@ pub fn spawnDaemon(
         @ptrCast(fd_str.ptr),
         @ptrCast(gpu_str.ptr),
         @ptrCast(gi_str.ptr),
+        @ptrCast(ls_str.ptr),
     };
     const pid = spawner.spawnDetached(&argv, envp, path_env, read_fd);
     // The read end belongs to the daemon now; the core keeps only the write end.
@@ -138,7 +148,7 @@ pub fn emitMetric(s: frame.MetricSample) void {
     if (write_fd < 0) return;
     var buf: [128]u8 = undefined;
     const bytes = frame.encodeMetric(&buf, s) catch return; // name too long → drop
-    writeFrame(bytes);
+    _ = writeFrame(bytes);
 }
 
 /// Emit one lifecycle event (drops silently if no daemon or the pipe is full).
@@ -146,25 +156,69 @@ pub fn emitLifecycle(e: frame.Lifecycle) void {
     if (write_fd < 0) return;
     var buf: [128]u8 = undefined;
     const bytes = frame.encodeLifecycle(&buf, e) catch return;
-    writeFrame(bytes);
+    _ = writeFrame(bytes);
+}
+
+/// Largest streamed-log frame we build. Held at PIPE_BUF (4096) so a single
+/// non-blocking pipe write is atomic (all-or-nothing): the write either lands
+/// the whole frame or writes nothing (EAGAIN), so a partial write can never
+/// desync the daemon's length-prefixed stream. A line whose frame would exceed
+/// this is refused by encodeLog and dropped (counted) — Task 12 adds a
+/// configurable line cap; near-max lines are rare and the stream tier is lossy.
+const max_log_frame = 4096;
+
+/// Streamed log lines dropped: pipe full, daemon gone, or a frame too large for
+/// one atomic pipe write. Streamed logs are the lossy tier — a drop here never
+/// touches supervision or the durable incident spool. Saturating so it cannot
+/// wrap-trap under a sustained log storm.
+var log_drops: u64 = 0;
+
+/// Number of streamed log lines dropped so far (for tests / diagnostics).
+pub fn logDrops() u64 {
+    return log_drops;
+}
+
+/// Emit one streamed worker-log line (opt-in `[logs] stream`). No-op if no
+/// daemon; drops (and counts) if the pipe is full, the daemon is gone, or the
+/// frame will not fit one atomic write. Same non-blocking / zero-alloc / never-
+/// trap contract as emitMetric/emitLifecycle — the supervision loop outranks
+/// telemetry. `iostream`: 0 stdout / 1 stderr. `severity`: 0 info / 1 warn / 2
+/// error (see capture.severityFromFlags).
+pub fn emitLog(name: []const u8, iostream: u8, severity: u8, t_ns: u64, line: []const u8) void {
+    if (write_fd < 0) return;
+    var buf: [max_log_frame]u8 = undefined;
+    const bytes = frame.encodeLog(&buf, .{
+        .name = name,
+        .iostream = iostream,
+        .severity = severity,
+        .t_unix_ns = t_ns,
+        .line = line,
+    }) catch {
+        log_drops +|= 1; // name/line too large for one atomic pipe write → drop
+        return;
+    };
+    if (!writeFrame(bytes)) log_drops +|= 1; // pipe full / daemon gone → drop
 }
 
 /// One non-blocking write; drop on anything but a full success. Never blocks,
 /// never retries — the supervision loop outranks telemetry. Frames are far
 /// below PIPE_BUF (4096), so a pipe write is atomic: it either writes the whole
 /// frame or, with O_NONBLOCK on a full pipe, writes nothing and returns EAGAIN.
-/// No partial frame can therefore desync the daemon's stream.
-fn writeFrame(bytes: []const u8) void {
+/// No partial frame can therefore desync the daemon's stream. Returns true iff
+/// the whole frame was written; false on any drop (pipe full, daemon gone,
+/// error) so a caller can count the drop.
+fn writeFrame(bytes: []const u8) bool {
     const rc = linux.write(write_fd, bytes.ptr, bytes.len);
     switch (posix.errno(rc)) {
-        .SUCCESS => {}, // whole frame written (atomic below PIPE_BUF)
+        .SUCCESS => return true, // whole frame written (atomic at/below PIPE_BUF)
         .PIPE => {
             // Daemon gone: stop trying so we neither spin nor keep tripping the
             // (blocked) SIGPIPE. Incidents still reach the spool regardless.
             _ = linux.close(write_fd);
             write_fd = -1;
+            return false;
         },
-        else => {}, // EAGAIN (pipe full) / EINTR / other → drop this record
+        else => return false, // EAGAIN (pipe full) / EINTR / other → drop this record
     }
 }
 
@@ -196,4 +250,34 @@ pub fn shutdown(budget_ms: u64) void {
         _ = linux.nanosleep(&ts, &ts);
         waited += step;
     }
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test "emitLog drops and counts an over-large line, ships a normal one" {
+    // emitLog does a real pipe write, so this is Linux-only.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var fds: [2]i32 = undefined;
+    if (posix.errno(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true })) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const saved_fd = write_fd;
+    const saved_drops = log_drops;
+    defer write_fd = saved_fd; // LIFO: restore before the fds close
+    write_fd = fds[1];
+
+    // A line past the frame's line cap cannot be encoded → dropped + counted.
+    var big: [5000]u8 = undefined;
+    @memset(&big, 'x');
+    emitLog("api", 0, 0, 1, &big);
+    try testing.expectEqual(saved_drops + 1, log_drops);
+
+    // A normal line fits and the (empty) pipe has room → written, no new drop.
+    emitLog("api", 1, 2, 1, "boom");
+    try testing.expectEqual(saved_drops + 1, log_drops);
 }

@@ -332,8 +332,12 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // path never does), watches the spool for incidents, and drains the
         // telemetry pipe for metrics/lifecycle events. Best-effort — if the
         // spawn fails, telemetry is simply off and supervision is unaffected.
-        telemetry.spawnDaemon(endpoint, state_dir, cfg.gpu.enabled, cfg.gpu.interval_ms, envp, path_env);
+        telemetry.spawnDaemon(endpoint, state_dir, cfg.gpu.enabled, cfg.gpu.interval_ms, cfg.logs.stream, envp, path_env);
         logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
+        // Opt-in full log streaming: only arm the per-line enqueue when the
+        // operator set `[logs] stream` AND photon is configured (so a daemon
+        // exists to drain it). Default off ⇒ the capture path stays untouched.
+        stream_logs = cfg.logs.stream;
     }
 
     var waiting: [cli.max_workers]bool = .{false} ** cli.max_workers;
@@ -1268,6 +1272,11 @@ fn stopWorkers(
 
 const EchoCtx = struct { w: *spawner.Worker, err: bool, t_ms: u64 = 0 };
 
+/// Armed once at startup when `[logs] stream` is set (and photon is on). Default
+/// false ⇒ the gated enqueue in echoLine is never taken, so opt-in log streaming
+/// costs the capture path nothing unless explicitly enabled.
+var stream_logs: bool = false;
+
 /// Ring-record the line and echo it, `[name] `-prefixed, to our own
 /// stdout/stderr in a single write (atomic below PIPE_BUF).
 var tty_out = false;
@@ -1298,6 +1307,18 @@ fn flushEcho(ctx: *EchoCtx) void {
 
 fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     _ = ctx.w.log.push(text, flags, ctx.t_ms);
+    // Opt-in full log streaming (default off ⇒ this branch is never taken, so
+    // the capture path pays nothing). Non-blocking, drop-on-full, zero-alloc:
+    // a slow/absent photon or a log storm drops lines (counted in telemetry),
+    // never stalls capture or supervision. iostream 0=stdout/1=stderr; severity
+    // from the line's error/warn flag. The ring push + echo below are untouched.
+    if (stream_logs) telemetry.emitLog(
+        ctx.w.nameSlice(),
+        @intFromBool(ctx.err),
+        capture.severityFromFlags(flags),
+        telemetry.nowNs(),
+        text,
+    );
     const name = ctx.w.nameSlice();
     const max_needed = text.len + spawner.name_cap + 24;
     if (echo_used + max_needed > echo_scratch.len or echo_iov_n == echo_iov.len)

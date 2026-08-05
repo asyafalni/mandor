@@ -1204,6 +1204,11 @@ const metric_batch_cap = 64;
 var metric_samples: [metric_batch_cap]frame.MetricSample = undefined;
 var metric_names: [metric_batch_cap][ship_name_cap]u8 = undefined;
 
+/// Streamed log frames seen on the pipe. THIS task only drains + counts them so
+/// the wire stream stays in sync; Task 11 replaces this arm with an OTLP
+/// `/v1/logs` batch ship. Written-only for now (a diagnostic hook for Task 11).
+var log_frames_seen: u64 = 0;
+
 // Host identity for the `system.*` resource, read ONCE at daemon start (it does
 // not change for the daemon's life) into these fixed buffers; the node-sample
 // ship path (runDaemon) and the per-worker metric batch (drainPipe, host.name)
@@ -1256,6 +1261,13 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
                 } else |_| {
                     // too large to encode → drop (routine telemetry is ephemeral)
                 }
+            },
+            .log_line => {
+                // Task 11 batches these into an OTLP /v1/logs POST. For now we
+                // only count and drop: the frame is fully consumed (off advances
+                // by d.used below) so the stream never desyncs, and streamed logs
+                // are the lossy tier anyway (nothing durable is lost).
+                log_frames_seen +|= 1;
             },
         }
         off += d.used;
@@ -1311,8 +1323,14 @@ pub fn runDaemon(
     pipe_fd: i32,
     gpu_enabled: bool,
     gpu_interval_ms: u64,
+    logs_stream: bool,
     environ: [:null]const ?[*:0]const u8,
 ) u8 {
+    // Task 11 gates log-frame shipping on this. This task's daemon only DRAINS
+    // and counts log frames (drainPipe), so the flag is threaded through but not
+    // yet acted on — streaming stays off unless the supervisor emits log frames,
+    // which it only does when the operator set `[logs] stream`.
+    _ = logs_stream;
     // Resolve once up front; re-resolved on a send failure below because photon
     // may restart with a new IP under compose. A literal IP short-circuits with
     // no network (resolve.zig), so re-resolving is free in that case.

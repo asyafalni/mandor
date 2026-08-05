@@ -1,7 +1,7 @@
 //! The compact pipe wire format shared by the supervisor core (writer) and the
 //! relay daemon (reader). Pure — NO syscalls, no allocation, no panic. One
-//! responsibility: framing mandor's internal telemetry records (metric samples
-//! and lifecycle events) into bytes and back.
+//! responsibility: framing mandor's internal telemetry records (metric samples,
+//! lifecycle events, and opt-in streamed log lines) into bytes and back.
 //!
 //! This is mandor's own form, NOT OTLP: the daemon re-encodes these into OTLP
 //! protobuf before shipping. Keeping the pipe format tiny and fixed keeps the
@@ -13,7 +13,7 @@
 
 const std = @import("std");
 
-pub const Kind = enum(u8) { metric_sample = 1, lifecycle_event = 2 };
+pub const Kind = enum(u8) { metric_sample = 1, lifecycle_event = 2, log_line = 3 };
 
 /// Compact fixed payload — mandor's internal form, NOT OTLP. `name` is a slice
 /// into caller-owned memory at encode time; `decode` copies it into caller
@@ -39,15 +39,32 @@ pub const Lifecycle = struct {
     t_unix_ns: u64,
 };
 
-pub const Decoded = union(Kind) { metric_sample: MetricSample, lifecycle_event: Lifecycle };
+/// Opt-in full worker-log streaming (default off). Carries the worker name
+/// (for service.name), which stream it came from, a severity tier, a timestamp,
+/// and the line bytes. `name` is copied into caller scratch by `decode`; `line`
+/// borrows the decode input buffer (see `decode`).
+pub const LogLine = struct {
+    name: []const u8, // worker name (<= name_cap)
+    iostream: u8, // 0 = stdout, 1 = stderr
+    severity: u8, // 0 = info, 1 = warn, 2 = error
+    t_unix_ns: u64,
+    line: []const u8, // captured line bytes (<= line_cap)
+};
+
+pub const Decoded = union(Kind) { metric_sample: MetricSample, lifecycle_event: Lifecycle, log_line: LogLine };
 
 /// Fixed bytes after the name in each payload. Kept as named constants so the
 /// encoder's sizing and the decoder's bounds check cannot drift apart.
 const metric_fixed = 8 + 2 + 2 + 2 + 4 + 8; // rss,cpu,fds,threads,restarts,t_ns
 const lifecycle_fixed = 1 + 4 + 4 + 4 + 8; // ev,code,backoff,restarts,t_ns
+const logline_fixed = 1 + 1 + 8; // iostream,severity,t_ns (the line adds a u16 len + bytes)
 
 const header = 3; // [u8 kind][u16 len]
 const name_cap = 255; // one length byte
+/// Mirrors capture.max_line (4095). Kept local so frame.zig stays a pure,
+/// dependency-free module (like config.zig mirroring spawner's caps). A longer
+/// line is refused by encodeLog; capture never produces one, so it cannot occur.
+const line_cap = 4095; // fits a u16 length field
 
 /// Encode one metric sample into `out`; returns the framed slice or
 /// `error.Overflow` if the name is over 255 bytes or the frame will not fit.
@@ -109,6 +126,39 @@ pub fn encodeLifecycle(out: []u8, e: Lifecycle) error{Overflow}![]const u8 {
     return out[0..total];
 }
 
+/// Encode one streamed log line into `out`; returns the framed slice or
+/// `error.Overflow` if the name is over 255 bytes, the line is over `line_cap`,
+/// or the frame will not fit `out`. Layout: name (len byte + bytes), iostream,
+/// severity, t_ns, then a u16 line length + the line bytes.
+pub fn encodeLog(out: []u8, l: LogLine) error{Overflow}![]const u8 {
+    if (l.name.len > name_cap) return error.Overflow;
+    if (l.line.len > line_cap) return error.Overflow;
+    const nl: u8 = @intCast(l.name.len);
+    const ll: u16 = @intCast(l.line.len);
+    const payload_len = 1 + @as(usize, nl) + logline_fixed + 2 + @as(usize, ll);
+    const total = header + payload_len;
+    if (total > out.len) return error.Overflow;
+
+    out[0] = @intFromEnum(Kind.log_line);
+    std.mem.writeInt(u16, out[1..][0..2], @intCast(payload_len), .little);
+    var p: usize = header;
+    out[p] = nl;
+    p += 1;
+    @memcpy(out[p..][0..nl], l.name);
+    p += nl;
+    out[p] = l.iostream;
+    p += 1;
+    out[p] = l.severity;
+    p += 1;
+    std.mem.writeInt(u64, out[p..][0..8], l.t_unix_ns, .little);
+    p += 8;
+    std.mem.writeInt(u16, out[p..][0..2], ll, .little);
+    p += 2;
+    @memcpy(out[p..][0..ll], l.line);
+    p += ll;
+    return out[0..total];
+}
+
 /// Decode one frame from the front of `buf`. Returns the record (with its name
 /// copied into `name_scratch`) and the number of bytes consumed, or `null` if
 /// `buf` holds less than one whole frame, the kind/event byte is unknown, the
@@ -125,6 +175,7 @@ pub fn decode(buf: []const u8, name_scratch: []u8) ?struct { rec: Decoded, used:
     const kind: Kind = switch (buf[0]) {
         @intFromEnum(Kind.metric_sample) => .metric_sample,
         @intFromEnum(Kind.lifecycle_event) => .lifecycle_event,
+        @intFromEnum(Kind.log_line) => .log_line,
         else => return null,
     };
 
@@ -189,6 +240,40 @@ pub fn decode(buf: []const u8, name_scratch: []u8) ?struct { rec: Decoded, used:
                 .t_unix_ns = t_ns,
             } }, .used = total };
         },
+        .log_line => {
+            // name_len(1) + name + iostream(1) + severity(1) + t_ns(8) + line_len(2)
+            if (payload.len < 1 + @as(usize, nl) + logline_fixed + 2) return null;
+            @memcpy(name_scratch[0..nl], payload[1..][0..nl]);
+            var p: usize = 1 + @as(usize, nl);
+            const iostream = payload[p];
+            p += 1;
+            const severity = payload[p];
+            p += 1;
+            const t_ns = std.mem.readInt(u64, payload[p..][0..8], .little);
+            p += 8;
+            const ll = std.mem.readInt(u16, payload[p..][0..2], .little);
+            p += 2;
+            // The declared line length must fit the remaining payload. Dropping
+            // this check would let the slice below run past the buffer end (a
+            // trap in safe modes) on a corrupt or truncated frame — instead we
+            // return null, exactly like the name/fixed-field checks above.
+            if (payload.len < p + @as(usize, ll)) return null;
+            return .{
+                .rec = .{
+                    .log_line = .{
+                        .name = name_scratch[0..nl],
+                        .iostream = iostream,
+                        .severity = severity,
+                        .t_unix_ns = t_ns,
+                        // Borrows `buf` (not name_scratch): a line can be up to 4095
+                        // bytes, far larger than the name scratch. The caller must
+                        // consume it before the input buffer is reused (drainPipe does).
+                        .line = payload[p..][0..ll],
+                    },
+                },
+                .used = total,
+            };
+        },
     }
 }
 
@@ -220,4 +305,56 @@ test "decode returns null on a partial frame" {
 test "encode refuses a name that would overflow the frame" {
     var out: [8]u8 = undefined; // deliberately tiny
     try testing.expectError(error.Overflow, encodeMetric(&out, .{ .name = "toolongforthisbuffer", .rss_kb = 0, .cpu_pct = 0, .fds = 0, .threads = 0, .restarts = 0, .t_unix_ns = 0 }));
+}
+
+test "log line survives encode -> decode" {
+    var out: [512]u8 = undefined;
+    const l = LogLine{ .name = "api", .iostream = 1, .severity = 2, .t_unix_ns = 1_700_000_000_123_456_789, .line = "panic: nil map write" };
+    const bytes = try encodeLog(&out, l);
+
+    var scratch: [256]u8 = undefined;
+    const d = decode(bytes, &scratch).?;
+    try testing.expectEqual(@as(usize, bytes.len), d.used);
+    const got = d.rec.log_line;
+    try testing.expectEqualStrings("api", got.name);
+    try testing.expectEqual(@as(u8, 1), got.iostream);
+    try testing.expectEqual(@as(u8, 2), got.severity);
+    try testing.expectEqual(l.t_unix_ns, got.t_unix_ns);
+    try testing.expectEqualStrings("panic: nil map write", got.line);
+}
+
+test "log line at max name and max line length round-trips" {
+    var out: [8192]u8 = undefined;
+    const name = "n" ** name_cap; // 255
+    const line = "x" ** line_cap; // 4095
+    const bytes = try encodeLog(&out, .{ .name = name, .iostream = 0, .severity = 0, .t_unix_ns = 42, .line = line });
+
+    var scratch: [256]u8 = undefined;
+    const d = decode(bytes, &scratch).?;
+    const got = d.rec.log_line;
+    try testing.expectEqual(@as(usize, name_cap), got.name.len);
+    try testing.expectEqual(@as(usize, line_cap), got.line.len);
+    try testing.expectEqualStrings(line, got.line);
+}
+
+test "decode returns null on a truncated log frame" {
+    var out: [512]u8 = undefined;
+    const bytes = try encodeLog(&out, .{ .name = "x", .iostream = 0, .severity = 0, .t_unix_ns = 1, .line = "hi" });
+    var scratch: [256]u8 = undefined;
+    try testing.expect(decode(bytes[0 .. bytes.len - 1], &scratch) == null);
+}
+
+test "decode rejects a log frame whose line length overruns its payload" {
+    // A whole frame (buf.len == total, so the outer length check passes) but
+    // with the internal line-length field inflated past the payload. The inner
+    // bounds check must catch it and return null — this is the mutation target.
+    var out: [512]u8 = undefined;
+    const bytes = try encodeLog(&out, .{ .name = "api", .iostream = 0, .severity = 0, .t_unix_ns = 1, .line = "hi" });
+    // The u16 line-length field is the last 2 bytes before the 2-byte line.
+    const ll_off = bytes.len - 2 - 2;
+    var corrupt: [512]u8 = undefined;
+    @memcpy(corrupt[0..bytes.len], bytes);
+    std.mem.writeInt(u16, corrupt[ll_off..][0..2], 9999, .little);
+    var scratch: [256]u8 = undefined;
+    try testing.expect(decode(corrupt[0..bytes.len], &scratch) == null);
 }

@@ -26,6 +26,8 @@ pub const FileConfig = struct {
     /// `[gpu]` section: null = key absent (caller keeps the cli.Config default).
     gpu_enabled: ?bool = null,
     gpu_interval_ms: ?u64 = null,
+    /// `[logs]` section: null = key absent (caller keeps the cli.Config default).
+    logs_stream: ?bool = null,
     psi_mem_pct: ?u16 = null,
     psi_cpu_pct: ?u16 = null,
     /// "dependent=dependency" worker-name pairs.
@@ -131,6 +133,7 @@ pub fn parse(
     var cur_worker: ?[]const u8 = null; // active [worker.NAME] section
     var cur_secret: ?usize = null; // active [secret.NAME] section (index)
     var cur_gpu = false; // active [gpu] section
+    var cur_logs = false; // active [logs] section
 
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw_line| {
@@ -162,16 +165,25 @@ pub fn parse(
                     cur_worker = nm;
                     cur_secret = null;
                     cur_gpu = false;
+                    cur_logs = false;
                 },
                 .secret => |nm| {
                     cur_worker = null;
                     cur_gpu = false;
+                    cur_logs = false;
                     cur_secret = try beginSecret(cfg, nm);
                 },
                 .gpu => {
                     cur_worker = null;
                     cur_secret = null;
                     cur_gpu = true;
+                    cur_logs = false;
+                },
+                .logs => {
+                    cur_worker = null;
+                    cur_secret = null;
+                    cur_gpu = false;
+                    cur_logs = true;
                 },
             }
             continue;
@@ -193,6 +205,11 @@ pub fn parse(
 
         if (cur_gpu) {
             try gpuSetting(cfg, key, value);
+            continue;
+        }
+
+        if (cur_logs) {
+            try logsSetting(cfg, key, value);
             continue;
         }
 
@@ -284,15 +301,16 @@ fn workerKey(key: []const u8) ?ArrayTarget {
     return null;
 }
 
-const Section = union(enum) { worker: []const u8, secret: []const u8, gpu };
+const Section = union(enum) { worker: []const u8, secret: []const u8, gpu, logs };
 
-/// `[worker.NAME]` / `[secret.NAME]` / `[gpu]` -> the section kind (+ NAME for
-/// the first two). Any other header is a hard error: configs are small, so a
-/// typo should stop startup rather than be silently ignored.
+/// `[worker.NAME]` / `[secret.NAME]` / `[gpu]` / `[logs]` -> the section kind
+/// (+ NAME for the first two). Any other header is a hard error: configs are
+/// small, so a typo should stop startup rather than be silently ignored.
 fn sectionHeader(line: []const u8) ParseError!Section {
     if (line[line.len - 1] != ']') return error.Syntax;
     const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
     if (std.mem.eql(u8, inner, "gpu")) return .gpu;
+    if (std.mem.eql(u8, inner, "logs")) return .logs;
     if (sectionName(inner, "worker.")) |nm| return .{ .worker = nm };
     if (sectionName(inner, "secret.")) |nm| return .{ .secret = nm };
     return error.Syntax;
@@ -313,6 +331,22 @@ fn gpuSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!v
         cfg.gpu_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
     } else {
         return error.Syntax; // unknown key inside a [gpu] section
+    }
+}
+
+/// Apply one `key = value` inside `[logs]`. `stream` is a bare bool. Unknown key
+/// -> hard Syntax error (a mistyped `max_rate` should stop startup, not be
+/// silently ignored; the rate cap is Task 12).
+fn logsSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!void {
+    if (std.mem.eql(u8, key, "stream")) {
+        cfg.logs_stream = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return error.BadValue;
+    } else {
+        return error.Syntax; // unknown key inside a [logs] section
     }
 }
 
@@ -916,6 +950,22 @@ test "gpu section: absent keys stay null; bad values and unknown key rejected" {
     try t.expectError(error.BadValue, parseTest("[gpu]\nenabled = yes", &storage));
     try t.expectError(error.BadValue, parseTest("[gpu]\ninterval = \"soon\"", &storage));
     try t.expectError(error.Syntax, parseTest("[gpu]\nbogus = \"x\"", &storage));
+}
+
+test "logs section: stream true/false and default-absent" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // stream = true
+    const on = try parseTest("[logs]\nstream = true", &storage);
+    try t.expectEqual(@as(?bool, true), on.logs_stream);
+    // stream = false is the explicit default
+    const off = try parseTest("[logs]\nstream = false", &storage);
+    try t.expectEqual(@as(?bool, false), off.logs_stream);
+    // No [logs] section at all -> null (caller keeps the cli.Config default).
+    const none = try parseTest("workers = [\"./a\"]", &storage);
+    try t.expectEqual(@as(?bool, null), none.logs_stream);
+    // Bad bool and unknown key inside [logs] are hard errors.
+    try t.expectError(error.BadValue, parseTest("[logs]\nstream = yes", &storage));
+    try t.expectError(error.Syntax, parseTest("[logs]\nbogus = \"x\"", &storage));
 }
 
 test "secret section: bare (non-derived) collision between two default envs" {

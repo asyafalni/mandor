@@ -36,6 +36,15 @@ pub const GpuConfig = struct {
     interval_ms: u64 = 15_000,
 };
 
+/// `[logs]` section (TOML-only). OFF by default — full worker-log streaming to
+/// photon is 100% opt-in and additionally requires `photon=` (so `photon=`
+/// alone still ships only the curated tier: incidents + metrics + lifecycle).
+/// When on, each captured line is shipped to photon as an OTLP log
+/// (best-effort, lossy — the ephemeral telemetry tier).
+pub const LogsConfig = struct {
+    stream: bool = false,
+};
+
 pub const Config = struct {
     mode: Mode = .supervise,
     backoff_max_ms: u64 = 30_000,
@@ -129,6 +138,8 @@ pub const Config = struct {
     secrets_n: usize = 0,
     /// `[gpu]` NVIDIA GPU sampling (TOML-only): off by default, daemon-side.
     gpu: GpuConfig = .{},
+    /// `[logs]` full worker-log streaming (TOML-only): off by default, opt-in.
+    logs: LogsConfig = .{},
 };
 
 /// "143,129" -> set the listed codes (on top of the always-clean 0).

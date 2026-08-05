@@ -95,6 +95,17 @@ pub const Assembler = struct {
     }
 };
 
+/// Map a captured line's ring flags to a streamed-log severity tier:
+/// 2 = error, 1 = warn, 0 = info. An error/warn-flagged line (flag_errorish)
+/// is an error; a bare stderr line is a warning; stdout is info. The
+/// continuation bit is irrelevant here — a split line keeps its base severity.
+/// Pure — used only when opt-in log streaming is on (default off).
+pub fn severityFromFlags(flags: u8) u8 {
+    if (flags & ring.flag_errorish != 0) return 2;
+    if (flags & ring.flag_stderr != 0) return 1;
+    return 0;
+}
+
 // ------------------------------------------------------- Linux plumbing
 
 const linux = std.os.linux;
@@ -186,6 +197,16 @@ test "oversized line splits with continuation flag" {
     try std.testing.expectEqual(@as(usize, 5000 - max_line), s.lens[1]);
     try std.testing.expectEqual(@as(u8, 0), s.flags[0]);
     try std.testing.expectEqual(ring.flag_continuation, s.flags[1]);
+}
+
+test "severity maps errorish->2, stderr->1, else info" {
+    try std.testing.expectEqual(@as(u8, 2), severityFromFlags(ring.flag_errorish));
+    // error outranks the stderr bit when both are set
+    try std.testing.expectEqual(@as(u8, 2), severityFromFlags(ring.flag_errorish | ring.flag_stderr));
+    try std.testing.expectEqual(@as(u8, 1), severityFromFlags(ring.flag_stderr));
+    try std.testing.expectEqual(@as(u8, 0), severityFromFlags(0));
+    // the continuation bit alone does not elevate severity
+    try std.testing.expectEqual(@as(u8, 0), severityFromFlags(ring.flag_continuation));
 }
 
 test "eof flushes partial line" {
