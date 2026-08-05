@@ -10,6 +10,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Upper bound on per-core CPU tracking. Matches the 32 KiB /proc/stat read in
+/// sample() (a few hundred cores' worth of `cpuN` lines). Per-core state lives
+/// in fixed arrays of this length; a `cpuN` with N >= max_cores is truncated
+/// (counted toward `logical` but never captured), never an overrun.
+pub const max_cores = 256;
+
 pub const HostSample = struct {
     // memory (bytes)
     mem_total: u64 = 0,
@@ -18,6 +24,11 @@ pub const HostSample = struct {
     cpu_total_delta: u64 = 0,
     cpu_idle_delta: u64 = 0,
     logical_cpus: u32 = 0,
+    // per-core cpu — same derivation as the aggregate, one entry per core.
+    // Only the first `core_n` (= min(logical, max_cores)) entries are valid.
+    core_total_delta: [max_cores]u64 = [_]u64{0} ** max_cores,
+    core_idle_delta: [max_cores]u64 = [_]u64{0} ** max_cores,
+    core_n: u32 = 0,
     load1_milli: u32 = 0, // /proc/loadavg field1 * 1000 (integer, no float on wire)
     // network (cumulative monotonic bytes across non-loopback ifaces)
     net_rx: u64 = 0,
@@ -52,12 +63,22 @@ pub fn parseMeminfo(text: []const u8) Mem {
     };
 }
 
-pub const Cpu = struct { total: u64 = 0, idle: u64 = 0, logical: u32 = 0 };
+pub const Cpu = struct {
+    total: u64 = 0,
+    idle: u64 = 0,
+    logical: u32 = 0,
+    // per-core, indexed by the parsed N (< max_cores). Same math as the
+    // aggregate: total = sum of a `cpuN` line's fields, idle = field4 + field5.
+    core_total: [max_cores]u64 = [_]u64{0} ** max_cores,
+    core_idle: [max_cores]u64 = [_]u64{0} ** max_cores,
+};
 
 /// /proc/stat: the aggregate `cpu ` line -> total = sum of all fields, idle =
 /// field4 + field5 (idle + iowait). logical = count of per-core `cpuN` lines
-/// (a "cpu" prefix followed by a digit). All sums saturate; garbage tokens
-/// parse to 0. O(input): single pass.
+/// (a "cpu" prefix followed by a digit); each such line's total/idle is also
+/// captured into core_total[N]/core_idle[N] when N < max_cores (larger N is
+/// truncated — counted but not captured, never an overrun). All sums saturate;
+/// garbage tokens parse to 0. O(input): single pass.
 pub fn parseStatCpu(text: []const u8) Cpu {
     var res: Cpu = .{};
     var got_agg = false;
@@ -67,6 +88,25 @@ pub fn parseStatCpu(text: []const u8) Cpu {
         if (line.len > 3 and line[3] >= '0' and line[3] <= '9') {
             // per-core line "cpuN" — count it, not the aggregate
             res.logical +|= 1;
+            // parse the core index N from the digit run after "cpu"
+            var j: usize = 3;
+            var n: u32 = 0;
+            while (j < line.len and line[j] >= '0' and line[j] <= '9') : (j += 1) {
+                n = n *| 10 +| (line[j] - '0'); // saturating: huge N stays huge
+            }
+            if (n >= max_cores) continue; // truncate — never index past the arrays
+            // capture this core's total (sum of fields) + idle (field4+field5)
+            var cit = std.mem.tokenizeAny(u8, line[j..], " \t\r");
+            var ci: usize = 1;
+            var ctotal: u64 = 0;
+            var cidle: u64 = 0;
+            while (cit.next()) |tok| : (ci += 1) {
+                const v = std.fmt.parseInt(u64, tok, 10) catch 0;
+                ctotal +|= v;
+                if (ci == 4 or ci == 5) cidle +|= v; // idle + iowait
+            }
+            res.core_total[n] = ctotal;
+            res.core_idle[n] = cidle;
             continue;
         }
         if (!got_agg and line.len > 3 and (line[3] == ' ' or line[3] == '\t')) {
@@ -223,6 +263,8 @@ pub fn hostId(buf: []u8) []const u8 {
 pub const Sampler = struct {
     prev_cpu_total: u64 = 0,
     prev_cpu_idle: u64 = 0,
+    prev_core_total: [max_cores]u64 = [_]u64{0} ** max_cores,
+    prev_core_idle: [max_cores]u64 = [_]u64{0} ** max_cores,
     have_prev: bool = false,
 
     /// Reads /proc + statfs and returns a HostSample. NEVER fails: any
@@ -239,12 +281,21 @@ pub const Sampler = struct {
         const stat_text = readFile("/proc/stat", &stat_buf) orelse "";
         const cpu = parseStatCpu(stat_text);
         out.logical_cpus = cpu.logical;
+        const ncore: u32 = if (cpu.logical > max_cores) max_cores else cpu.logical;
+        out.core_n = ncore;
         if (self.have_prev) {
             out.cpu_total_delta = cpu.total -| self.prev_cpu_total;
             out.cpu_idle_delta = cpu.idle -| self.prev_cpu_idle;
+            var i: u32 = 0;
+            while (i < ncore) : (i += 1) {
+                out.core_total_delta[i] = cpu.core_total[i] -| self.prev_core_total[i];
+                out.core_idle_delta[i] = cpu.core_idle[i] -| self.prev_core_idle[i];
+            }
         }
         self.prev_cpu_total = cpu.total;
         self.prev_cpu_idle = cpu.idle;
+        self.prev_core_total = cpu.core_total;
+        self.prev_core_idle = cpu.core_idle;
         self.have_prev = true;
 
         var mem_buf: [4096]u8 = undefined;
@@ -286,6 +337,68 @@ test "parseStatCpu sums fields and extracts idle" {
     try testing.expectEqual(@as(u32, 1), c.logical);
 }
 
+test "parseStatCpu captures per-core total and idle" {
+    const c = parseStatCpu(
+        "cpu  100 20 30 400 50 0 0 0 0 0\n" ++
+            "cpu0 1 2 3 4 5\n" ++ // total 15, idle field4+field5 = 4+5 = 9
+            "cpu1 10 20 30 40 50\n" ++ // total 150, idle 40+50 = 90
+            "cpu2 5 5 5 5 5\n" ++ // total 25, idle 5+5 = 10
+            "cpu3 2 2 2 2 2\n", // total 10, idle 2+2 = 4
+    );
+    try testing.expectEqual(@as(u32, 4), c.logical);
+    // aggregate line is unchanged by the per-core capture
+    try testing.expectEqual(@as(u64, 100 + 20 + 30 + 400 + 50), c.total);
+    try testing.expectEqual(@as(u64, 400 + 50), c.idle);
+    // each cpuN line's total (sum of fields) + idle (field4+field5)
+    try testing.expectEqual(@as(u64, 15), c.core_total[0]);
+    try testing.expectEqual(@as(u64, 9), c.core_idle[0]);
+    try testing.expectEqual(@as(u64, 150), c.core_total[1]);
+    try testing.expectEqual(@as(u64, 90), c.core_idle[1]);
+    try testing.expectEqual(@as(u64, 25), c.core_total[2]);
+    try testing.expectEqual(@as(u64, 10), c.core_idle[2]);
+    try testing.expectEqual(@as(u64, 10), c.core_total[3]);
+    try testing.expectEqual(@as(u64, 4), c.core_idle[3]);
+}
+
+// MUTATION TARGET: loosening the per-core index bound in parseStatCpu
+// (`n >= max_cores` -> `n > max_cores`, or dropping the clamp) makes this test
+// overrun core_total[]/core_idle[] and trap.
+test "parseStatCpu ignores cpuN with N beyond max_cores (no overrun)" {
+    // cpu256 == max_cores (boundary: catches `>=`->`>`) and cpu9999 far past
+    // the end (catches a dropped clamp). Both must be counted but not captured.
+    const c = parseStatCpu(
+        "cpu  1 1 1 1 1\n" ++
+            "cpu0 1 1 1 1 1\n" ++ // in range: captured (total 5)
+            "cpu256 9 9 9 9 9\n" ++ // == max_cores: out of range
+            "cpu9999 9 9 9 9 9\n", // far out of range
+    );
+    try testing.expectEqual(@as(u64, 5), c.core_total[0]); // in-range core captured
+    try testing.expectEqual(@as(u32, 3), c.logical); // every cpuN line still counted
+}
+
+test "per-core util: busy core -> ~1.0, idle core -> ~0.0" {
+    // Two /proc/stat readings mirroring the Sampler's per-core deltas and the
+    // encoder's util formula (1 - idle_delta/total_delta), applied per core.
+    const first = parseStatCpu(
+        "cpu  0 0 0 0 0\n" ++
+            "cpu0 100 0 0 100 0\n" ++ // total 200, idle 100
+            "cpu1 100 0 0 100 0\n", // total 200, idle 100
+    );
+    const second = parseStatCpu(
+        "cpu  0 0 0 0 0\n" ++
+            "cpu0 200 0 0 100 0\n" ++ // total 300 (+100 busy), idle 100 (+0)
+            "cpu1 100 0 0 200 0\n", // total 300 (+100), idle 200 (+100 all idle)
+    );
+    const c0_total_delta = second.core_total[0] -| first.core_total[0]; // 100
+    const c0_idle_delta = second.core_idle[0] -| first.core_idle[0]; // 0
+    const c1_total_delta = second.core_total[1] -| first.core_total[1]; // 100
+    const c1_idle_delta = second.core_idle[1] -| first.core_idle[1]; // 100
+    const util0 = 1.0 - @as(f64, @floatFromInt(c0_idle_delta)) / @as(f64, @floatFromInt(c0_total_delta));
+    const util1 = 1.0 - @as(f64, @floatFromInt(c1_idle_delta)) / @as(f64, @floatFromInt(c1_total_delta));
+    try testing.expectApproxEqAbs(@as(f64, 1.0), util0, 1e-9); // fully busy
+    try testing.expectApproxEqAbs(@as(f64, 0.0), util1, 1e-9); // fully idle
+}
+
 test "parseNetDev sums non-loopback rx/tx" {
     const n = parseNetDev("Inter-|...\n face |...\n  lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n");
     try testing.expectEqual(@as(u64, 1000), n.rx); // lo excluded
@@ -309,6 +422,10 @@ test "overflow-safe: a giant /proc number saturates, no trap" {
     _ = parseNetDev(" eth0: 99999999999999999999 0 0 0 0 0 0 0 99999999999999999999 0\n");
     // A giant cpu field saturates the running total, not trap.
     _ = parseStatCpu("cpu 99999999999999999999999 99999999999999999999999\n");
+    // A giant per-core field also saturates (parseInt overflow -> 0), not trap.
+    const cg = parseStatCpu("cpu 0 0\ncpu0 99999999999999999999999 99999999999999999999999\n");
+    try testing.expectEqual(@as(u64, 0), cg.core_total[0]);
+    try testing.expectEqual(@as(u64, 0), cg.core_idle[0]);
 }
 
 test "sample reads live host values (validates statfs layout + /proc)" {
@@ -325,4 +442,9 @@ test "sample reads live host values (validates statfs layout + /proc)" {
     try testing.expect(h.fs_total > 0); // statfs("/") struct offsets correct
     try testing.expect(h.fs_used <= h.fs_total);
     try testing.expect(h.logical_cpus > 0); // /proc/stat cpuN lines counted
+    // per-core path primed + delta'd without overrun: core_n is bounded by both
+    // the logical count and max_cores.
+    try testing.expect(h.core_n > 0);
+    try testing.expect(h.core_n <= h.logical_cpus);
+    try testing.expect(h.core_n <= max_cores);
 }

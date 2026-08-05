@@ -592,7 +592,29 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
 
     // Datapoints (one array per metric so the slices outlive the sizing/write
     // passes below).
-    const dp_cpu_util = [_]HDp{.{ .value_bits = cpu_util_bits, .is_double = true, .attrs = &a_cpu_total }};
+    //
+    // system.cpu.utilization carries the aggregate (cpu="total") plus one point
+    // per core (cpu="<n>"), each computed with the SAME formula/guard as the
+    // aggregate (ratioBits guards total_delta==0 -> 0.0). Backing storage is all
+    // fixed-size on the stack (zero heap) and sized to max_cores: the decimal
+    // index strings, their HAttr wrappers, and the HDp array all outlive the
+    // sizing/write passes.
+    const max_cores = hostmetrics.max_cores;
+    var core_idx_buf: [max_cores][3]u8 = undefined; // "0".."255"
+    var core_attr_buf: [max_cores]HAttr = undefined;
+    var dp_cpu_util_buf: [1 + max_cores]HDp = undefined;
+    dp_cpu_util_buf[0] = .{ .value_bits = cpu_util_bits, .is_double = true, .attrs = &a_cpu_total };
+    const ncore: u32 = if (h.core_n > max_cores) max_cores else h.core_n;
+    {
+        var ci: u32 = 0;
+        while (ci < ncore) : (ci += 1) {
+            const s: []const u8 = std.fmt.bufPrint(&core_idx_buf[ci], "{d}", .{ci}) catch "";
+            core_attr_buf[ci] = .{ .k = "cpu", .v = s };
+            const core_util = ratioBits(h.core_total_delta[ci] -| h.core_idle_delta[ci], h.core_total_delta[ci]);
+            dp_cpu_util_buf[1 + ci] = .{ .value_bits = core_util, .is_double = true, .attrs = core_attr_buf[ci .. ci + 1] };
+        }
+    }
+    const dp_cpu_util = dp_cpu_util_buf[0 .. 1 + ncore];
     const dp_cpu_count = [_]HDp{.{ .value_bits = h.logical_cpus, .is_double = false, .attrs = &a_none }};
     const dp_load = [_]HDp{.{ .value_bits = load1_bits, .is_double = true, .attrs = &a_none }};
     const dp_mem = [_]HDp{
@@ -609,7 +631,7 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     const dp_fs_util = [_]HDp{.{ .value_bits = fs_util_bits, .is_double = true, .attrs = &a_fs_root }};
 
     const metrics = [_]HMetric{
-        .{ .name = "system.cpu.utilization", .unit = "1", .kind = .gauge, .dps = &dp_cpu_util },
+        .{ .name = "system.cpu.utilization", .unit = "1", .kind = .gauge, .dps = dp_cpu_util },
         .{ .name = "system.cpu.logical.count", .unit = "{cpu}", .kind = .gauge, .dps = &dp_cpu_count },
         .{ .name = "system.cpu.load_average.1m", .unit = "1", .kind = .gauge, .dps = &dp_load },
         .{ .name = "system.memory.usage", .unit = "By", .kind = .gauge, .dps = &dp_mem },
@@ -1540,6 +1562,60 @@ test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can w
     try testing.expectEqualStrings("direction", Fields.get(dir_kv, 1).?.bytes);
     try testing.expectEqualStrings("receive", avStr(Fields.get(dir_kv, 2).?.bytes));
     try testing.expectEqual(@as(u64, 5000), Fields.get(first_sdp, 6).?.int); // net_rx
+}
+
+test "buildOtlpHostMetrics emits per-core cpu.utilization datapoints" {
+    // Same metric (system.cpu.utilization), same formula/guard, one extra
+    // datapoint per core: cpu="total" plus cpu="0"/cpu="1".
+    var h = hostmetrics.HostSample{
+        .cpu_total_delta = 100,
+        .cpu_idle_delta = 25, // aggregate util 0.75
+        .logical_cpus = 2,
+        .core_n = 2,
+    };
+    h.core_total_delta[0] = 100;
+    h.core_idle_delta[0] = 0; // core0 fully busy -> 1.0
+    h.core_total_delta[1] = 100;
+    h.core_idle_delta[1] = 100; // core1 fully idle -> 0.0
+    const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
+
+    const rm = Fields.get(body, 1).?.bytes; // resource_metrics
+    const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
+    var mit = Fields{ .b = sm };
+    var cpu_util: []const u8 = &.{};
+    while (mit.next()) |f| {
+        if (f.num != 2) continue; // Metric
+        const name = Fields.get(f.bytes, 1).?.bytes;
+        if (std.mem.eql(u8, name, "system.cpu.utilization")) cpu_util = f.bytes;
+    }
+    try testing.expect(cpu_util.len > 0);
+
+    // Walk every datapoint: match cpu="total"/"0"/"1" to their utilizations.
+    const gauge = Fields.get(cpu_util, 5).?.bytes;
+    var dps = Fields{ .b = gauge };
+    var seen_total = false;
+    var seen_c0 = false;
+    var seen_c1 = false;
+    while (dps.next()) |f| {
+        if (f.num != 1) continue; // data_points
+        const dp = f.bytes;
+        const kv = Fields.get(dp, 7).?.bytes; // NumberDataPoint.attributes
+        try testing.expectEqualStrings("cpu", Fields.get(kv, 1).?.bytes);
+        const which = avStr(Fields.get(kv, 2).?.bytes);
+        try testing.expect(Fields.get(dp, 6) == null); // as_double, not as_int
+        const util: f64 = @bitCast(Fields.get(dp, 4).?.int);
+        if (std.mem.eql(u8, which, "total")) {
+            try testing.expectApproxEqAbs(@as(f64, 0.75), util, 1e-9);
+            seen_total = true;
+        } else if (std.mem.eql(u8, which, "0")) {
+            try testing.expectApproxEqAbs(@as(f64, 1.0), util, 1e-9);
+            seen_c0 = true;
+        } else if (std.mem.eql(u8, which, "1")) {
+            try testing.expectApproxEqAbs(@as(f64, 0.0), util, 1e-9);
+            seen_c1 = true;
+        }
+    }
+    try testing.expect(seen_total and seen_c0 and seen_c1);
 }
 
 test "Shipped set tracks names and sweeps entries no longer on disk" {
