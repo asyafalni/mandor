@@ -17,6 +17,10 @@ mandor's existing **per-worker (per-process)** fine-grained metrics: photon must
 show each supervised process's resource usage AND the node it runs on, under one
 host, so an operator can read a process against the node's totals.
 
+Separately, P3 adds an **opt-in** capability for operators who want more than the
+curated view: streaming full worker logs to photon as OTLP logs. It is default-off
+and independent of the host-metric work — mandor still curates by default.
+
 ## Background
 
 **photon-agent** (photon repo, `crates/photon-agent/`) is a standalone glibc
@@ -181,8 +185,10 @@ enabled = true          # default false; when true, daemon shells out to nvidia-
 interval = "15s"        # GPU sample cadence (default 15s)
 ```
 
-Adds ≤2 documented keys → config-surface gate budget bump (currently 35/36), with
-CHANGELOG justification (same discipline as the secret-store keys).
+Adds the `[gpu]` keys here plus the `[logs]` streaming key(s) in P3 (~3–4
+documented keys total across the phases) → config-surface gate budget bump per
+phase (currently 35/36), each with CHANGELOG justification (same discipline as
+the secret-store keys). Keep the 4-flag CLI rule intact — all TOML-only.
 
 ## Deployment — node-monitor model
 
@@ -192,6 +198,59 @@ host's `/proc`, `/sys`, `/etc/machine-id` mounted in (and `/dev/nvidia*` +
 those mounts mandor reports container-scoped numbers (unchanged behavior). This
 is additive: the same binary still supervises workers; a plain sidecar deployment
 without host mounts simply reports its container's view.
+
+## Optional full log streaming (P3)
+
+mandor's default is unchanged: it **curates** — worker log content reaches photon
+only inside incident bundles (the `logs_tail` summary + error dedup), never as a
+firehose. P3 adds an **opt-in** mode that streams every captured worker line to
+photon as OTLP logs, for operators who explicitly want full logs there. This is a
+deliberate, bounded softening of the 2026-07-28 "curate, don't stream" decision:
+**curate by default, stream only on explicit opt-in.**
+
+**Opt-in, default off — even when `photon=` is set.** `photon=` alone still ships
+only incidents + metrics + lifecycle (curated). Full logs require a second,
+separate key, so a normal deployment never accidentally turns into a log firehose,
+and the offline-by-default guarantee (no `photon=` ⇒ no network at all) is intact.
+
+**Path (best-effort, never blocks PID-1).** Capture already assembles worker
+stdout/stderr into per-worker ring buffers. When streaming is on, each completed
+line is also enqueued to the relay daemon over the telemetry pipe as a new log
+frame (worker index, stream, severity flag, timestamp, bytes). The daemon batches
+them (flush every N records or T ms) into one OTLP `/v1/logs` POST. This rides the
+existing **ephemeral** telemetry tier: the pipe write is non-blocking and the
+daemon buffer is bounded — under backpressure (photon down/slow, or a log storm)
+lines are **dropped with a counter**, never spooled and never allowed to stall
+capture or supervision. Incidents remain the durable tier (spool + retry);
+streamed logs are explicitly lossy, matching their volume.
+
+**OTLP mapping (photon `/v1/logs`, already the incident-bundle sink).** Resource:
+`service.name=<worker>` + `host.name`/`host.id` — the SAME identity as this
+worker's `process.*` metrics, so in photon a worker's logs, its process metrics,
+and the node line up under one service/host. Log record: `time_unix_nano`, `body`
+= the line text, `severity_number`/`severity_text` from mandor's existing
+error/warn line flagging (else INFO), attributes `log.iostream=stdout|stderr`.
+Reuses the OTLP-logs encoder already built for incident bundles.
+
+**Guards specific to the firehose:**
+- Off by default; requires both `photon=` and the streaming key.
+- Optional rate cap (lines/sec) and/or line-length cap so one chatty worker can't
+  saturate the daemon or photon; over-cap lines dropped with the same counter.
+- Zero effect on the curated path: incidents, metrics, and lifecycle are
+  unchanged whether streaming is on or off.
+- Never spooled to disk (that tier is for incidents only) — a down photon means
+  streamed logs are lost for that window, by design.
+
+**Config (TOML-only):**
+```toml
+[logs]
+stream = true           # default false; opt-in full worker-log streaming to photon
+# max_rate = "2000/s"   # optional: drop beyond this to protect mandor + photon
+```
+
+**Non-goals for P3:** no on-disk log spooling/retention beyond the existing ring
+buffers; no log parsing/indexing (photon does that); no PII redaction (operator's
+responsibility — flagged in docs, same as the incident env-snapshot caveat).
 
 ## Constraints / guardrails
 
@@ -214,6 +273,10 @@ without host mounts simply reports its container's view.
    → photon-agent is now fully replaceable.
 2. **P2 — extras.** AMD/Intel GPU (DRM sysfs), `system.disk.io`, swap, CPU temp,
    uptime, 5m/15m load. mandor becomes a superset.
+3. **P3 — optional full log streaming (opt-in).** Stream every captured worker
+   stdout/stderr line to photon as OTLP logs, for operators who want the full
+   firehose (see "Optional full log streaming" below). Independent of P1/P2 and
+   the largest departure from mandor's defaults — kept strictly opt-in.
 
 ## Testing
 
@@ -231,6 +294,12 @@ without host mounts simply reports its container's view.
   `/api/infra/hosts/:host/processes` populated with the workers — proving the
   per-process + node views are coherent under one host.
 - **Size / harness** — size gate; harness unaffected (host/GPU are daemon-side).
+- **P3 log streaming** — unit-test the log-frame encode/decode + severity mapping
+  + OTLP `/v1/logs` record shape (protoWalk). A harness case: with `[logs] stream`
+  on, a worker's lines land in photon `/api/search` under its `service.name`; with
+  it off (default), only incident-bundle logs appear (no firehose). A backpressure
+  test: a log storm against a dead endpoint drops lines (counter increments) and
+  never stalls capture or raises mandor's RSS (soak-style).
 
 ## Open questions
 
