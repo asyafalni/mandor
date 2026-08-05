@@ -579,6 +579,8 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     const cpu_util_bits = ratioBits(h.cpu_total_delta -| h.cpu_idle_delta, h.cpu_total_delta);
     const mem_util_bits = ratioBits(h.mem_used, h.mem_total);
     const load1_bits: u64 = @bitCast(@as(f64, @floatFromInt(h.load1_milli)) / 1000.0);
+    const load5_bits: u64 = @bitCast(@as(f64, @floatFromInt(h.load5_milli)) / 1000.0);
+    const load15_bits: u64 = @bitCast(@as(f64, @floatFromInt(h.load15_milli)) / 1000.0);
 
     // Datapoint attribute sets.
     const a_cpu_total = [_]HAttr{.{ .k = "cpu", .v = "total" }};
@@ -617,12 +619,25 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     const dp_cpu_util = dp_cpu_util_buf[0 .. 1 + ncore];
     const dp_cpu_count = [_]HDp{.{ .value_bits = h.logical_cpus, .is_double = false, .attrs = &a_none }};
     const dp_load = [_]HDp{.{ .value_bits = load1_bits, .is_double = true, .attrs = &a_none }};
+    const dp_load5 = [_]HDp{.{ .value_bits = load5_bits, .is_double = true, .attrs = &a_none }};
+    const dp_load15 = [_]HDp{.{ .value_bits = load15_bits, .is_double = true, .attrs = &a_none }};
     const dp_mem = [_]HDp{
         .{ .value_bits = h.mem_used, .is_double = false, .attrs = &a_state_used },
         .{ .value_bits = h.mem_total -| h.mem_used, .is_double = false, .attrs = &a_state_free },
     };
     const dp_mem_limit = [_]HDp{.{ .value_bits = h.mem_total, .is_double = false, .attrs = &a_none }};
     const dp_mem_util = [_]HDp{.{ .value_bits = mem_util_bits, .is_double = true, .attrs = &a_none }};
+    // system.paging.usage: swap used/free bytes (as_int), emitted only when the
+    // host actually has swap (swap_total>0).
+    const dp_paging = [_]HDp{
+        .{ .value_bits = h.swap_used, .is_double = false, .attrs = &a_state_used },
+        .{ .value_bits = h.swap_free, .is_double = false, .attrs = &a_state_free },
+    };
+    // system.uptime (s) and system.cpu.temperature (Cel) are single as_int
+    // gauges with no attributes; temperature is emitted only when a CPU-temp
+    // chip was found (cpu_temp_c>0).
+    const dp_uptime = [_]HDp{.{ .value_bits = h.uptime_s, .is_double = false, .attrs = &a_none }};
+    const dp_cpu_temp = [_]HDp{.{ .value_bits = h.cpu_temp_c, .is_double = false, .attrs = &a_none }};
 
     // system.network.io carries one receive + one transmit datapoint PER
     // interface (attrs device=<if> + direction), mirroring the per-mount path:
@@ -701,18 +716,52 @@ pub fn buildOtlpHostMetrics(h: hostmetrics.HostSample, host_name: []const u8, ho
     const dp_fs_usage = dp_fs_usage_buf[0..nmount];
     const dp_fs_util = dp_fs_util_buf[0..nmount];
 
-    const metrics = [_]HMetric{
-        .{ .name = "system.cpu.utilization", .unit = "1", .kind = .gauge, .dps = dp_cpu_util },
-        .{ .name = "system.cpu.logical.count", .unit = "{cpu}", .kind = .gauge, .dps = &dp_cpu_count },
-        .{ .name = "system.cpu.load_average.1m", .unit = "1", .kind = .gauge, .dps = &dp_load },
-        .{ .name = "system.memory.usage", .unit = "By", .kind = .gauge, .dps = &dp_mem },
-        .{ .name = "system.memory.limit", .unit = "By", .kind = .gauge, .dps = &dp_mem_limit },
-        .{ .name = "system.memory.utilization", .unit = "1", .kind = .gauge, .dps = &dp_mem_util },
-        .{ .name = "system.network.io", .unit = "By", .kind = .sum, .dps = dp_net },
-        .{ .name = "system.disk.io", .unit = "By", .kind = .sum, .dps = dp_disk },
-        .{ .name = "system.filesystem.usage", .unit = "By", .kind = .gauge, .dps = dp_fs_usage },
-        .{ .name = "system.filesystem.utilization", .unit = "1", .kind = .gauge, .dps = dp_fs_util },
-    };
+    // Runtime-populated so the two conditional metrics (system.paging.usage,
+    // system.cpu.temperature) can be omitted when the host has no swap / no
+    // CPU-temp chip. Backing storage is fixed on the stack (zero heap); nm counts
+    // the emitted metrics. `system.uptime` and `system.cpu.temperature` are
+    // mandor-extension names (no OTel semconv); all others are OTel semconv.
+    var metrics_buf: [15]HMetric = undefined;
+    var nm: usize = 0;
+    metrics_buf[nm] = .{ .name = "system.cpu.utilization", .unit = "1", .kind = .gauge, .dps = dp_cpu_util };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.cpu.logical.count", .unit = "{cpu}", .kind = .gauge, .dps = &dp_cpu_count };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.cpu.load_average.1m", .unit = "1", .kind = .gauge, .dps = &dp_load };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.cpu.load_average.5m", .unit = "1", .kind = .gauge, .dps = &dp_load5 };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.cpu.load_average.15m", .unit = "1", .kind = .gauge, .dps = &dp_load15 };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.memory.usage", .unit = "By", .kind = .gauge, .dps = &dp_mem };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.memory.limit", .unit = "By", .kind = .gauge, .dps = &dp_mem_limit };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.memory.utilization", .unit = "1", .kind = .gauge, .dps = &dp_mem_util };
+    nm += 1;
+    // system.paging.usage: only when the host has swap.
+    if (h.swap_total > 0) {
+        metrics_buf[nm] = .{ .name = "system.paging.usage", .unit = "By", .kind = .gauge, .dps = &dp_paging };
+        nm += 1;
+    }
+    // system.uptime (mandor-extension name — no OTel semconv).
+    metrics_buf[nm] = .{ .name = "system.uptime", .unit = "s", .kind = .gauge, .dps = &dp_uptime };
+    nm += 1;
+    // system.cpu.temperature (mandor-extension name): only when a CPU-temp chip
+    // was found.
+    if (h.cpu_temp_c > 0) {
+        metrics_buf[nm] = .{ .name = "system.cpu.temperature", .unit = "Cel", .kind = .gauge, .dps = &dp_cpu_temp };
+        nm += 1;
+    }
+    metrics_buf[nm] = .{ .name = "system.network.io", .unit = "By", .kind = .sum, .dps = dp_net };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.disk.io", .unit = "By", .kind = .sum, .dps = dp_disk };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.filesystem.usage", .unit = "By", .kind = .gauge, .dps = dp_fs_usage };
+    nm += 1;
+    metrics_buf[nm] = .{ .name = "system.filesystem.utilization", .unit = "1", .kind = .gauge, .dps = dp_fs_util };
+    nm += 1;
+    const metrics = metrics_buf[0..nm];
 
     // Pass 1: sizes, innermost first.
     var scope_len: usize = 0;
@@ -1786,6 +1835,97 @@ test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can w
     try testing.expectEqualStrings("eth0", dev);
     try testing.expectEqualStrings("receive", dir);
     try testing.expectEqual(@as(u64, 5000), Fields.get(first_sdp, 6).?.int); // iface rx
+}
+
+test "buildOtlpHostMetrics emits swap, 5m/15m load, uptime, and cpu temperature" {
+    const h = hostmetrics.HostSample{
+        .mem_total = 1000,
+        .mem_used = 400,
+        .load1_milli = 1250,
+        .load5_milli = 2500,
+        .load15_milli = 3750,
+        .uptime_s = 12345,
+        .swap_total = 2000,
+        .swap_used = 1500,
+        .swap_free = 500,
+        .cpu_temp_c = 55,
+    };
+    const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
+
+    const rm = Fields.get(body, 1).?.bytes; // resource_metrics
+    const sm = Fields.get(rm, 2).?.bytes; // scope_metrics
+    var mit = Fields{ .b = sm };
+    var paging: []const u8 = &.{};
+    var load5: []const u8 = &.{};
+    var load15: []const u8 = &.{};
+    var uptime: []const u8 = &.{};
+    var cputemp: []const u8 = &.{};
+    while (mit.next()) |f| {
+        if (f.num != 2) continue; // Metric
+        const name = Fields.get(f.bytes, 1).?.bytes;
+        if (std.mem.eql(u8, name, "system.paging.usage")) paging = f.bytes;
+        if (std.mem.eql(u8, name, "system.cpu.load_average.5m")) load5 = f.bytes;
+        if (std.mem.eql(u8, name, "system.cpu.load_average.15m")) load15 = f.bytes;
+        if (std.mem.eql(u8, name, "system.uptime")) uptime = f.bytes;
+        if (std.mem.eql(u8, name, "system.cpu.temperature")) cputemp = f.bytes;
+    }
+    try testing.expect(paging.len > 0);
+    try testing.expect(load5.len > 0);
+    try testing.expect(load15.len > 0);
+    try testing.expect(uptime.len > 0);
+    try testing.expect(cputemp.len > 0);
+
+    // system.paging.usage: Gauge, datapoint[0] state=used (swap_used), [1]=free.
+    const pg = Fields.get(paging, 5).?.bytes;
+    var pdps = Fields{ .b = pg };
+    const p_used = pdps.next().?.bytes;
+    const p_used_kv = Fields.get(p_used, 7).?.bytes;
+    try testing.expectEqualStrings("state", Fields.get(p_used_kv, 1).?.bytes);
+    try testing.expectEqualStrings("used", avStr(Fields.get(p_used_kv, 2).?.bytes));
+    try testing.expectEqual(@as(u64, 1500), Fields.get(p_used, 6).?.int); // swap_used
+    const p_free = pdps.next().?.bytes;
+    const p_free_kv = Fields.get(p_free, 7).?.bytes;
+    try testing.expectEqualStrings("free", avStr(Fields.get(p_free_kv, 2).?.bytes));
+    try testing.expectEqual(@as(u64, 500), Fields.get(p_free, 6).?.int); // swap_free
+
+    // 5m/15m load: as_double (field 4) decoding to 2.5 / 3.75.
+    const l5_dp = Fields.get(Fields.get(load5, 5).?.bytes, 1).?.bytes;
+    const l5v: f64 = @bitCast(Fields.get(l5_dp, 4).?.int);
+    try testing.expectApproxEqAbs(@as(f64, 2.5), l5v, 1e-9);
+    const l15_dp = Fields.get(Fields.get(load15, 5).?.bytes, 1).?.bytes;
+    const l15v: f64 = @bitCast(Fields.get(l15_dp, 4).?.int);
+    try testing.expectApproxEqAbs(@as(f64, 3.75), l15v, 1e-9);
+
+    // system.uptime: as_int seconds.
+    const up_dp = Fields.get(Fields.get(uptime, 5).?.bytes, 1).?.bytes;
+    try testing.expectEqual(@as(u64, 12345), Fields.get(up_dp, 6).?.int);
+
+    // system.cpu.temperature: as_int °C.
+    const t_dp = Fields.get(Fields.get(cputemp, 5).?.bytes, 1).?.bytes;
+    try testing.expectEqual(@as(u64, 55), Fields.get(t_dp, 6).?.int);
+}
+
+test "buildOtlpHostMetrics omits swap and temperature when absent" {
+    // No swap (swap_total=0) and no CPU-temp chip (cpu_temp_c=0): neither metric
+    // is emitted, but uptime + 5m/15m load always are.
+    const h = hostmetrics.HostSample{ .load5_milli = 1000, .load15_milli = 500, .uptime_s = 7 };
+    const body = try buildOtlpHostMetrics(h, "node-1", "abc123");
+    const rm = Fields.get(body, 1).?.bytes;
+    const sm = Fields.get(rm, 2).?.bytes;
+    var mit = Fields{ .b = sm };
+    var saw_paging = false;
+    var saw_temp = false;
+    var saw_uptime = false;
+    while (mit.next()) |f| {
+        if (f.num != 2) continue; // Metric
+        const name = Fields.get(f.bytes, 1).?.bytes;
+        if (std.mem.eql(u8, name, "system.paging.usage")) saw_paging = true;
+        if (std.mem.eql(u8, name, "system.cpu.temperature")) saw_temp = true;
+        if (std.mem.eql(u8, name, "system.uptime")) saw_uptime = true;
+    }
+    try testing.expect(!saw_paging); // omitted: no swap
+    try testing.expect(!saw_temp); // omitted: no CPU-temp chip
+    try testing.expect(saw_uptime); // always emitted
 }
 
 test "buildOtlpHostMetrics emits per-core cpu.utilization datapoints" {

@@ -55,12 +55,17 @@ never touches one. That child ships three things to photon:
   toggle** (same minimal-surface rule as the rest of telemetry), sampled every
   5 s over the non-blocking, drop-under-backpressure pipe. Metrics shipped:
   `system.cpu.utilization` (`cpu=total` **and one point per core** `cpu=<n>`),
-  `system.cpu.logical.count`, `system.cpu.load_average.1m`, `system.memory.usage`
-  (`state=used|free`), `system.memory.limit`, `system.memory.utilization`,
-  `system.network.io` (monotonic sum, **per interface** `device=<if>` ×
-  `direction=receive|transmit`), and `system.filesystem.usage` /
-  `system.filesystem.utilization` (**per mount** `mountpoint=<mp>`, real
-  filesystems only). Host identity comes from `/proc/sys/kernel/hostname` and
+  `system.cpu.logical.count`, `system.cpu.load_average.1m` / `.5m` / `.15m`,
+  `system.memory.usage` (`state=used|free`), `system.memory.limit`,
+  `system.memory.utilization`, `system.paging.usage` (`state=used|free`, swap;
+  emitted only when the host has swap), `system.network.io` (monotonic sum, **per
+  interface** `device=<if>` × `direction=receive|transmit`), and
+  `system.filesystem.usage` / `system.filesystem.utilization` (**per mount**
+  `mountpoint=<mp>`, real filesystems only). Two **mandor-extension** gauges
+  (no OTel semantic-convention name): `system.uptime` (seconds) and
+  `system.cpu.temperature` (`Cel`; first CPU-temp hwmon chip — `coretemp`,
+  `k10temp`, `zenpower`, `cpu_thermal`, `k8temp` — emitted only when present).
+  Host identity comes from `/proc/sys/kernel/hostname` and
   `/etc/machine-id` (falling back to `boot_id`, then the literal `unknown`).
 - **GPU metrics** (opt-in) → OTLP metrics (`/v1/metrics`). With `[gpu] enabled`,
   the relay daemon shells out to `nvidia-smi` every `[gpu] interval` (default

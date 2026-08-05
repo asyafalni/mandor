@@ -77,6 +77,11 @@ pub const HostSample = struct {
     // memory (bytes)
     mem_total: u64 = 0,
     mem_used: u64 = 0,
+    // swap (bytes). Encoder emits system.paging.usage (state used/free) only
+    // when swap_total>0 (a no-swap host reports both as 0).
+    swap_total: u64 = 0,
+    swap_used: u64 = 0,
+    swap_free: u64 = 0,
     // cpu — caller derives utilization = 1 - idle_delta/total_delta
     cpu_total_delta: u64 = 0,
     cpu_idle_delta: u64 = 0,
@@ -87,6 +92,10 @@ pub const HostSample = struct {
     core_idle_delta: [max_cores]u64 = [_]u64{0} ** max_cores,
     core_n: u32 = 0,
     load1_milli: u32 = 0, // /proc/loadavg field1 * 1000 (integer, no float on wire)
+    load5_milli: u32 = 0, // /proc/loadavg field2 * 1000
+    load15_milli: u32 = 0, // /proc/loadavg field3 * 1000
+    uptime_s: u64 = 0, // /proc/uptime field1, whole seconds
+    cpu_temp_c: u32 = 0, // first CPU-temp hwmon chip's temp1_input, whole °C (0 = none)
     // network — one entry per non-loopback interface, cumulative monotonic
     // bytes. Only the first `iface_n` (<= max_ifaces) entries of `ifaces` are
     // valid. Daemon-local, so the fixed-size stored names never touch the wire
@@ -108,26 +117,48 @@ pub const HostSample = struct {
 
 // ------------------------------------------------------ pure parsers
 
-pub const Mem = struct { total: u64 = 0, used: u64 = 0 };
+pub const Mem = struct {
+    total: u64 = 0,
+    used: u64 = 0,
+    // swap (bytes). swap_used = (SwapTotal - SwapFree) * 1024; swap_free =
+    // SwapFree * 1024. swap_total is kept so the encoder can skip a no-swap host.
+    swap_total: u64 = 0,
+    swap_used: u64 = 0,
+    swap_free: u64 = 0,
+};
 
 /// /proc/meminfo: MemTotal (limit) and MemAvailable (both in kB). used =
-/// (MemTotal - MemAvailable) * 1024. Every multiply/subtract saturates, so a
-/// garbage or absurdly long number yields 0 (parseInt overflow -> 0), never a
-/// trap. O(input): one pass over the lines.
+/// (MemTotal - MemAvailable) * 1024. Also SwapTotal/SwapFree (kB): swap_used =
+/// (SwapTotal - SwapFree) * 1024, swap_free = SwapFree * 1024. Every
+/// multiply/subtract saturates, so a garbage or absurdly long number yields 0
+/// (parseInt overflow -> 0), never a trap. O(input): one pass over the lines.
+///
+/// MUTATION SENTINEL: computing swap_used as `swap_total - swap_total` (always 0)
+/// or swapping the SwapTotal/SwapFree operands makes the "parseMeminfo reads
+/// swap" test see the wrong swap_used and fail.
 pub fn parseMeminfo(text: []const u8) Mem {
     var total_kb: u64 = 0;
     var avail_kb: u64 = 0;
+    var swap_total_kb: u64 = 0;
+    var swap_free_kb: u64 = 0;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
         if (std.mem.startsWith(u8, line, "MemTotal:")) {
             total_kb = firstUint(line["MemTotal:".len..]);
         } else if (std.mem.startsWith(u8, line, "MemAvailable:")) {
             avail_kb = firstUint(line["MemAvailable:".len..]);
+        } else if (std.mem.startsWith(u8, line, "SwapTotal:")) {
+            swap_total_kb = firstUint(line["SwapTotal:".len..]);
+        } else if (std.mem.startsWith(u8, line, "SwapFree:")) {
+            swap_free_kb = firstUint(line["SwapFree:".len..]);
         }
     }
     return .{
         .total = total_kb *| 1024,
         .used = (total_kb -| avail_kb) *| 1024,
+        .swap_total = swap_total_kb *| 1024,
+        .swap_used = (swap_total_kb -| swap_free_kb) *| 1024,
+        .swap_free = swap_free_kb *| 1024,
     };
 }
 
@@ -191,12 +222,25 @@ pub fn parseStatCpu(text: []const u8) Cpu {
     return res;
 }
 
-/// /proc/loadavg field 1 ("1.25") -> milli (1250), integer only — NO float on
-/// the wire. Manual digit scan so the whole part saturates a u32 and at most 3
-/// fractional digits are taken (padded to 3). O(input).
-pub fn parseLoadavg(text: []const u8) u32 {
+/// /proc/loadavg field `which` (0=1m, 1=5m, 2=15m; space-separated) -> milli
+/// ("1.25" -> 1250), integer only — NO float on the wire. Skips `which` leading
+/// whitespace-separated fields, then a manual digit scan so the whole part
+/// saturates a u32 and at most 3 fractional digits are taken (padded to 3). A
+/// field that is missing (fewer than `which`+1 fields) scans nothing -> 0.
+/// O(input).
+///
+/// MUTATION SENTINEL: swapping the 5m/15m field index at the call site (or
+/// off-by-one in the field skip here) makes the "loadFieldMilli reads 1m/5m/15m"
+/// test read the wrong column and fail.
+pub fn loadFieldMilli(text: []const u8, which: usize) u32 {
     var i: usize = 0;
     while (i < text.len and (text[i] == ' ' or text[i] == '\t')) : (i += 1) {}
+    // Skip `which` whitespace-separated fields to reach the target column.
+    var f: usize = 0;
+    while (f < which) : (f += 1) {
+        while (i < text.len and text[i] != ' ' and text[i] != '\t') : (i += 1) {}
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) : (i += 1) {}
+    }
     var whole: u32 = 0;
     while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
         whole = whole *| 10 +| (text[i] - '0');
@@ -212,6 +256,63 @@ pub fn parseLoadavg(text: []const u8) u32 {
     }
     while (fdigits < 3) : (fdigits += 1) frac *= 10; // "25" -> 250
     return whole *| 1000 +| frac;
+}
+
+/// /proc/loadavg field 1 ("1.25") -> milli (1250). Thin wrapper over
+/// loadFieldMilli(text, 0), kept for existing callers/tests.
+pub fn parseLoadavg(text: []const u8) u32 {
+    return loadFieldMilli(text, 0);
+}
+
+/// /proc/uptime field 1 (float seconds, e.g. "12345.67") -> whole seconds (u64,
+/// saturating). Only the integer part before '.' is kept; fractional seconds and
+/// the second field (cumulative idle time) are ignored. Leading whitespace is
+/// skipped; garbage -> 0. O(input).
+pub fn parseUptime(text: []const u8) u64 {
+    var i: usize = 0;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) : (i += 1) {}
+    var secs: u64 = 0;
+    while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
+        secs = secs *| 10 +| (text[i] - '0');
+    }
+    return secs;
+}
+
+/// hwmon chip `name` values (the `name` file of /sys/class/hwmon/hwmonN) that
+/// expose a meaningful CPU package/core temperature in temp1_input. Everything
+/// else (acpitz, nvme, drivetemp, ...) is ignored.
+///
+/// MUTATION SENTINEL: removing an entry (or bypassing isCpuTempChip) lets a
+/// non-CPU chip's temp1_input be reported as the CPU temperature — the
+/// "cpuTempFromHwmon" test's non-CPU-name case then returns a value and fails.
+const cpu_temp_chips = [_][]const u8{
+    "coretemp", "k10temp", "zenpower", "cpu_thermal", "k8temp",
+};
+
+/// True iff `name` (trimmed) is one of the CPU-temperature hwmon chips.
+fn isCpuTempChip(name: []const u8) bool {
+    const n = std.mem.trim(u8, name, " \t\r\n\x00");
+    for (cpu_temp_chips) |c| {
+        if (std.mem.eql(u8, c, n)) return true;
+    }
+    return false;
+}
+
+/// milli-°C text (e.g. "55000") -> whole °C (u32). parseInt overflow (a too-long
+/// digit run) -> 0; the /1000 and cast saturate, never a trap.
+fn parseMilliCelsius(text: []const u8) u32 {
+    const t = std.mem.trim(u8, text, " \t\r\n\x00");
+    const milli = std.fmt.parseInt(u64, t, 10) catch return 0;
+    const c = milli / 1000;
+    return if (c > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(c);
+}
+
+/// Given a hwmon chip's `name` file text and its `temp1_input` text, return the
+/// CPU temperature in whole °C iff the chip is a CPU-temp chip, else null. Pure:
+/// deterministically unit-testable with fixture strings.
+pub fn cpuTempFromHwmon(name_text: []const u8, temp_text: []const u8) ?u32 {
+    if (!isCpuTempChip(name_text)) return null;
+    return parseMilliCelsius(temp_text);
 }
 
 /// /proc/net/dev: capture rx-bytes (col 1) and tx-bytes (col 9) PER
@@ -473,6 +574,29 @@ fn readTrimmed(path: [*:0]const u8, buf: []u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n\x00");
 }
 
+/// CPU temperature (whole °C) from the first CPU-temp hwmon chip, else 0.
+/// Bounded probe of /sys/class/hwmon/hwmon0..15: read each `name`, and on the
+/// first whose name is in the CPU-temp allowlist, read that hwmon's temp1_input
+/// (milli-°C -> °C). Fail-closed: a missing dir/file, a non-CPU name, or an
+/// unreadable temp1_input is skipped; none found -> 0. All buffers are fixed
+/// stack allocations; no heap.
+fn readCpuTemp() u32 {
+    var path_buf: [64]u8 = undefined;
+    var name_buf: [64]u8 = undefined;
+    var temp_buf: [64]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) { // bounded probe hwmon0..hwmon15
+        const name_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/hwmon/hwmon{d}/name", .{i}) catch continue;
+        const name = readFile(name_path.ptr, &name_buf) orelse continue;
+        if (!isCpuTempChip(name)) continue;
+        // name_buf holds `name`; path_buf is free to reuse for the temp path.
+        const temp_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/hwmon/hwmon{d}/temp1_input", .{i}) catch continue;
+        const temp = readFile(temp_path.ptr, &temp_buf) orelse continue;
+        return parseMilliCelsius(temp); // first CPU-temp chip wins
+    }
+    return 0;
+}
+
 /// host.name from /proc/sys/kernel/hostname (trimmed). Falls back to the
 /// stable literal "unknown" so the OTLP resource attribute is never empty.
 pub fn hostName(buf: []u8) []const u8 {
@@ -535,9 +659,22 @@ pub const Sampler = struct {
         const mem = parseMeminfo(readFile("/proc/meminfo", &mem_buf) orelse "");
         out.mem_total = mem.total;
         out.mem_used = mem.used;
+        out.swap_total = mem.swap_total;
+        out.swap_used = mem.swap_used;
+        out.swap_free = mem.swap_free;
 
         var load_buf: [128]u8 = undefined;
-        out.load1_milli = parseLoadavg(readFile("/proc/loadavg", &load_buf) orelse "");
+        const load_text = readFile("/proc/loadavg", &load_buf) orelse "";
+        out.load1_milli = loadFieldMilli(load_text, 0);
+        out.load5_milli = loadFieldMilli(load_text, 1);
+        out.load15_milli = loadFieldMilli(load_text, 2);
+
+        var uptime_buf: [128]u8 = undefined;
+        out.uptime_s = parseUptime(readFile("/proc/uptime", &uptime_buf) orelse "");
+
+        // CPU temperature: bounded probe of hwmon0..15, first CPU-temp chip wins;
+        // 0 when no CPU-temp chip is present (fail-closed).
+        out.cpu_temp_c = readCpuTemp();
 
         // Per-interface network counters. Read /proc/net/dev (8 KiB covers many
         // interfaces; truncation is safe — we parse what we read) and fill the
@@ -857,6 +994,66 @@ test "parseLoadavg reads the 1m field as milli" {
     try testing.expectEqual(@as(u32, 1250), parseLoadavg("1.25 0.80 0.66 1/234 5678"));
     try testing.expectEqual(@as(u32, 0), parseLoadavg("0.00 0.80 0.66"));
     try testing.expectEqual(@as(u32, 12000), parseLoadavg("12 0.0 0.0")); // no fraction
+}
+
+// MUTATION TARGET: swapping the 5m/15m field index (or an off-by-one in the
+// field skip) makes loadFieldMilli read the wrong column — this test's 5m/15m
+// assertions then fail. 1m is unchanged so parseLoadavg still passes.
+test "loadFieldMilli reads 1m, 5m, 15m columns as milli" {
+    const s = "1.25 2.50 3.75 1/234 5678";
+    try testing.expectEqual(@as(u32, 1250), loadFieldMilli(s, 0)); // 1m
+    try testing.expectEqual(@as(u32, 2500), loadFieldMilli(s, 1)); // 5m
+    try testing.expectEqual(@as(u32, 3750), loadFieldMilli(s, 2)); // 15m
+    try testing.expectEqual(@as(u32, 1250), parseLoadavg(s)); // 1m wrapper unchanged
+}
+
+test "parseMeminfo reads swap (used = SwapTotal - SwapFree, bytes)" {
+    const s =
+        "MemTotal:       65808388 kB\n" ++
+        "MemAvailable:   40000000 kB\n" ++
+        "SwapTotal:       2000000 kB\n" ++
+        "SwapFree:         500000 kB\n";
+    const m = parseMeminfo(s);
+    try testing.expectEqual(@as(u64, 2000000 * 1024), m.swap_total);
+    try testing.expectEqual(@as(u64, (2000000 - 500000) * 1024), m.swap_used);
+    try testing.expectEqual(@as(u64, 500000 * 1024), m.swap_free);
+}
+
+test "parseMeminfo no-swap fixture -> swap fields 0" {
+    const m = parseMeminfo("MemTotal: 1000 kB\nMemAvailable: 500 kB\n");
+    try testing.expectEqual(@as(u64, 0), m.swap_total);
+    try testing.expectEqual(@as(u64, 0), m.swap_used);
+    try testing.expectEqual(@as(u64, 0), m.swap_free);
+}
+
+test "parseUptime keeps whole seconds from field 1" {
+    try testing.expectEqual(@as(u64, 12345), parseUptime("12345.67 98765.43\n"));
+    try testing.expectEqual(@as(u64, 0), parseUptime("garbage"));
+    try testing.expectEqual(@as(u64, 42), parseUptime("42 0.0\n")); // no fraction
+}
+
+test "cpuTempFromHwmon matches CPU chips and parses milli-°C, ignores others" {
+    // coretemp is a CPU-temp chip: 55000 milli-°C -> 55 °C.
+    try testing.expectEqual(@as(?u32, 55), cpuTempFromHwmon("coretemp\n", "55000\n"));
+    // Every allowlisted chip is accepted.
+    try testing.expectEqual(@as(?u32, 42), cpuTempFromHwmon("k10temp\n", "42000\n"));
+    try testing.expectEqual(@as(?u32, 60), cpuTempFromHwmon("cpu_thermal\n", "60000\n"));
+    // acpitz is NOT a CPU-temp chip -> not used.
+    try testing.expectEqual(@as(?u32, null), cpuTempFromHwmon("acpitz\n", "55000\n"));
+    try testing.expectEqual(@as(?u32, null), cpuTempFromHwmon("nvme\n", "40000\n"));
+}
+
+test "overflow-safe: giant swap/uptime/temp values saturate, no trap" {
+    // A giant swap number saturates (parseInt overflow -> 0), never traps.
+    const m = parseMeminfo("SwapTotal: 99999999999999999999999 kB\nSwapFree: 1 kB\n");
+    try testing.expectEqual(@as(u64, 0), m.swap_total);
+    try testing.expectEqual(@as(u64, 0), m.swap_used); // (0 -| tiny) *| 1024 = 0
+    // A giant uptime saturates its u64, never traps.
+    _ = parseUptime("99999999999999999999999999999999.5 0\n");
+    // A giant temp: parseInt overflow -> 0 (no trap).
+    try testing.expectEqual(@as(?u32, 0), cpuTempFromHwmon("coretemp\n", "99999999999999999999999\n"));
+    // A within-range but huge milli-°C divides down and casts safely (saturates).
+    try testing.expectEqual(@as(?u32, std.math.maxInt(u32)), cpuTempFromHwmon("coretemp", "18446744073709551000"));
 }
 
 test "overflow-safe: a giant /proc number saturates, no trap" {
