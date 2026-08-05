@@ -3,6 +3,17 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.8.1] - 2026-08-05
+
+### Changed
+- **Internal: worker-name derivation unified into `src/names.zig`.** The
+  basename → length-cap → dedup-suffix → Prometheus-unsafe-neutralization logic
+  was duplicated between the spawner (a worker's actual name) and the config
+  parser (the name a `[secret.*]` grant resolves against), with two independent
+  cap constants free to drift. Both now call the same `names.finalize`, so a
+  worker's name and the name a grant matches on can never diverge. No behavior
+  change (harness green, 77/77); the stripped binary is ~300 B smaller.
+
 ## [1.8.0] - 2026-08-04
 
 ### Added
