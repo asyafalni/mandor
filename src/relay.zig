@@ -1282,10 +1282,12 @@ pub fn runDaemon(
     var next_node_sample_ms: u64 = monoMs() +| sampler.interval_ms;
 
     // GPU sampling ([gpu] enabled): its own timer on the daemon, off PID 1.
-    // gpu.sample() forks/execs nvidia-smi bounded + timed and is fail-closed
-    // (absent binary / error -> empty slice + one stderr log), so nothing here
-    // can affect supervision or the host/process telemetry. path_env resolves
-    // the bare `nvidia-smi`; envp is the daemon's own environment for the child.
+    // TWO sources under this ONE toggle: gpu.sample() forks/execs nvidia-smi
+    // (bounded + timed, fail-closed), and gpu.sampleDrm() reads AMD/Intel DRM
+    // sysfs (pure file reads, no subprocess, fail-closed). Both are fail-closed
+    // (empty slice on any error), so nothing here can affect supervision or the
+    // host/process telemetry. path_env resolves the bare `nvidia-smi`; envp is
+    // the daemon's own environment for the child.
     const gpu_path_env = spawner.findPath(environ);
     var gpu_samples: [gpu.max_gpus]gpu.GpuSample = undefined;
     var next_gpu_sample_ms: u64 = if (gpu_enabled) monoMs() +| gpu_interval_ms else 0;
@@ -1339,8 +1341,18 @@ pub fn runDaemon(
         // nothing here and never disturbs the other tiers. A build failure or
         // an empty batch drops the sample (routine telemetry is ephemeral).
         if (gpu_enabled and monoMs() >= next_gpu_sample_ms) {
-            const gs = gpu.sample(gpu_path_env, environ.ptr, &gpu_samples);
-            if (gs.len > 0) {
+            // TWO GPU sources into ONE contiguous buffer, shipped in ONE POST:
+            //   1. nvidia-smi (subprocess, fail-closed) fills gpu_samples[0..nv].
+            //   2. DRM sysfs (pure file reads, no subprocess) appends AMD/Intel
+            //      cards after them via sampleDrm(start_index = nv.len), which
+            //      writes at [nv.len..] and gives each a unique index continuing
+            //      from nv.len — so the merged set can't collide on the index
+            //      attribute. Both flow through the SAME buildOtlpGpuMetrics.
+            const nv = gpu.sample(gpu_path_env, environ.ptr, &gpu_samples);
+            const drm = gpu.sampleDrm(&gpu_samples, @intCast(nv.len));
+            const total = nv.len + drm.len;
+            if (total > 0) {
+                const gs = gpu_samples[0..total]; // contiguous {nvidia ++ drm}
                 if (buildOtlpGpuMetrics(gs, daemon_host_name, daemon_host_id)) |b| {
                     _ = post(hp.host, hp.port, "/v1/metrics", b, token);
                 } else |_| {

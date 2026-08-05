@@ -125,6 +125,58 @@ pub fn parseNvidiaSmi(csv: []const u8, out: *[max_gpus]GpuSample) []const GpuSam
     return out[0..n];
 }
 
+// ------------------------------------------------------- DRM sysfs (AMD/Intel)
+//
+// A SECOND GPU source with the SAME GpuSample shape, filled from pure sysfs file
+// reads (no subprocess — unlike the nvidia-smi path). AMD amdgpu primarily,
+// Intel best-effort. These samples flow through the SAME buildOtlpGpuMetrics
+// encoder as the nvidia-smi samples — no encoder change, one merged POST.
+//
+// STABILITY (the motto): every read is fail-closed (unreadable file -> "" -> the
+// field is 0, or the whole card is skipped); every parse saturates; the set is
+// bounded to max_gpus; no subprocess, no alloc, no unreachable/panic. Runs ONLY
+// in the relay daemon (off PID 1), under the SAME `[gpu] enabled` toggle.
+
+/// PURE per-card core: given the (already-file-read) CONTENTS of one card's
+/// sysfs files, produce a GpuSample — or `null` to SKIP the card. The skip rule
+/// is the whole point: a card with no `gpu_busy_percent` (empty `util`) is an
+/// NVIDIA GPU (or a non-GPU DRM node) already covered by nvidia-smi, so it is
+/// dropped here to avoid double-counting. Units: VRAM is bytes as-is; temp is
+/// milli-°C ÷1000 -> °C; power is micro-W ÷1000 -> mW. Every field parses
+/// saturating (garbage/over-long -> saturates; missing -> ""/0). `index` becomes
+/// the sample's index; `name` is copied (truncated to name_cap). No syscalls, no
+/// allocation: deterministically unit-testable with fixture strings.
+///
+/// MUTATION SENTINEL: the `util_t.len == 0 -> return null` guard is the "skip a
+/// card without gpu_busy_percent" rule. Treating empty util as 0 and keeping the
+/// card (dropping this return) makes the "parseDrmCard skips a card without
+/// gpu_busy_percent" test fail.
+pub fn parseDrmCard(
+    index: u32,
+    name: []const u8,
+    util: []const u8, // gpu_busy_percent (0..100); empty -> skip the card
+    vram_used: []const u8, // mem_info_vram_used (bytes)
+    vram_total: []const u8, // mem_info_vram_total (bytes)
+    temp: []const u8, // hwmon tempN_input (milli-°C); may be empty -> 0
+    power: []const u8, // hwmon power1_average (micro-W); may be empty -> 0
+) ?GpuSample {
+    const ws = " \t\r\n\x00";
+    const util_t = std.mem.trim(u8, util, ws);
+    if (util_t.len == 0) return null; // no gpu_busy_percent -> not an amdgpu -> skip
+
+    var g = GpuSample{};
+    g.index = index;
+    const nlen = @min(name.len, name_cap);
+    @memcpy(g.name[0..nlen], name[0..nlen]);
+    g.name_len = @intCast(nlen);
+    g.util_pct = parseUint(u32, util_t);
+    g.mem_used = parseUint(u64, std.mem.trim(u8, vram_used, ws)); // bytes as-is
+    g.mem_total = parseUint(u64, std.mem.trim(u8, vram_total, ws)); // bytes as-is
+    g.temp_c = parseUint(u32, std.mem.trim(u8, temp, ws)) / 1000; // milli-°C -> °C
+    g.power_mw = parseUint(u64, std.mem.trim(u8, power, ws)) / 1000; // micro-W -> mW
+    return g;
+}
+
 // ------------------------------------------------------- daemon-side sampling
 
 /// Bounded scratch for nvidia-smi's stdout. 16 GPUs × one CSV line each is far
@@ -273,6 +325,95 @@ pub fn sample(
     return parseNvidiaSmi(stdout_buf[0..filled], out);
 }
 
+// ------------------------------------------------------- DRM sysfs reader
+//
+// Fixed buffers + raw openat/read/close (posix.errno), mirroring
+// hostmetrics.readFile/readTrimmed. NEVER fails: an unreadable/absent file is ""
+// (fail-closed). No allocation, no subprocess.
+
+/// Read a small sysfs file into `buf`, returning it trimmed of surrounding
+/// whitespace/NUL — or "" on ANY error (absent, EACCES, read error). Mirrors
+/// hostmetrics.readTrimmed's fail-closed contract.
+fn readTrimmed(path: [*:0]const u8, buf: []u8) []const u8 {
+    const rc = linux.openat(linux.AT.FDCWD, path, .{}, 0);
+    if (posix.errno(rc) != .SUCCESS) return "";
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, buf.ptr, buf.len);
+    if (posix.errno(n) != .SUCCESS) return "";
+    return std.mem.trim(u8, buf[0..n], " \t\r\n\x00");
+}
+
+/// Read `/sys/class/drm/card<card>/device/<leaf>` into `buf` (trimmed), "" on
+/// any failure. Building `card<card>` from an integer sidesteps the
+/// `card<N>-<connector>` output nodes entirely — we never enumerate them, so
+/// only bare-card device attributes are ever read.
+fn readLeaf(card: u32, comptime leaf: []const u8, buf: []u8) []const u8 {
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/sys/class/drm/card{d}/device/" ++ leaf, .{card}) catch return "";
+    return readTrimmed(path, buf);
+}
+
+/// hwmon is optional and its instance number varies (`hwmon0`, `hwmon3`, ...).
+/// Without getdents we PROBE a bounded set of instances and take the first that
+/// yields the leaf; absent hwmon -> "" (best-effort, 0 downstream). Bounded loop.
+fn readHwmon(card: u32, comptime leaf: []const u8, buf: []u8) []const u8 {
+    var h: u32 = 0;
+    while (h < 8) : (h += 1) { // bounded probe: hwmon0..hwmon7
+        var path_buf: [160]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "/sys/class/drm/card{d}/device/hwmon/hwmon{d}/" ++ leaf, .{ card, h }) catch continue;
+        const v = readTrimmed(path, buf);
+        if (v.len != 0) return v;
+    }
+    return "";
+}
+
+/// Enumerate DRM cards via a bounded PROBE (card0..card{max_gpus-1}) — no
+/// getdents needed, and constructing `card<N>` by integer never touches the
+/// `card<N>-<connector>` output nodes. For each card, read `gpu_busy_percent`
+/// first: absent -> the card is an NVIDIA GPU (already covered by nvidia-smi) or
+/// not a GPU, so it is SKIPPED (this cleanly avoids double-counting). Present ->
+/// read VRAM + hwmon temp/power (best-effort, 0 if missing) and fill a GpuSample
+/// via the pure `parseDrmCard`.
+///
+/// Samples are written into `out` STARTING at `start_index` and each is given a
+/// UNIQUE `index` continuing from `start_index`, so a merged {nvidia ++ drm} set
+/// shares one contiguous buffer and never collides on the index attribute
+/// (gpu.name disambiguates further). Bounded to max_gpus; NEVER fails (unreadable
+/// -> skip); no allocation, no subprocess. Runs ONLY in the daemon.
+pub fn sampleDrm(out: *[max_gpus]GpuSample, start_index: u32) []const GpuSample {
+    const base: u32 = if (start_index < max_gpus) start_index else max_gpus;
+    var w: u32 = base;
+    var card: u32 = 0;
+    while (card < max_gpus and w < max_gpus) : (card += 1) {
+        // Each field reads into its OWN buffer so all slices stay valid until the
+        // single parseDrmCard call (no read clobbers a prior field's bytes).
+        var b_util: [64]u8 = undefined;
+        var b_vu: [64]u8 = undefined;
+        var b_vt: [64]u8 = undefined;
+        var b_temp: [64]u8 = undefined;
+        var b_power: [64]u8 = undefined;
+        var b_name: [96]u8 = undefined;
+
+        const util = readLeaf(card, "gpu_busy_percent", &b_util);
+        if (util.len == 0) continue; // no gpu_busy_percent -> skip (NVIDIA / non-GPU)
+
+        const vu = readLeaf(card, "mem_info_vram_used", &b_vu);
+        const vt = readLeaf(card, "mem_info_vram_total", &b_vt);
+        const temp = readHwmon(card, "temp1_input", &b_temp); // milli-°C, optional
+        const power = readHwmon(card, "power1_average", &b_power); // micro-W, optional
+
+        // Name: prefer product_name; else the stable fallback "card<N>".
+        var name = readLeaf(card, "product_name", &b_name);
+        if (name.len == 0) name = std.fmt.bufPrint(&b_name, "card{d}", .{card}) catch "card";
+
+        const g = parseDrmCard(w, name, util, vu, vt, temp, power) orelse continue;
+        out[w] = g;
+        w += 1;
+    }
+    return out[base..w];
+}
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -344,4 +485,87 @@ test "parseNvidiaSmi truncates an over-long GPU name" {
     try testing.expectEqual(@as(usize, 1), g.len);
     try testing.expectEqual(@as(u8, name_cap), g[0].name_len);
     try testing.expectEqual(@as(usize, name_cap), g[0].nameSlice().len);
+}
+
+test "parseDrmCard builds a GpuSample from AMD sysfs fixtures with correct units" {
+    // Real amdgpu sysfs shapes (trailing newlines included): gpu_busy_percent is
+    // an integer %, VRAM is bytes as-is, temp is milli-°C (÷1000), power is
+    // micro-W (÷1000 = mW).
+    const g = parseDrmCard(
+        0,
+        "card0",
+        "42\n",
+        "2147483648\n", // 2 GiB used, bytes as-is
+        "17179869184\n", // 16 GiB total, bytes as-is
+        "65000\n", // 65.000 °C
+        "120000000\n", // 120 W -> 120000 mW
+    ) orelse return error.UnexpectedNull;
+    try testing.expectEqual(@as(u32, 0), g.index);
+    try testing.expectEqualStrings("card0", g.nameSlice());
+    try testing.expectEqual(@as(u32, 42), g.util_pct);
+    try testing.expectEqual(@as(u64, 2147483648), g.mem_used); // bytes, no rescale
+    try testing.expectEqual(@as(u64, 17179869184), g.mem_total);
+    try testing.expectEqual(@as(u32, 65), g.temp_c); // 65000 milli-°C -> 65
+    try testing.expectEqual(@as(u64, 120000), g.power_mw); // 120000000 micro-W -> 120000 mW
+}
+
+// MUTATION TARGET: the `util_t.len == 0 -> return null` guard in parseDrmCard.
+// Treating an empty gpu_busy_percent as 0 and KEEPING the card (dropping the
+// return) makes this test fail — the card must be SKIPPED, because a DRM node
+// without gpu_busy_percent is an NVIDIA GPU (already covered by nvidia-smi) or
+// not a GPU at all, and keeping it double-counts.
+test "parseDrmCard skips a card without gpu_busy_percent" {
+    // Empty util (file absent -> readLeaf returned "") must skip the card.
+    try testing.expect(parseDrmCard(0, "card0", "", "1", "2", "65000", "1000") == null);
+    // Whitespace-only util is likewise "no gpu_busy_percent" -> skipped.
+    try testing.expect(parseDrmCard(0, "card0", "  \n", "1", "2", "65000", "1000") == null);
+}
+
+test "parseDrmCard: missing temp/power are 0 and garbage/over-long saturates" {
+    // Missing hwmon temp/power (empty) -> 0, no trap.
+    const g = parseDrmCard(3, "card3", "10\n", "", "", "", "") orelse return error.UnexpectedNull;
+    try testing.expectEqual(@as(u32, 3), g.index);
+    try testing.expectEqual(@as(u32, 10), g.util_pct);
+    try testing.expectEqual(@as(u64, 0), g.mem_used);
+    try testing.expectEqual(@as(u64, 0), g.mem_total);
+    try testing.expectEqual(@as(u32, 0), g.temp_c);
+    try testing.expectEqual(@as(u64, 0), g.power_mw);
+
+    // A garbage/over-long value must saturate (parseUint saturates), never trap.
+    const big = "999999999999999999999999999999";
+    const g2 = parseDrmCard(0, "card0", "999", big, big, big, big) orelse return error.UnexpectedNull;
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), g2.mem_used); // saturated
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), g2.mem_total);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32) / 1000), g2.temp_c); // saturate then ÷1000
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64) / 1000), g2.power_mw);
+}
+
+test "parseDrmCard assigns indices continuing from start_index (no nvidia collision)" {
+    // sampleDrm hands parseDrmCard w = start_index, start_index+1, ... — mirror
+    // that here so the merged {nvidia ++ drm} set can never collide on `index`.
+    const start_index: u32 = 2; // e.g. 2 NVIDIA GPUs already occupy 0 and 1
+    var seen: [4]u32 = undefined;
+    var j: u32 = 0;
+    while (j < 4) : (j += 1) {
+        const g = parseDrmCard(start_index + j, "card", "5", "1", "2", "0", "0") orelse return error.UnexpectedNull;
+        seen[j] = g.index;
+    }
+    try testing.expectEqual(@as(u32, 2), seen[0]); // starts AT start_index, not 0
+    try testing.expectEqual(@as(u32, 3), seen[1]);
+    try testing.expectEqual(@as(u32, 4), seen[2]);
+    try testing.expectEqual(@as(u32, 5), seen[3]);
+}
+
+test "sampleDrm never traps and respects start_index bound" {
+    // Exercises the file-reading path. On CI/dev hosts there is usually no amdgpu
+    // (or no /sys at all), so the assertion is the FAIL-CLOSED contract: it must
+    // return without trapping, bounded, and honour start_index. If a real amdgpu
+    // IS present, every returned sample's index is >= start_index (continuation).
+    var out: [max_gpus]GpuSample = undefined;
+    const start_index: u32 = 3;
+    const drm = sampleDrm(&out, start_index);
+    try testing.expect(drm.len <= max_gpus - start_index); // bounded, appended after slot 2
+    for (drm) |g| try testing.expect(g.index >= start_index);
+    // start_index past the buffer -> empty, never an overrun.
+    try testing.expectEqual(@as(usize, 0), sampleDrm(&out, max_gpus + 5).len);
 }
