@@ -3,6 +3,28 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.10.0] - 2026-08-06
+
+### Added
+- **Opt-in full worker-log streaming (`[logs] stream`).** When set (and `photon=`
+  is configured), the relay daemon ships every captured worker stdout/stderr line
+  to photon's OTLP `/v1/logs` — one `service.name` per worker, the line as the log
+  `body`, stderr/error lines severity-flagged, same `host.name`/`host.id` as the
+  metrics. Default **off**: mandor still curates by default (log content otherwise
+  reaches photon only inside incident bundles). This is the **ephemeral** tier —
+  best-effort over the non-blocking pipe, **dropped under backpressure**, never
+  spooled or retried (incidents remain the only durable tier). `[logs] max_rate`
+  caps lines/sec (0 = unlimited); over-cap lines are dropped, not blocked. Traces
+  are never shipped. Verified end to end against photon v1.5.0 (50/50 distinct
+  lines delivered) and default-off proven by a harness case.
+
+### Changed
+- **CPU temperature now also reads `/sys/class/thermal/thermal_zone*`** (Intel
+  `x86_pkg_temp`, ARM `cpu-thermal`, …) as a fallback when no hwmon
+  `coretemp`/`k10temp` chip is present, so `system.cpu.temperature` populates on
+  more hosts. Still fail-closed (no sensor ⇒ no datapoint).
+- Config-surface budget 38 → 40 for the two `[logs]` keys (`stream`, `max_rate`).
+
 ## [1.9.0] - 2026-08-05
 
 mandor absorbs the role of **photon-agent** (photon's standalone per-host
