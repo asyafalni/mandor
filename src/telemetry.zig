@@ -169,6 +169,15 @@ pub fn emitLifecycle(e: frame.Lifecycle) void {
 /// built) is the separate volume knob.
 const max_log_frame = 4096;
 
+/// emitLog's frame-encode scratch. Module-level (not a stack local) on purpose:
+/// emitLog is called from the per-line capture hot path and gets INLINED into
+/// `echoLine`, so a 4 KB stack local would inflate echoLine's frame past Zig's
+/// stack-probe threshold and cost a `__zig_probe_stack` on EVERY captured line —
+/// even when streaming is off. As BSS it lives outside any frame; single-
+/// threaded, and fully consumed within emitLog before the next call, so sharing
+/// is safe (same rationale as the supervisor's echo_scratch/merged_env statics).
+var emit_log_buf: [max_log_frame]u8 = undefined;
+
 /// Streamed log lines dropped: pipe full, daemon gone, or a frame too large for
 /// one atomic pipe write. Streamed logs are the lossy tier — a drop here never
 /// touches supervision or the durable incident spool. Saturating so it cannot
@@ -206,8 +215,7 @@ pub fn rateDrops() u64 {
 /// error (see capture.severityFromFlags).
 pub fn emitLog(name: []const u8, iostream: u8, severity: u8, t_ns: u64, line: []const u8) void {
     if (write_fd < 0) return;
-    var buf: [max_log_frame]u8 = undefined;
-    const bytes = frame.encodeLog(&buf, .{
+    const bytes = frame.encodeLog(&emit_log_buf, .{
         .name = name,
         .iostream = iostream,
         .severity = severity,
