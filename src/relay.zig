@@ -20,9 +20,19 @@ const gpu = @import("gpu.zig");
 /// strand a process for the life of the container.
 const relay_timeout_s = 10;
 
-var file_buf: [256 * 1024]u8 = undefined;
-var body_buf: [320 * 1024]u8 = undefined;
-var req_buf: [321 * 1024]u8 = undefined;
+// The largest OTLP message mandor ever builds is an incident bundle embedded
+// raw as the `mandor.bundle` attribute. A bundle is capped at 128 KB (spool's
+// bundle_buf) and protobuf embeds strings UNESCAPED, so that message is the
+// bundle plus ~1 KB of framing. Every other encoder is far smaller: process /
+// host / GPU metrics are tens of KB, and the streamed-log batch is bounded by
+// the 64 KB log_arena. So the body buffer only needs the bundle cap plus a
+// generous OTLP-framing margin; a message that would exceed it returns
+// error.TooLarge and is dropped (the incident stays durable on the spool).
+// These were 320/321/256 KB — over-provisioned for a 128 KB-max message.
+const max_bundle = 128 * 1024;
+var file_buf: [max_bundle]u8 = undefined; // reads one on-disk bundle (<= 128 KB by construction)
+var body_buf: [max_bundle + 32 * 1024]u8 = undefined; // 160 KB: bundle + framing margin
+var req_buf: [body_buf.len + 4 * 1024]u8 = undefined; // body + HTTP request line/headers
 
 pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const ?[*:0]const u8) u8 {
     const bundle = readFile(path) catch |e| {
