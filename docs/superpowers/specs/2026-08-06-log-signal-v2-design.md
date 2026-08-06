@@ -65,6 +65,27 @@ Guarded for flood safety by:
   encode+write — mandor's streaming CPU **self-caps, no config**.
 - **`max_rate`** (global, lines/sec, already drops pre-encode) — optional hard cap.
 
+## Multi-tenancy — service prefix
+
+photon is multi-tenant: several mandor origins (deployments / environments /
+tenants) publish to the same photon, and two of them may run a worker with the
+same name (e.g. `api`), colliding on `service.name`. A config key adds an origin
+**prefix** to `service.name` on **every** OTLP emission so origins stay distinct:
+
+```toml
+photon = "…"
+service_prefix = "tenant-a-"     # service.name becomes e.g. "tenant-a-api"
+```
+
+- Applied in **one place** — a shared `putServiceName` helper the daemon uses in
+  every encoder that emits `service.name` (process metrics, incidents, lifecycle,
+  streamed logs, the Tier-2 digest). The bare worker name is unchanged everywhere
+  else (log `[name]` prefix, `report`, Prometheus label) — the prefix is
+  telemetry-only. Default empty = no prefix (unchanged behavior).
+- The prefix is threaded to the daemon like the other telemetry config; a tiny
+  fixed scratch forms `prefix ++ name` (no alloc). `host.id` (machine-id) already
+  distinguishes hosts; the prefix is the service-level tenant tag.
+
 ## Config surface changes (breaking vs v1.10.0 — done while fresh)
 
 | v1.10.0 | v1.11.0 |
@@ -72,6 +93,7 @@ Guarded for flood safety by:
 | `[logs] stream = true` (global) | **removed** → per-worker `[worker.NAME] stream = true` |
 | `[logs] max_rate` | kept (global hard cap for Tier 3) |
 | — | `[logs] digest` (bool, default true), `digest_interval` (dur, 30s), `digest_threshold` (int) |
+| — | `service_prefix` (string, default "") — tenant/origin tag on `service.name` |
 
 Keep the 4-flag CLI rule (all TOML). Config-surface budget bumped for the net key
 change (removed `stream`; added `digest`/`digest_interval`/`digest_threshold`).
@@ -106,6 +128,11 @@ change (removed `stream`; added `digest`/`digest_interval`/`digest_threshold`).
 
 ## Phasing (tasks)
 
+0. **Service prefix (multi-tenancy)** — `service_prefix` config threaded to the
+   daemon; a shared `putServiceName` helper used by EVERY encoder that emits
+   `service.name` (process metrics, incident, lifecycle, streamed logs). Default
+   "" = unchanged. Unit (prefixed name in each encoder via protoWalk) + mutation.
+   Done first so the Tier-2/Tier-3 emitters inherit it.
 1. **Tier 3 → per-worker `stream`** (refactor v1.10.0 global toggle): `[worker.NAME] stream`, `Worker.stream`, supervisor gates `emitLog` per worker; remove `[logs] stream`; keep `max_rate`. Docs + harness (per-worker on/off).
 2. **Backpressure shedding** in `emitLog`: EAGAIN → shed state, pre-encode drop + cooldown/probe, counter. Unit + soak-style flood test (no CPU spike, drops counted).
 3. **Tier 2 accumulator**: signature table (`{sig,count,first,last,sample,sev}`, bounded), fed by warn/error-flagged lines in the capture path; reuse `summarize.signature`. Unit tests (dedup, count, overflow bucket). Mutation.
