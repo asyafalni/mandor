@@ -8,6 +8,6 @@ without running it: `mandor validate --config=PATH`.
 |---|---|
 | `web-worker-cron/` | API + worker + cron with start ordering and health-check-driven restart |
 | `init-task/` | Oneshot init task (setup/migration/warmup) that must succeed before workers start |
-| `photon-observability/` | Auto-forwarding incidents to the [photon](https://github.com/nevindra/photon) sister project, with persistent history |
+| `photon-observability/` | Push incidents, per-process + node/GPU metrics, lifecycle events (and opt-in logs) to the [photon](https://github.com/nevindra/photon) sister project over OTLP, with persistent crash history |
 
 Every configurable key: [../docs/CONFIG.md](../docs/CONFIG.md).

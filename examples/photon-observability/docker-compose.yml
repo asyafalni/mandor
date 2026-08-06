@@ -1,6 +1,9 @@
-# mandor + photon (sister project): incidents auto-forward to photon over
-# OTLP with a single config key, and a shared volume persists crash history
-# across container restarts. mandor stays offline until `photon` is set.
+# mandor + photon (sister project): with a single config key, mandor pushes
+# incidents, per-process + node metrics, and lifecycle events to photon over
+# OTLP (no collector), and a shared volume persists crash history across
+# container restarts. mandor stays offline until `photon` is set. To also report
+# the host + GPU (superseding a standalone node agent), mount /proc, /sys,
+# /etc/machine-id (and /dev/nvidia* for GPU) into `app` and set [gpu] enabled.
 services:
   app:
     build: .            # image ENTRYPOINT: ["/mandor", "--config=/mandor.toml"]
@@ -17,6 +20,8 @@ services:
 volumes:
   mandor-state:
 # mandor.toml inside the app image:
-#   restart = "on-failure"
-#   photon  = "photon:4318"
-#   workers = ["./api --port 3000", "./worker"]
+#   max_restarts = 3
+#   photon       = "photon:4318"
+#   workers      = ["./api --port 3000", "./worker"]
+#   # [gpu]        enabled = true      # opt-in NVIDIA/AMD/Intel GPU metrics
+#   # [logs]       stream  = true      # opt-in full log streaming to /v1/logs

@@ -116,8 +116,8 @@ hold:
 
 | Setup | Expected |
 |---|---|
-| plain worker, `--restart=on-failure` | `failed to start` → `restarting in 200ms` → recovers when the injection clears |
-| plain worker, `--restart=never` | `failed to start`, no retry, exit 125 |
+| plain worker, `--max-restarts=-1` | `failed to start` → `restarting in 200ms` → recovers when the injection clears |
+| plain worker, `--max-restarts=0` (default) | `failed to start`, no retry, exit 125 |
 | `essential = true` | `essential worker … stopping all`, fleet stops, exit 125 |
 | `oneshot = true` | `init task … failed, shutting down`, dependents never start |
 
@@ -137,10 +137,11 @@ body and costs ~6 KB of `.text` for identical behaviour.
 
 `src/fuzz.zig` mutation-fuzzes everything that consumes input mandor does not
 control: worker stderr (the six trace parsers), the worker's ELF header,
-`mandor.toml`, argv, `/proc` and cgroup text, mandor's own state files, the
-incident-bundle serializer, the capture ring buffer, and the cost
-accumulators. It runs as part of `zig build test`, with a different seed each
-invocation.
+`mandor.toml`, argv, `/proc` and cgroup text, `nvidia-smi` CSV output, mandor's
+own state files, the incident-bundle serializer, the OTLP encoders (metrics /
+host / GPU / streamed-log records — output must stay a decodable protobuf), the
+capture ring buffer, and the cost accumulators. It runs as part of
+`zig build test`, with a different seed each invocation.
 
 ```console
 zig build test --seed 0xdeadbeef   # replay a specific seed
@@ -184,8 +185,9 @@ instruments zero PCs with it off), which is why the harness is in-repo.
 ## Ground rules
 
 - **Size is a feature.** The stripped ReleaseSafe binary must stay under
-  500 KB (CI gates it); it currently sits near ~248 KB. A new dependency or
-  a large `std` pull-in needs a very good story.
+  500 KB (CI gates it, per-commit); it currently sits near ~348 KB (the opt-in
+  telemetry / node + GPU metrics subsystem is most of the growth since 1.6). A
+  new dependency or a large `std` pull-in needs a very good story.
 - **PID 1 must not die.** No panics on the supervision path; every syscall
   error is handled. No allocations in the steady state (fixed buffers).
 - **Offline by default.** The binary opens no network connection unless the

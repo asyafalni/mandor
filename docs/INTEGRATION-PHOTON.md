@@ -1,73 +1,97 @@
 # mandor × photon — integration design
 
-[photon](https://github.com/nevindra/photon) is mandor's sister project: an
-OTEL-native, single-binary observability platform (logs, traces, metrics,
-APM, uptime) in Rust. mandor is a PID-1 supervisor that *produces* exactly
-the signals photon *displays*. This doc defines how mandor tells its story
-to photon — without breaking mandor's product boundary (the free binary
-never phones home unless the operator opts in with `photon=`, and even then
-the supervision path itself opens no socket).
+[photon](https://github.com/nevindra/photon) is mandor's sister project (at
+v1.5.0): an OTEL-native, single-binary observability platform (logs, traces,
+metrics, APM, uptime) in Rust, with an Infrastructure / Hosts view — including a
+per-host Processes table — that mandor populates. mandor is a PID-1 supervisor
+that *produces* exactly the signals photon *displays*. This doc defines how
+mandor tells its story to photon — without breaking mandor's product boundary
+(the free binary never phones home unless the operator opts in with `photon=`,
+and even then the supervision path itself opens no socket).
 
 > **Self-sufficient as of the OTLP-telemetry work.** When `photon=` is set,
-> mandor ships **incidents, per-process/supervisor metrics, and process
-> lifecycle events** to photon directly as OTLP — **no collector in the
-> container is required** for any of the three. A single long-lived
-> `mandor relay --daemon` child owns the socket (watches the incident spool,
-> drains a non-blocking telemetry pipe); the supervision path never touches a
-> socket. The collector note in §1 below now applies only if you additionally
-> want third-party **pull** metrics off the Prometheus `--metrics` endpoint.
-> mandor does **not** ship raw per-line worker logs and never ships traces —
-> log content reaches photon inside incident bundles (their flagged log-tail
-> summary), not as a live stream.
+> mandor ships **incidents, per-process/supervisor metrics, node/host metrics,
+> optional GPU metrics, and process-lifecycle events** to photon directly as
+> OTLP — **no collector in the container is required** for any of them. A single
+> long-lived `mandor relay --daemon` child owns the socket (watches the incident
+> spool, drains a non-blocking telemetry pipe, and samples the node on its own
+> timer); the supervision path never touches a socket. Because mandor now pushes
+> node and GPU metrics itself, one mandor with the host mounted in **supersedes
+> photon's standalone `photon-agent`**. By default mandor still *curates* — it
+> does **not** ship raw per-line worker logs and never ships traces, so log
+> content reaches photon inside incident bundles (their flagged log-tail
+> summary). Full per-line log streaming exists but is strictly opt-in
+> (`[logs] stream`, see channel 2). The Prometheus `--metrics` endpoint remains a
+> local pull option; it is **no longer required** to get metrics into photon.
 
-## The three story channels
+## The story channels
 
-### 1. Metrics — native OTLP push when `photon=` is set; collector only for pull
+### 1. Metrics — native OTLP push when `photon=` is set
 
-**With `photon=` set, mandor now pushes OTLP metrics itself** (`/v1/metrics`,
-via the relay daemon): one `ResourceMetrics` per worker (`service.name=<worker>`)
-carrying rss/cpu/fds/threads gauges and a monotonic restarts sum, plus one
-`service.name="mandor"` supervisor self-metric. No collector needed. The rest
-of this section applies **only** if you instead want to *pull* metrics off
-mandor's Prometheus endpoint with third-party tooling.
+**With `photon=` set, mandor pushes OTLP metrics itself** (`/v1/metrics`, via the
+relay daemon) — no collector needed. Three resource scopes, all carrying the SAME
+`host.name`/`host.id` so photon's Infrastructure / Hosts view groups them under
+one node:
 
-mandor also serves Prometheus text on `--metrics=PORT` (127.0.0.1) — a **pull**
-endpoint. photon ingests metrics by **push** only: OTLP to `/v1/metrics`, or
-Prometheus `remote_write` to `/api/v1/write`. It has **no scraper** — verified
-against photon `main` (`f5b70df`, 2026-07-27): `photon-ingest` handles OTLP and
-`promrw_mapping`, and `photon-agent` collects host/GPU and *pushes*; nothing in
-the tree scrapes a target. A pull exporter and a push sink therefore do not
-meet on their own — a collector sits between them, scraping mandor and
-`remote_write`-ing to photon:
+- **Per-process + supervisor.** One `ResourceMetrics` per worker
+  (`service.name=<worker>`) with OTel-semconv `process.memory.usage`,
+  `process.cpu.utilization`, `process.unix.file_descriptor.count`,
+  `process.thread.count` gauges and a `process.restarts` monotonic sum; plus one
+  `service.name="mandor"` supervisor self-metric. Each worker resource also
+  carries `host.name`, so a worker is attributable to its node (photon's per-host
+  Processes table). Sampled on the /proc cadence (5s), delivered best-effort over
+  a non-blocking pipe — dropped under backpressure so telemetry never stalls
+  supervision.
+- **Node / host.** One host-scoped resource (`host.name`/`host.id`/`os.type`)
+  with `system.cpu.utilization` (`cpu=total` + per-core `cpu=<n>`),
+  `system.cpu.logical.count`, `system.cpu.load_average.{1m,5m,15m}`,
+  `system.memory.{usage,limit,utilization}`, `system.paging.usage` (swap),
+  `system.network.io` (per-interface × direction),
+  `system.filesystem.{usage,utilization}` (per-mount), `system.disk.io`
+  (per-device), plus mandor-extension gauges `system.uptime` and
+  `system.cpu.temperature`. Sampled **inside the daemon** (its own /proc + statfs
+  reads on a 5s timer) — the supervision path carries none of it. Emitted
+  automatically whenever `photon=` is set; there is no separate toggle.
+- **GPU** (opt-in `[gpu] enabled`, daemon-side, default 15s).
+  `system.gpu.{utilization,memory.usage,memory.utilization,temperature,power}`
+  per GPU (`gpu`, `gpu.name`). NVIDIA via an `nvidia-smi` shell-out (mandor is
+  static/libc-free, so it cannot dlopen NVML); AMD/Intel via DRM sysfs.
+  Fail-closed — no GPU, no `nvidia-smi`, or any error ⇒ nothing shipped, no
+  effect on anything else.
 
-```
-mandor --metrics=9464  ──scrape──▶  collector  ──remote_write──▶  photon /api/v1/write
-```
+Config specifics live in [CONFIG.md](CONFIG.md); the whole telemetry surface is
+`photon=` plus the small `[gpu]` / `[logs]` sections.
 
-The collector is any standard Prometheus, Grafana Alloy, or OTel Collector
-(`remote_write: url: http://photon:4318/api/v1/write`, bearer token). This is
-one small sidecar, **not zero infra** — the honest cost of bridging a pull
-exporter to a push sink. mandor stays a plain exporter and speaks no OTLP for
-metrics; that boundary is deliberate (see Non-goals). If native push ever lands
-it will ride the existing `photon =` relay, not the supervision path.
+**The Prometheus `--metrics=PORT` endpoint (127.0.0.1) is a separate, local pull
+option**, unrelated to the photon push path above. photon ingests by push only —
+OTLP to `/v1/metrics` or Prometheus `remote_write` to `/api/v1/write`, no scraper
+— so if you want a *third party* to pull mandor's Prometheus series you still put
+a collector between them; you just no longer need one to reach photon. Exposed
+series (stable names): `mandor_worker_up`, `mandor_worker_restarts_total`,
+`mandor_worker_rss_kilobytes`, `mandor_worker_cpu_percent`, `mandor_worker_fds`,
+`mandor_worker_threads`, `mandor_incidents_total` — all labeled `worker="name"`.
+photon's uptime checker can also probe the metrics port: mandor answering =
+supervisor alive; `mandor_worker_up == 0` = worker down.
 
-Exposed series (stable names): `mandor_worker_up`,
-`mandor_worker_restarts_total`, `mandor_worker_rss_kilobytes`,
-`mandor_worker_cpu_percent`, `mandor_worker_fds`, `mandor_worker_threads`,
-`mandor_incidents_total` — all labeled `worker="name"`.
+### 2. Worker logs — curated by default, full streaming opt-in
 
-photon's uptime checker can also probe the metrics port itself: mandor
-answering = supervisor alive; `mandor_worker_up == 0` = worker down.
+By default mandor does **not** ship raw per-line logs: it multiplexes worker
+output to its own stdout/stderr with `[name]` prefixes (each line wall-clock
+timestamped in the capture ring), and log *content* reaches photon only inside
+incident bundles (the flagged log-tail summary). A container runtime or OTEL
+collector can still forward mandor's stdout independently.
 
-### 2. Worker logs — works today via any OTLP collector
+Set `[logs] stream = true` (requires `photon=`) to also stream every worker
+stdout/stderr line to photon's `/v1/logs` as OTLP logs — one `service.name` per
+worker, the line as the log `body`, stderr/severity flagged, same host identity
+as the metrics. This is the **ephemeral, best-effort** tier: streamed lines ride
+the same non-blocking pipe as metrics, are **dropped under backpressure** (and by
+the `[logs] max_rate` lines/sec cap), and are **never spooled or retried** —
+incidents are the only durable tier. Full logs can carry secrets and are a lot of
+egress, so streaming is deliberately opt-in and rate-limitable. Traces are never
+shipped either way.
 
-mandor multiplexes worker output to its own stdout/stderr with `[name]`
-prefixes; every line is also wall-clock timestamped in the capture ring.
-Container runtimes already collect stdout — an OTEL collector (or photon's
-own future file/stdout receiver) forwards it. No mandor change required;
-`service.name` can be derived from the `[name]` prefix.
-
-### 3. Incidents — the real story; needs one v0.8 feature
+### 3. Incidents — the real story; shipped and durable
 
 The incident bundle (schema v7, versioned contract in `src/spool.zig`) is a
 ready-made OTEL *event*: structured cause, exception type/message, stack
@@ -75,8 +99,8 @@ frames with `file:line`/`in_app` (Sentry vocabulary), deduplicated log tail,
 stats timeline, release/build-id, and recurrence history — now including
 release correlation (`history.builds` / `first_build` / `last_build` /
 `regressed`) so photon can group incidents by build and highlight crashes
-that survived a deploy. The delivery mechanism is ROADMAP #19, the
-**on-incident hook**:
+that survived a deploy. Delivery is the **`photon=` key** (built on the
+`on_incident` primitive, ROADMAP #19):
 
 ```toml
 photon = "127.0.0.1:4318"   # that's the whole integration
@@ -189,20 +213,30 @@ integration, and mandor no longer waits on it.
 | `trace.frames` | attr `exception.stacktrace` (rendered) |
 | whole bundle | attr `mandor.bundle` (JSON string, schema-versioned) |
 
-## What we need, concretely
+### 4. Process-lifecycle events — OTLP logs alongside incidents
 
-1. **mandor v0.8 #19 — `on_incident` hook** (XS, already top of Tier 4).
-   The single missing primitive on our side.
+The relay daemon also emits process-lifecycle events to `/v1/logs`: `started`,
+`exited` (ok / error / OOM), `restarting` (with backoff), and `unhealthy`.
+Best-effort over the same non-blocking pipe as metrics — so photon shows a
+worker's timeline (start → restart → crash) next to its metrics and any incident
+bundle, all under the same host identity.
+
+## What we need, concretely — done
+
+The integration is complete on mandor's side and confirmed end to end (below);
+this section is kept as the contract record.
+
+1. **`on_incident` hook / `photon=` key** — SHIPPED (ROADMAP #19). The relay
+   daemon builds on it to push incidents, metrics, host/GPU metrics, and
+   lifecycle events as OTLP.
 2. **Contract freeze docs** — this file + schema versioning discipline
-   (already enforced by golden fixture tests). photon developers code
-   against `"v"` and get told loudly when it bumps.
-3. **photon-side (sister's homework, ~an afternoon each):**
-   a. `photon-relay` shim (static musl binary, <100 lines: read file, POST
-      OTLP/HTTP to localhost:4318) — or —
-   b. a native "mandor spool" source in photon: watch
-      `/var/lib/mandor/incidents/` (shared volume), import new `*.json`.
-      The spool dir is append-only, atomic-rename, self-pruning — built to
-      be watched (it is the premium sidecar's interface too).
+   (enforced by golden fixture tests). photon developers code against `"v"`
+   and get told loudly when it bumps.
+3. **photon-side** — photon ingests OTLP protobuf on `/v1/{logs,metrics}`
+   directly; no shim is required. The `/var/lib/mandor/incidents/` spool
+   (append-only, atomic-rename, self-pruning) remains available as an
+   alternative "watch the shared volume" source, and is the premium sidecar's
+   interface.
 4. **Shared conventions** — both projects honor `MANDOR_RELEASE` /
    `GIT_SHA` env for release correlation, so photon can group incidents by
    deploy the same way the LLM agent does.
@@ -212,22 +246,27 @@ integration, and mandor no longer waits on it.
 ```yaml
 services:
   app:
-    image: my-app            # ENTRYPOINT ["/mandor", "--metrics=9464", ...]
+    image: my-app            # ENTRYPOINT ["/mandor", "--config=/mandor.toml"]
     volumes: [mandor-state:/var/lib/mandor]
-    # photon = "photon:4318" in mandor.toml forwards incidents directly (channel 3).
-  collector:                 # bridges mandor's pull metrics to photon's push sink (channel 1)
-    image: grafana/alloy     # or prometheus / otelcol — scrape app:9464, remote_write to photon
+    # photon = "photon:4318" in mandor.toml pushes incidents, per-process +
+    # host (+ opt-in GPU) metrics, and lifecycle events directly — no collector.
   photon:
-    image: photon
+    image: ghcr.io/nevindra/photon:latest
     ports: ["8080:8080"]
-    volumes: [mandor-state:/var/lib/mandor:ro]   # spool watcher path (3b)
+    volumes: [mandor-state:/var/lib/mandor:ro]   # optional spool-watcher path
 volumes:
   mandor-state:
 ```
 
+To have this mandor also report the **host** (superseding `photon-agent`), mount
+`/proc`, `/sys`, `/etc/machine-id` (and `/dev/nvidia*` + `nvidia-smi` for GPU)
+into the `app` container — node-exporter style, additive to supervising its
+workers.
+
 ## Non-goals
 
-- mandor will not speak OTLP natively (size + offline boundary; the hook
-  externalizes that choice).
+- No raw log streaming by default and no traces ever — mandor curates
+  (incidents + metrics + lifecycle); full per-line streaming is strictly opt-in.
 - No photon-specific code in mandor's core — everything above rides on
-  generic, versioned contracts (metrics names, spool schema, hook argv).
+  generic, versioned contracts (OTLP semconv, metrics names, spool schema,
+  hook argv).

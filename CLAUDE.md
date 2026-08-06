@@ -12,7 +12,8 @@
   Docker/Podman (`scratch`/distroless friendly), x86_64 + aarch64 musl-free
   static via Zig cross-compilation.
 - **Free tier (this binary):** multirun parity + log capture + perf stats +
-  heuristic incident summaries. **Fully offline. No network, no account, no LLM.**
+  heuristic incident summaries. **Offline by default (see the OTLP note below),
+  no account, no LLM.**
 - **Premium (separate sidecar binary, later):** ships incident bundles to a
   relay → AI root-cause analysis → optional repo access → auto-fix PR.
 - **mandor OPTIONALLY speaks OTLP.** Off by default: with no `photon=` key the
@@ -35,15 +36,28 @@ mandor (PID 1, this repo)
 ├── capture        per-worker stdout/stderr pipes → ring buffers (default 256KB)
 ├── sampler        /proc/<pid>/{stat,status} poll (default 5s): CPU%, RSS, fds, threads
 ├── detector       incident triggers: nonzero exit, fatal signal, cgroup OOM,
-│                  restart-loop (N in M min), monotonic RSS climb
+│                  restart-loop (N in M min), monotonic RSS climb, PSI stall
 ├── summarize      heuristic engine (NO LLM): error dedup by signature,
 │                  trace parsing, pattern verdicts ("restart loop", "leak suspect")
-├── report         `mandor report` → human text or --json
-└── spool          incident bundles written to /var/lib/mandor/incidents/*.json
-                   (premium sidecar watches this dir — clean tier boundary)
+├── report         `mandor report` → human text or --json (+ --incidents, --cost)
+├── secret         per-session app secrets (CSPRNG) handed to workers over pipe fds
+├── spool          incident bundles written to /var/lib/mandor/incidents/*.json
+│                  (premium sidecar watches this dir — clean tier boundary)
+└── telemetry      OPT-IN, only when `photon=` set — else this whole path is dead:
+    ├── telemetry  supervisor-side emit: non-blocking pipe (frame.zig wire format)
+    ├── relay      the `mandor relay --daemon` child: owns the socket, OTLP
+    │              encoders, watches the spool, drains the pipe, retries incidents
+    ├── hostmetrics node /proc + statfs sampling (daemon-side, node-monitor mode)
+    └── gpu         NVIDIA (nvidia-smi shell-out) + AMD/Intel (DRM sysfs), opt-in
 ```
 
 ### Incident bundle schema (stable contract — sidecar + AI depend on it)
+
+> Illustrative shape below. The **live schema is v7** (structured `cause`
+> object, first-class `exception.type`/`message`, structured trace frames,
+> release-correlation `history`) — the authority is `src/spool.zig` and the
+> golden fixtures; every change bumps `"v"`. See docs/INTEGRATION-PHOTON.md for
+> the current field-by-field OTLP mapping.
 
 ```json
 {
@@ -58,21 +72,32 @@ mandor (PID 1, this repo)
 }
 ```
 
-## Build order (do not skip ahead)
+## Build order (historical — v0.1–v0.4 and the telemetry milestones all SHIPPED)
 
-1. **v0.1 — multirun parity.** Spawn N workers from argv, forward signals,
+The original milestones below are **all done** (the 1.x line is stable; see
+docs/ROADMAP.md for the shipped ledger). Kept as a record of the intended order,
+not future work. Note the restart model in v0.1 evolved: `--restart=…` was
+replaced by the single `max_restarts` knob in v1.3 (`0` = don't retry, `-1` =
+forever). New work follows the same discipline — compile early, size-gate, ship.
+
+1. **v0.1 — multirun parity.** ✅ Spawn N workers from argv, forward signals,
    reap zombies, exit when all workers exit (propagate worst exit code).
-   Restart policy `--restart=always|on-failure|never` + exponential backoff.
-2. **v0.2 — capture + stats.** Pipe stdout/stderr through ring buffers
+   Restart policy + exponential backoff.
+2. **v0.2 — capture + stats.** ✅ Pipe stdout/stderr through ring buffers
    (prefix lines `[name]` like multirun), /proc sampler, `mandor report`.
-3. **v0.3 — detector + summarize.** Incident triggers, error dedup by
-   signature, spool dir writer. Trace parsers: **Go and Rust first**
-   (panic formats are structured stderr text), Python third (traceback),
-   C++ (needs symbolization — defer), Zig last.
-4. **v0.4 — polish.** cgroup v2 OOM detection, optional Prometheus text
+3. **v0.3 — detector + summarize.** ✅ Incident triggers, error dedup by
+   signature, spool dir writer. Trace parsers now: Go, Rust, Python, Node, JVM,
+   Zig (C++ still deferred — needs symbolization).
+4. **v0.4 — polish.** ✅ cgroup v2 OOM detection, optional Prometheus text
    endpoint (hand-rolled, one route), mandor.toml config (CLI-only must
    always work — zero-config is a feature).
-5. **v1.x — premium sidecar** (separate repo/binary, possibly Rust for rustls):
+5. **Telemetry milestones (post-1.0, all SHIPPED through v1.9.0).** ✅ OPT-IN
+   OTLP telemetry via the `mandor relay --daemon` child (incidents, per-process
+   + supervisor metrics, node/host metrics, opt-in GPU metrics, lifecycle
+   events); ✅ opt-in full log streaming (`[logs] stream`); ✅ app-shared secret
+   store (`[secret.NAME]`). Offline-by-default is unchanged — none of this
+   activates without `photon=`.
+6. **v1.x — premium sidecar** (separate repo/binary, possibly Rust for rustls):
    watches spool dir, POSTs to relay, license check. NOT in this binary.
 
 ## Zig discipline (critical — read before writing code)
@@ -115,8 +140,9 @@ Usage target (v0.1, multirun-compatible feel):
 
 ```bash
 mandor "./api --port 8080" "./worker" "./cron-loop"
-mandor --restart=on-failure --backoff-max=30s -- "./api" "./worker"
+mandor --max-restarts=3 -- "./api" "./worker"   # retry a failed worker 3x, then exit
 mandor report            # human summary     mandor report --json
+# (backoff_max, restart policy, etc. are mandor.toml keys — the CLI is 4 flags)
 ```
 
 Dockerfile consumption:
@@ -142,21 +168,40 @@ ENTRYPOINT ["/mandor", "./api", "./worker"]
 mandor/
 ├── CLAUDE.md  build.zig  build.zig.zon  .zigversion
 ├── src/
-│   ├── main.zig  spawner.zig  reaper.zig  signals.zig
-│   ├── capture.zig  sampler.zig  detector.zig
-│   ├── summarize.zig  report.zig  spool.zig
-│   └── parsers/ (go.zig  rust.zig  python.zig)
-└── test/ (fixtures/  harness/)
+│   ├── main.zig  cli.zig  config.zig  supervisor.zig
+│   ├── spawner.zig  reaper.zig  signals.zig  backoff.zig  names.zig
+│   ├── capture.zig  ring.zig  sampler.zig  detector.zig  cgroup.zig
+│   ├── summarize.zig  incident.zig  spool.zig  history.zig
+│   ├── report.zig  cost.zig  metrics.zig  elf.zig  caps.zig  secret.zig
+│   ├── telemetry.zig  relay.zig  frame.zig  hostmetrics.zig  gpu.zig  resolve.zig
+│   ├── log.zig  jsonbuf.zig  fuzz.zig
+│   └── parsers/ (go.zig  rust.zig  python.zig  node.zig  java.zig  zigp.zig)
+└── test/ (fixtures/  harness/  container/  photon/)
 ```
+
+The telemetry cluster (`telemetry.zig` emit path, `relay.zig` OTLP encoders +
+the `relay --daemon`, `frame.zig` pipe wire format, `hostmetrics.zig` node
+sampling, `gpu.zig`, `resolve.zig` DNS) is inert unless `photon=` is set.
 
 ## Product boundaries (do not blur)
 
-- Free binary: never phones home, never requires an account, never embeds an
-  API key, never calls an LLM. Its excellence is the funnel for premium.
-- Premium logic lives in the sidecar + relay only. The spool dir JSON is the
-  ONLY interface between tiers.
+- Free binary: never requires an account, never embeds an API key, never calls
+  an LLM. Its excellence is the funnel for premium.
+- **Offline by default, opt-in telemetry.** With no `photon=` key mandor opens
+  no socket and spawns no relay child — the offline guarantee is absolute. When
+  `photon=` IS set it speaks OTLP to photon, but *only* through the long-lived
+  `mandor relay --daemon` child: the supervision path itself must never touch a
+  socket, and telemetry must never stall or slow supervision (non-blocking pipe,
+  drop-under-backpressure — incidents are the one durable tier). Any new
+  telemetry follows this shape.
+- **Curate by default.** mandor ships log *content* only inside incident
+  bundles; full per-line log streaming and GPU sampling are strictly opt-in
+  (`[logs] stream`, `[gpu] enabled`). Traces are never shipped.
+- Premium (AI-fix) logic lives in the sidecar + relay only. The spool dir JSON
+  is the tier boundary the sidecar watches; photon consumes the same contracts
+  over OTLP.
 - Do not add features that grow the core past the size budget without
-  explicit discussion (each v0.x milestone: check stripped size in CI).
+  explicit discussion (CI gates stripped size per commit).
 
 ## Naming
 

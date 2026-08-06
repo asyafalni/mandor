@@ -106,7 +106,7 @@ core-dump, JSON logging). Only extensions of existing subsystems survived.
 |---|---------|----|-------|-------|
 | 35 ✅ | PSI stall sampling (cgroup v2 pressure) → `stall:*` detector cause | S | ● ● ● ○ | SHIPPED v0.16 — psi_mem_pct/psi_cpu_pct, PSI in bundle stats (schema v6) |
 | 36 ✅ | `no_new_privs` + `cap_drop` at exec | S | ● ● ● ○ | SHIPPED v0.16 — per-worker cap bounding-set (names or "all"), no libcap |
-| 37 | JSON supervisor-event log | S | ● ● ○ ○ | Folded into existing paths: offline = plain `[mandor]` stdout lines; online = photon. No separate sink |
+| 37 ✅ | JSON supervisor-event log | S | ● ● ○ ○ | SHIPPED (Tier 10 #48) — offline = plain `[mandor]` stdout lines; online = OTLP lifecycle events + metrics to photon. No separate sink |
 | 38 ✅ | `RLIMIT_CORE` in bundle | XS | ● ○ ○ ○ | SHIPPED v0.16 (`limits.core`) |
 
 ## Tier 7 — parked idea (user, 2026-07-18)
@@ -281,8 +281,8 @@ thing:
 | Mode | Already expressed as |
 |------|----------------------|
 | Shut the fleet down | `essential = true` (exit stops the fleet, code propagates) |
-| Restart the exited worker | `restart = "on-failure"` / `"always"` |
-| Leave it dead, keep going | `restart = "never"` and not essential (the default) |
+| Restart the exited worker | `max_restarts = N` / `-1` (only failures are retried) |
+| Leave it dead, keep going | `max_restarts = 0` (the default) and not essential |
 
 These map onto OTP's child restart types (`permanent` / `transient` /
 `temporary`), and mandor already has `one_for_one` (per-worker restart) and
@@ -390,13 +390,37 @@ it removes.
 for `api`" is inexpressible. Small and mechanical; slots naturally into
 `[worker.NAME]` now that the sections exist.
 
+## Tier 10 — self-sufficiency & observability (2026-07 → 2026-08) — ✅ SHIPPED
+
+The post-1.6 arc turned mandor from "produces the signals photon displays" into a
+self-sufficient OTLP source, and let one mandor absorb the role of a standalone
+node agent. Everything here is **opt-in** and rides a single long-lived
+`mandor relay --daemon` child — the supervision path never touches a socket, and
+with no `photon=` key none of it activates. Full contract in
+[INTEGRATION-PHOTON.md](INTEGRATION-PHOTON.md); config in [CONFIG.md](CONFIG.md).
+
+| # | Feature | Value | Notes |
+|---|---------|-------|-------|
+| 48 ✅ | Self-sufficient OTLP telemetry (`photon =` key) | ● ● ● ● | v1.7.0 — incidents (durable/retried) + per-process & supervisor metrics + lifecycle events pushed as OTLP by the relay daemon; no collector. This is #37 realized: offline = plain stdout, online = photon |
+| 49 ✅ | Node/host metrics + `host.name` on process metrics | ● ● ● ○ | v1.7.1/1.7.2 — `system.*` node resource; `process.*` renamed to OTel semconv; each worker attributable to its node in photon's Infrastructure view |
+| 50 ✅ | App-shared secret store (`[secret.NAME]`) | ● ● ● ○ | v1.8.0 — per-session secrets handed to granted workers over inherited pipe fds (`$CONFD_<NAME>` = the fd number); deny-by-default; value never in env/argv/disk |
+| 51 ✅ | Absorb photon-agent: fine-grained node + GPU metrics | ● ● ● ● | v1.9.0 — per-core CPU, per-mount fs, per-interface net, swap, disk.io, uptime, load 1/5/15m, cpu temp; GPU via `nvidia-smi` (NVIDIA) + DRM sysfs (AMD/Intel), opt-in `[gpu]`. Node sampling moved into the daemon. One mandor with host `/proc`,`/sys` mounted supersedes a standalone node agent |
+| 52 ✅ | Opt-in full log streaming (`[logs] stream`) | ● ● ○ ○ | v1.10.0 — every worker line → OTLP `/v1/logs`, ephemeral/best-effort (dropped under backpressure, `[logs] max_rate` cap), never spooled. Default off: mandor curates (log content otherwise travels only inside incident bundles) unless explicitly asked |
+
 ## Backlog status
 
 Four research rounds complete; all surfaced features shipped or
 rejected-with-reason, including the last parked code item (#34 fast capture,
 v0.18), the user-originated #39 cost report (v0.17), and the Tier 8
 foreman↔owner reporting pair (#40 release correlation v0.19, #41 shift report
-v0.20). No feature backlog remains.
+v0.20). The original feature backlog is empty.
+
+**Post-1.6 (Tier 10) is a new, user-directed arc**, not from the research
+rounds: opt-in OTLP self-sufficiency, node + GPU host metrics (absorbing the
+role of a standalone node agent), an app-shared secret store, and opt-in log
+streaming — all shipped through v1.10.0, all off by default. That closes the
+observability story; no feature backlog remains beyond the non-feature work
+noted at the end.
 
 **v1.0 fuzz-hardening: done (v1.0.0).** `src/fuzz.zig` mutation-fuzzes the
 whole untrusted-input surface — the six trace parsers, the worker ELF header,

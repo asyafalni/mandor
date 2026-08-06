@@ -9,7 +9,7 @@
 
 [![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.16.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Static binary](https://img.shields.io/badge/binary-static%2C%20~248KB-success)
+![Static binary](https://img.shields.io/badge/binary-static%2C%20~348KB-success)
 ![No dependencies](https://img.shields.io/badge/dependencies-zero-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
@@ -40,12 +40,16 @@ $ mandor --max-restarts=3 -- "./api --port 8080" "./worker" "./cron-loop"
 | Crash summaries ("restart loop", "leak suspect") | ✅ | ❌ | ❌ |
 | Per-worker cost + right-sizing report | ✅ | ❌ | ❌ |
 | Release correlation ("did the fix hold?") | ✅ | ❌ | ❌ |
-| Size | **~248 KB** | ~50 KB | MBs + runtime |
-| Network access required | **never** | never | varies |
+| OTLP telemetry to an observability backend | ✅ opt-in | ❌ | ❌ |
+| Node + GPU host metrics (node-exporter style) | ✅ opt-in | ❌ | ❌ |
+| Size | **~348 KB** | ~50 KB | MBs + runtime |
+| Network access | **off by default** (opt-in OTLP) | never | varies |
 
-The `mandor` binary is fully offline and self-contained: no accounts, no
-phoning home. Incident bundles are plain JSON on disk — yours to ignore, ship,
-or feed to tooling. Repeated log lines are deduplicated (`"repeat": 47`,
+The `mandor` binary is **offline by default** and self-contained: no accounts,
+no LLM, and no network at all unless you opt in with the `photon =` key (see
+[Observability](#observability-optional)). Incident bundles are plain JSON on
+disk — yours to ignore, ship, or feed to tooling. Repeated log lines are
+deduplicated (`"repeat": 47`,
 digit-insensitive, first/last timestamps kept), so a retry storm costs one
 bundle entry instead of thousands of tokens. The upcoming **mandor premium** sidecar picks those same
 bundles up and hands them to an AI coding agent that root-causes the crash,
@@ -242,7 +246,10 @@ mandor (PID 1)
 ├── sampler        /proc polling: CPU%, RSS, fds, threads
 ├── detector       nonzero exit, fatal signal, OOM, restart-loop, RSS climb
 ├── summarize      heuristic verdicts — error dedup, trace parsing, instant
-└── spool          incident bundles → /var/lib/mandor/incidents/*.json
+├── spool          incident bundles → /var/lib/mandor/incidents/*.json
+├── secret         per-session app secrets → granted workers over pipe fds (opt-in)
+└── relay --daemon OTLP telemetry to photon (opt-in, off the hot path): incidents,
+                   per-process + node + GPU metrics, lifecycle, opt-in logs
 ```
 
 Design rules the code lives by:
@@ -285,25 +292,53 @@ unchanged — CI runs the full integration harness on all three distro bases.
 
 ## Status
 
-**1.0** — stable. The incident-bundle schema is a versioned contract, the
-untrusted-input surface is fuzz-hardened in CI, and every build is soaked
-under load to prove the supervisor's own footprint stays flat. Version
-history:
+**Stable (1.x).** Core supervision has been stable since 1.0; the 1.7–1.9 line
+added opt-in OTLP telemetry, node + GPU host metrics (superseding a standalone
+node agent), an app-shared secret store, and opt-in log streaming — all off by
+default, none of it on the supervision path. The incident-bundle schema is a
+versioned contract, the untrusted-input surface is fuzz-hardened in CI, and every
+build is soaked under load to prove the supervisor's own footprint stays flat.
+Version history:
 [CHANGELOG.md](CHANGELOG.md) · every
 config key: [docs/CONFIG.md](docs/CONFIG.md) · planned and
 researched-but-parked work: [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## Sister project: photon
+## Observability (optional)
 
-[photon](https://github.com/nevindra/photon) is an OTEL-native single-binary
-observability platform — and mandor's natural display layer: worker metrics
-via the Prometheus endpoint, worker logs via stdout collection, and incident
-bundles via the `photon = "ip:port"` key (or the generic `on_incident` hook
-for anything else). Both ship today; note that photon's `/v1/logs` currently
-decodes OTLP protobuf only while mandor sends OTLP/JSON, so the forward is
-built and tested on mandor's side but not yet ingested — status and the
-photon-side fix live in
-[docs/INTEGRATION-PHOTON.md](docs/INTEGRATION-PHOTON.md).
+mandor is offline by default. Set one key — `photon = "ip:port"` — and it ships
+its whole story to [photon](https://github.com/nevindra/photon) (mandor's
+OTEL-native sister project) as OTLP, **no collector required**. All network I/O
+lives in a single long-lived `mandor relay --daemon` child; the supervision path
+never touches a socket, and telemetry is dropped under backpressure before it can
+ever stall supervision. Auth via the `PHOTON_TOKEN` env var. With `photon` unset,
+none of this activates.
+
+What it ships when `photon` is set:
+
+- **Incidents** → OTLP logs (durable: spooled and retried).
+- **Per-process + supervisor metrics** → OTLP metrics (one `service.name` per
+  worker: cpu/rss/fds/threads + restarts, using OTel semantic conventions).
+- **Node / host metrics** → OTLP metrics, sampled by the daemon itself:
+  per-core CPU, per-mount filesystem, per-interface network, memory, swap, load
+  (1/5/15m), disk I/O, uptime, CPU temperature. Every worker and the node share
+  one `host.name`, so photon shows each process against the node it runs on.
+- **GPU metrics** (opt-in, `[gpu] enabled`) → NVIDIA via `nvidia-smi`, AMD/Intel
+  via DRM sysfs. Fail-closed when no GPU is present.
+- **Process-lifecycle events** → OTLP logs (started / exited / restarting /
+  unhealthy).
+- **Full worker logs** (opt-in, `[logs] stream`) → OTLP logs. By default mandor
+  *curates* — log content otherwise reaches photon only inside incident bundles;
+  the firehose is off unless you ask for it (and rate-limitable via
+  `[logs] max_rate`). Traces are never shipped.
+
+Run one mandor with the host `/proc`, `/sys`, `/etc/machine-id` (and
+`/dev/nvidia*` for GPU) mounted in and it reports the **host** — node-exporter
+style, superseding a standalone node agent — while still supervising its workers.
+Full details and the OTLP field mapping: [docs/INTEGRATION-PHOTON.md](docs/INTEGRATION-PHOTON.md);
+every config key: [docs/CONFIG.md](docs/CONFIG.md).
+
+A local Prometheus text endpoint (`--metrics=PORT`, 127.0.0.1) is a separate,
+always-offline pull option unrelated to the photon push path.
 
 ## Contributing
 
