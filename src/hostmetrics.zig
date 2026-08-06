@@ -315,6 +315,33 @@ pub fn cpuTempFromHwmon(name_text: []const u8, temp_text: []const u8) ?u32 {
     return parseMilliCelsius(temp_text);
 }
 
+/// Thermal-zone `type` values that name a CPU sensor. Many hosts expose CPU
+/// temperature via `/sys/class/thermal/thermal_zoneN` instead of an hwmon
+/// coretemp/k10temp chip: Intel packages report `x86_pkg_temp`, ARM SoCs report
+/// `cpu-thermal` / `cpuN-thermal`, some report `coretemp`. This is the fallback
+/// source when the hwmon probe finds nothing.
+const cpu_thermal_types = [_][]const u8{ "x86_pkg_temp", "coretemp" };
+
+/// True iff a thermal-zone `type` (trimmed) names a CPU sensor: any type
+/// containing `cpu` (e.g. `cpu-thermal`, `cpu0-thermal`), plus the explicit
+/// x86 package / coretemp types that have no `cpu` substring.
+fn isCpuThermalZone(type_str: []const u8) bool {
+    const t = std.mem.trim(u8, type_str, " \t\r\n\x00");
+    if (std.mem.indexOf(u8, t, "cpu") != null) return true;
+    for (cpu_thermal_types) |c| {
+        if (std.mem.eql(u8, c, t)) return true;
+    }
+    return false;
+}
+
+/// Given a thermal zone's `type` file text and its `temp` text, return the CPU
+/// temperature in whole °C iff the zone is a CPU sensor, else null. Pure:
+/// deterministically unit-testable with fixture strings.
+pub fn cpuTempFromThermalZone(type_text: []const u8, temp_text: []const u8) ?u32 {
+    if (!isCpuThermalZone(type_text)) return null;
+    return parseMilliCelsius(temp_text);
+}
+
 /// /proc/net/dev: capture rx-bytes (col 1) and tx-bytes (col 9) PER
 /// NON-loopback interface (skip `lo`) into `out`, returning the filled prefix.
 /// The interface name is the text before ':' (trimmed); a name longer than 31
@@ -593,6 +620,18 @@ fn readCpuTemp() u32 {
         const temp_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/hwmon/hwmon{d}/temp1_input", .{i}) catch continue;
         const temp = readFile(temp_path.ptr, &temp_buf) orelse continue;
         return parseMilliCelsius(temp); // first CPU-temp chip wins
+    }
+    // Fallback: /sys/class/thermal/thermal_zoneN — where hosts that don't expose
+    // an hwmon coretemp/k10temp chip (Intel x86_pkg_temp, ARM cpu-thermal) put
+    // the CPU sensor. Bounded probe; a missing zone/temp is simply skipped.
+    i = 0;
+    while (i < 32) : (i += 1) {
+        const type_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/thermal/thermal_zone{d}/type", .{i}) catch continue;
+        const zone = readFile(type_path.ptr, &name_buf) orelse continue;
+        if (!isCpuThermalZone(zone)) continue;
+        const temp_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/thermal/thermal_zone{d}/temp", .{i}) catch continue;
+        const temp = readFile(temp_path.ptr, &temp_buf) orelse continue;
+        return parseMilliCelsius(temp); // first CPU thermal zone wins
     }
     return 0;
 }
@@ -1041,6 +1080,20 @@ test "cpuTempFromHwmon matches CPU chips and parses milli-°C, ignores others" {
     // acpitz is NOT a CPU-temp chip -> not used.
     try testing.expectEqual(@as(?u32, null), cpuTempFromHwmon("acpitz\n", "55000\n"));
     try testing.expectEqual(@as(?u32, null), cpuTempFromHwmon("nvme\n", "40000\n"));
+}
+
+// MUTATION SENTINEL: bypassing isCpuThermalZone (or dropping the x86_pkg_temp
+// allowlist entry) lets a non-CPU zone like `acpitz` be reported as CPU temp —
+// this test's null cases then return a value and fail.
+test "cpuTempFromThermalZone matches CPU zones (x86_pkg_temp, cpu-thermal), ignores others" {
+    // Intel package sensor: 58000 milli-°C -> 58 °C.
+    try testing.expectEqual(@as(?u32, 58), cpuTempFromThermalZone("x86_pkg_temp\n", "58000\n"));
+    // ARM SoC CPU zones (any `cpu…-thermal`).
+    try testing.expectEqual(@as(?u32, 47), cpuTempFromThermalZone("cpu-thermal\n", "47000\n"));
+    try testing.expectEqual(@as(?u32, 51), cpuTempFromThermalZone("cpu0-thermal\n", "51000\n"));
+    // Non-CPU zones are ignored.
+    try testing.expectEqual(@as(?u32, null), cpuTempFromThermalZone("acpitz\n", "55000\n"));
+    try testing.expectEqual(@as(?u32, null), cpuTempFromThermalZone("pch_skylake\n", "60000\n"));
 }
 
 test "overflow-safe: giant swap/uptime/temp values saturate, no trap" {
