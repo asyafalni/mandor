@@ -41,6 +41,14 @@ unchanged.
   probes again. A flood into a backed-up daemon costs ~O(1)/line instead of
   encode + write, so mandor's streaming CPU self-caps — no config. Drops are
   counted, never spooled. (Unit-tested.)
+- **Wrong-endpoint detection.** photon's web UI answers `200 OK` with an SPA HTML
+  page for any unknown path, so a `photon =` pointed at the UI port (instead of
+  the OTLP ingest port, e.g. `:4318`) silently swallowed every payload while
+  looking like a success. The relay now treats a `2xx` whose body is HTML as
+  **not delivered** (the durable incident tier keeps retrying) and logs a
+  one-time warning naming the likely cause. A genuine OTLP `ExportLogsServiceResponse`
+  (empty `partial_success`) is still accepted. Found and verified against a live
+  photon during v1.11.0 testing.
 
 ### Changed
 - **Breaking (config): full log streaming is now per-worker.** The global

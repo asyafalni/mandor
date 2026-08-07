@@ -1246,6 +1246,36 @@ fn statusOk(resp: []const u8) bool {
     return resp[9] == '2';
 }
 
+/// Case-insensitive substring scan. `needle` MUST be lowercase. Pure, no alloc.
+fn containsCi(hay: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or hay.len < needle.len) return false;
+    var i: usize = 0;
+    outer: while (i + needle.len <= hay.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(hay[i + j]) != needle[j]) continue :outer;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// Does a 2xx response look like an HTML page rather than OTLP? photon's web UI
+/// answers `200 OK` with an SPA `<!doctype html>…` for any unknown path, so a
+/// mandor pointed at the UI port (not the OTLP ingest port, e.g. :4318) gets a
+/// 200 for `/v1/logs` and the payload is silently swallowed by the SPA
+/// catch-all — never ingested. This signature turns that into a loud warning and
+/// a NOT-delivered verdict instead of counted-as-shipped data loss.
+fn looksLikeHtml(resp: []const u8) bool {
+    return containsCi(resp, "text/html") or
+        containsCi(resp, "<!doctype") or
+        containsCi(resp, "<html");
+}
+
+/// One-time guard so a wrong-endpoint warning is logged once, not per POST
+/// (incidents fire per restart — a crash loop must not spam stderr).
+var warned_html_endpoint: bool = false;
+
 fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const u8) u8 {
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (posix.errno(rc) != .SUCCESS) {
@@ -1301,20 +1331,34 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
         }
         off += n;
     }
-    var resp: [128]u8 = undefined;
+    // 512, not 128: enough to see the response's Content-Type header (and the
+    // SPA body start) so a 200-with-HTML wrong-endpoint reply is detectable.
+    var resp: [512]u8 = undefined;
     const got = linux.read(fd, &resp, resp.len);
     if (posix.errno(got) == .AGAIN) {
         err("photon accepted the connection but never answered (timed out) — see docs/INTEGRATION-PHOTON.md");
         return 1;
     }
-    if (posix.errno(got) == .SUCCESS and got > 0 and
-        statusOk(resp[0..@min(@as(usize, @intCast(got)), resp.len)])) return 0;
-    // Echo the status line: "did not accept the payload" alone gives the
-    // operator nothing to act on, and the most likely cause is a receiver that
-    // decodes OTLP protobuf only while mandor sends OTLP/JSON — which the
-    // status plus docs/INTEGRATION-PHOTON.md makes diagnosable.
     if (posix.errno(got) == .SUCCESS and got > 0) {
-        const line = resp[0..@min(@as(usize, @intCast(got)), 64)];
+        const rslice = resp[0..@min(@as(usize, @intCast(got)), resp.len)];
+        if (statusOk(rslice)) {
+            // A 2xx from photon's OTLP receiver is a real delivery — UNLESS it is
+            // an HTML page, which means the address is photon's web UI, not its
+            // OTLP ingest port: the SPA catch-all 200s and the payload is
+            // dropped. Treat that as NOT delivered (so the durable incident tier
+            // keeps retrying and nothing is falsely marked shipped) and warn once.
+            if (!looksLikeHtml(rslice)) return 0;
+            if (!warned_html_endpoint) {
+                warned_html_endpoint = true;
+                err("photon answered 200 with an HTML page, not OTLP — the address is likely photon's web UI, not its OTLP ingest port (e.g. :4318). Nothing is being ingested. See docs/INTEGRATION-PHOTON.md");
+            }
+            return 1;
+        }
+        // Non-2xx: echo the status line. "did not accept the payload" alone gives
+        // the operator nothing to act on, and the most likely cause is a receiver
+        // that decodes OTLP protobuf only while mandor sends OTLP/JSON — which the
+        // status plus docs/INTEGRATION-PHOTON.md makes diagnosable.
+        const line = rslice[0..@min(rslice.len, 64)];
         const cut = std.mem.indexOfScalar(u8, line, '\r') orelse line.len;
         err("photon rejected the payload — see docs/INTEGRATION-PHOTON.md");
         err(line[0..cut]);
@@ -1861,6 +1905,26 @@ test "statusOk accepts real 2xx and nothing else" {
     try testing.expect(!statusOk(""));
     try testing.expect(!statusOk("HTTP/1.1 2"));
     try testing.expect(!statusOk("200 OK"));
+}
+
+test "looksLikeHtml flags a web-UI 200 but not a real OTLP response" {
+    // photon's SPA catch-all: 200 with an HTML page (the wrong-endpoint case).
+    try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<x>"));
+    try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\ncontent-length: 210\r\n\r\n210\r\n<!doctype html>\n<html>"));
+    // Case-insensitive: header/body casing varies across servers.
+    try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: TEXT/HTML\r\n\r\n"));
+    try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\n\r\n<!DOCTYPE HTML>"));
+
+    // A genuine OTLP/HTTP receiver: protobuf ExportLogsServiceResponse (\n\x00 =
+    // empty partial_success = 0 rejected). Must NOT be mistaken for HTML.
+    try testing.expect(!looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\n\r\n\n\x00"));
+    try testing.expect(!looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}"));
+    try testing.expect(!looksLikeHtml(""));
+
+    // containsCi contract: needle must be lowercase; matches any-case haystack.
+    try testing.expect(containsCi("aXBcd", "xbc"));
+    try testing.expect(!containsCi("abc", "xyz"));
+    try testing.expect(!containsCi("ab", "abcd")); // needle longer than haystack
 }
 
 test "parseHostPort accepts and rejects" {

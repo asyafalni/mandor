@@ -240,6 +240,17 @@ strand one process per incident — and incidents fire per restart, so a crash
 loop would strand one per crash. A timeout says so explicitly rather than
 reporting a rejection. `202 Accepted` is treated as success, not failure.
 
+**Point `photon =` at the OTLP ingest port (e.g. `:4318`), not photon's web
+UI.** photon's UI serves a single-page app whose catch-all answers `200 OK` with
+an HTML page for *any* unknown path — including `/v1/logs`. Sent there, mandor's
+payload is swallowed by the SPA and never ingested, yet the `200` looks like a
+successful delivery. mandor guards against this: a `2xx` whose body is HTML
+(`Content-Type: text/html`, or a `<!doctype html>` page) is treated as **not
+delivered** — the durable incident tier keeps retrying — and the relay logs a
+one-time warning (`photon answered 200 with an HTML page, not OTLP …`). A real
+OTLP receiver answers with an `ExportLogsServiceResponse` protobuf (an empty
+`partial_success` = `\n\x00` = zero rejected), which mandor accepts.
+
 > **Status: unblocked as of mandor v1.6.0 — mandor now sends OTLP protobuf.**
 >
 > For three months this said "blocked, the fix is photon-side". It was the
