@@ -132,6 +132,19 @@ fn applyConfig(
             setup_warnings += 1;
         }
     }
+    // Per-worker log streaming opt-in (`[worker.NAME] stream = true`). Same
+    // warn-not-fail treatment as oneshot: an unknown name warns (run() keeps
+    // supervising, validate() reports it) and streaming stays off for it.
+    // Actual shipping still needs photon (no daemon ⇒ emitLog no-ops); armed
+    // per line via `ctx.w.stream` on the capture path.
+    for (cfg.stream[0..cfg.stream_n]) |name| {
+        if (findWorker(workers, name)) |w| {
+            w.stream = true;
+        } else {
+            logmod.print("[mandor] stream: no worker named {s}\n", .{name});
+            setup_warnings += 1;
+        }
+    }
     // A oneshot's failure always aborts startup, so `essential` never applies
     // to it. Silently ignoring the key is how contradictory config goes
     // unnoticed, so say so and stop.
@@ -332,12 +345,12 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // path never does), watches the spool for incidents, and drains the
         // telemetry pipe for metrics/lifecycle events. Best-effort — if the
         // spawn fails, telemetry is simply off and supervision is unaffected.
-        telemetry.spawnDaemon(endpoint, state_dir, cfg.gpu.enabled, cfg.gpu.interval_ms, cfg.logs.stream, cfg.service_prefix, envp, path_env);
+        telemetry.spawnDaemon(endpoint, state_dir, cfg.gpu.enabled, cfg.gpu.interval_ms, cfg.service_prefix, envp, path_env);
         logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
-        // Opt-in full log streaming: only arm the per-line enqueue when the
-        // operator set `[logs] stream` AND photon is configured (so a daemon
-        // exists to drain it). Default off ⇒ the capture path stays untouched.
-        stream_logs = cfg.logs.stream;
+        // Opt-in log streaming is now per-worker (`ctx.w.stream`, set in
+        // applyConfig). Only ARM the shared rate cap when photon is configured
+        // (so a daemon exists to drain it); no photon ⇒ the cap stays 0 and
+        // nothing ships (emitLog no-ops without a daemon).
         stream_max_rate = cfg.logs.max_rate;
     }
 
@@ -1273,12 +1286,7 @@ fn stopWorkers(
 
 const EchoCtx = struct { w: *spawner.Worker, err: bool, t_ms: u64 = 0 };
 
-/// Armed once at startup when `[logs] stream` is set (and photon is on). Default
-/// false ⇒ the gated enqueue in echoLine is never taken, so opt-in log streaming
-/// costs the capture path nothing unless explicitly enabled.
-var stream_logs: bool = false;
-
-/// `[logs] max_rate`, lines/sec, armed alongside `stream_logs`. 0 = unlimited
+/// `[logs] max_rate`, lines/sec, armed only when photon is on. 0 = unlimited
 /// (the default) ⇒ `rateAllows` returns immediately with no window bookkeeping,
 /// so an uncapped stream pays nothing for the limiter.
 var stream_max_rate: u32 = 0;
@@ -1346,7 +1354,7 @@ fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     // `rateAllows` caps lines/sec (`[logs] max_rate`) BEFORE any frame is built:
     // an over-cap line is dropped here without touching emitLog. `&&` short-
     // circuits so an uncapped or disabled stream skips it at zero cost.
-    if (stream_logs and rateAllows(ctx.t_ms)) telemetry.emitLog(
+    if (ctx.w.stream and rateAllows(ctx.t_ms)) telemetry.emitLog(
         ctx.w.nameSlice(),
         @intFromBool(ctx.err),
         capture.severityFromFlags(flags),

@@ -1580,7 +1580,6 @@ pub fn runDaemon(
     pipe_fd: i32,
     gpu_enabled: bool,
     gpu_interval_ms: u64,
-    logs_stream: bool,
     service_prefix_arg: []const u8,
     environ: [:null]const ?[*:0]const u8,
 ) u8 {
@@ -1590,11 +1589,10 @@ pub fn runDaemon(
     // leaves OTLP byte-identical to a build without the feature.
     setServicePrefix(service_prefix_arg);
     // Log-line frames are drained, batched, and shipped to /v1/logs by drainPipe.
-    // The operator's `[logs] stream` toggle is the real gate: the SUPERVISOR only
-    // writes log frames when it is on, so with it off no frames reach the pipe and
-    // the batch stays empty (nothing ships). The flag is threaded through for
-    // symmetry and future daemon-side use; the gate lives at the frame source.
-    _ = logs_stream;
+    // Streaming is gated at the frame source: the SUPERVISOR writes a log frame
+    // only for a worker with `stream = true`, so with none selected no frames
+    // reach the pipe and the batch stays empty (nothing ships). The daemon needs
+    // no toggle — it ships whatever log frames it drains.
     // Resolve once up front; re-resolved on a send failure below because photon
     // may restart with a new IP under compose. A literal IP short-circuits with
     // no network (resolve.zig), so re-resolving is free in that case.

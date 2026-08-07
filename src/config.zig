@@ -31,7 +31,6 @@ pub const FileConfig = struct {
     gpu_enabled: ?bool = null,
     gpu_interval_ms: ?u64 = null,
     /// `[logs]` section: null = key absent (caller keeps the cli.Config default).
-    logs_stream: ?bool = null,
     logs_max_rate: ?u32 = null,
     psi_mem_pct: ?u16 = null,
     psi_cpu_pct: ?u16 = null,
@@ -44,6 +43,11 @@ pub const FileConfig = struct {
     cwd_pairs_n: u8 = 0,
     oneshot: [16][]const u8 = undefined,
     oneshot_n: u8 = 0,
+    /// Workers with `[worker.NAME] stream = true` — per-worker log streaming
+    /// opt-in. Like `oneshot`, the worker's NAME joins this list rather than
+    /// carrying a value; default (absent) leaves the worker non-streaming.
+    stream: [16][]const u8 = undefined,
+    stream_n: u8 = 0,
     user_pairs: [16]cli.HealthSpec = undefined,
     user_pairs_n: u8 = 0,
     cap_drop_pairs: [16]cli.HealthSpec = undefined,
@@ -346,18 +350,13 @@ fn gpuSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!v
     }
 }
 
-/// Apply one `key = value` inside `[logs]`. `stream` is a bare bool; `max_rate`
-/// is a bare non-negative int (lines/sec, 0 = unlimited). Unknown key -> hard
-/// Syntax error (a mistyped key should stop startup, not be silently ignored).
+/// Apply one `key = value` inside `[logs]`. `max_rate` is a bare non-negative
+/// int (lines/sec, 0 = unlimited). Streaming is now per-worker
+/// (`[worker.NAME] stream = true`), so `[logs]` carries only the global rate
+/// cap. Unknown key -> hard Syntax error (a mistyped key should stop startup,
+/// not be silently ignored).
 fn logsSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!void {
-    if (std.mem.eql(u8, key, "stream")) {
-        cfg.logs_stream = if (std.mem.eql(u8, value, "true"))
-            true
-        else if (std.mem.eql(u8, value, "false"))
-            false
-        else
-            return error.BadValue;
-    } else if (std.mem.eql(u8, key, "max_rate")) {
+    if (std.mem.eql(u8, key, "max_rate")) {
         // Bare int, lines/sec. Range 0..u32-max; a negative or non-numeric value
         // (parseInt rejects the sign for an unsigned type) is a hard BadValue so a
         // typo cannot silently disable the cap.
@@ -575,6 +574,14 @@ fn workerSetting(
         if (cfg.oneshot_n == cfg.oneshot.len) return error.BadValue;
         cfg.oneshot[cfg.oneshot_n] = w;
         cfg.oneshot_n += 1;
+        return;
+    }
+    if (std.mem.eql(u8, key, "stream")) {
+        if (std.mem.eql(u8, value, "false")) return; // the default
+        if (!std.mem.eql(u8, value, "true")) return error.BadValue;
+        if (cfg.stream_n == cfg.stream.len) return error.BadValue;
+        cfg.stream[cfg.stream_n] = w;
+        cfg.stream_n += 1;
         return;
     }
 
@@ -985,32 +992,44 @@ test "gpu section: absent keys stay null; bad values and unknown key rejected" {
     try t.expectError(error.Syntax, parseTest("[gpu]\nbogus = \"x\"", &storage));
 }
 
-test "logs section: stream true/false and default-absent" {
+test "worker section: stream collects the worker name; others stay non-streaming" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    // stream = true
-    const on = try parseTest("[logs]\nstream = true", &storage);
-    try t.expectEqual(@as(?bool, true), on.logs_stream);
-    // stream = false is the explicit default
-    const off = try parseTest("[logs]\nstream = false", &storage);
-    try t.expectEqual(@as(?bool, false), off.logs_stream);
-    // No [logs] section at all -> null (caller keeps the cli.Config default).
-    const none = try parseTest("workers = [\"./a\"]", &storage);
-    try t.expectEqual(@as(?bool, null), none.logs_stream);
-    // Bad bool and unknown key inside [logs] are hard errors.
-    try t.expectError(error.BadValue, parseTest("[logs]\nstream = yes", &storage));
-    try t.expectError(error.Syntax, parseTest("[logs]\nbogus = \"x\"", &storage));
+    const text =
+        \\[worker.api]
+        \\stream = true
+        \\
+        \\[worker.cron]
+        \\stream = false
+        \\
+        \\[worker.worker]
+        \\cwd = "/srv"
+    ;
+    const cfg = try parseTest(text, &storage);
+    // Only the worker that opted in is listed; `stream = false` and a worker
+    // without the key record nothing (default = non-streaming).
+    try t.expectEqual(@as(u8, 1), cfg.stream_n);
+    try t.expectEqualStrings("api", cfg.stream[0]);
+    // A non-true/false value is a hard error (a typo can't silently enable it).
+    try t.expectError(error.BadValue, parseTest("[worker.api]\nstream = yes", &storage));
+}
+
+test "logs section: stream key is no longer accepted (now per-worker)" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // `[logs] stream` was removed in log-signal-v2: streaming is per-worker now,
+    // so an old `[logs] stream` key is an unknown-key Syntax error.
+    try t.expectError(error.Syntax, parseTest("[logs]\nstream = true", &storage));
 }
 
 test "logs section: max_rate parses, defaults absent, rejects bad values" {
     var storage: [cli.max_workers][]const u8 = undefined;
     // A positive cap parses as a bare int.
-    const cap = try parseTest("[logs]\nstream = true\nmax_rate = 500", &storage);
+    const cap = try parseTest("[logs]\nmax_rate = 500", &storage);
     try t.expectEqual(@as(?u32, 500), cap.logs_max_rate);
     // 0 = unlimited is a legal explicit value.
     const unlimited = try parseTest("[logs]\nmax_rate = 0", &storage);
     try t.expectEqual(@as(?u32, 0), unlimited.logs_max_rate);
     // Absent -> null (caller keeps the cli.Config default of 0/unlimited).
-    const none = try parseTest("[logs]\nstream = true", &storage);
+    const none = try parseTest("workers = [\"./a\"]", &storage);
     try t.expectEqual(@as(?u32, null), none.logs_max_rate);
     // Non-numeric and negative are hard errors (parseInt rejects the sign for a
     // u32), so a typo cannot silently disable the cap.

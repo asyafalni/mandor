@@ -41,13 +41,12 @@ pub const GpuConfig = struct {
     interval_ms: u64 = 15_000,
 };
 
-/// `[logs]` section (TOML-only). OFF by default — full worker-log streaming to
-/// photon is 100% opt-in and additionally requires `photon=` (so `photon=`
-/// alone still ships only the curated tier: incidents + metrics + lifecycle).
-/// When on, each captured line is shipped to photon as an OTLP log
-/// (best-effort, lossy — the ephemeral telemetry tier).
+/// `[logs]` section (TOML-only). Holds only the GLOBAL rate cap — log streaming
+/// is now selected PER WORKER (`[worker.NAME] stream = true`), and additionally
+/// requires `photon=` (so `photon=` alone still ships only the curated tier:
+/// incidents + metrics + lifecycle). Each streamed line is shipped to photon as
+/// an OTLP log (best-effort, lossy — the ephemeral telemetry tier).
 pub const LogsConfig = struct {
-    stream: bool = false,
     /// Rate cap for streamed log lines, lines/sec. 0 = unlimited (the default):
     /// the limiter is skipped entirely so streaming costs nothing beyond the
     /// enqueue. When > 0, lines past the cap in a 1-second window are dropped
@@ -115,6 +114,10 @@ pub const Config = struct {
     cwd_pairs_n: u8 = 0,
     oneshot: [16][]const u8 = undefined,
     oneshot_n: u8 = 0,
+    /// Names of workers with `[worker.NAME] stream = true` — per-worker log
+    /// streaming opt-in (TOML-only). Default empty ⇒ no worker streams.
+    stream: [16][]const u8 = undefined,
+    stream_n: u8 = 0,
     /// "name=uid:gid" privilege drops (numeric only — scratch has no passwd).
     user_pairs: [16]HealthSpec = undefined,
     user_pairs_n: u8 = 0,
@@ -151,7 +154,8 @@ pub const Config = struct {
     secrets_n: usize = 0,
     /// `[gpu]` NVIDIA GPU sampling (TOML-only): off by default, daemon-side.
     gpu: GpuConfig = .{},
-    /// `[logs]` full worker-log streaming (TOML-only): off by default, opt-in.
+    /// `[logs]` global streaming rate cap (TOML-only). Per-worker streaming
+    /// opt-in lives in `stream`/`stream_n` above; this holds only `max_rate`.
     logs: LogsConfig = .{},
 };
 

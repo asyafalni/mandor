@@ -78,6 +78,10 @@ pub const Worker = struct {
     cwd_buf: [256]u8 = undefined,
     cwd_len: u16 = 0, // NUL-terminated in cwd_buf when set
     is_oneshot: bool = false,
+    /// Per-worker opt-in log streaming (`[worker.NAME] stream = true`). Default
+    /// false ⇒ this worker's captured lines are never enqueued to photon, so the
+    /// capture path pays nothing. Armed in applyConfig only when photon is set.
+    stream: bool = false,
     drop_uid: ?u32 = null,
     drop_gid: ?u32 = null,
     /// Capability bits to drop from the bounding set; drop_all_caps drops
@@ -193,6 +197,7 @@ fn resetWorker(w: *Worker) void {
     w.secrets_n = 0;
     w.cwd_len = 0;
     w.is_oneshot = false;
+    w.stream = false;
     w.drop_uid = null;
     w.drop_gid = null;
     w.cap_drop_mask = 0;

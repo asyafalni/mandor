@@ -1195,7 +1195,7 @@ if [ $c -eq 0 ] \
   ok "formats: b10 yields 6 digits, raw round-trips 32 bytes to EOF"
 else bad "secret formats" "exit $c: $(grep -E '^\[sh\] (OTP|BLOB)' "$TMP/77")"; fi
 
-# 78-79. Opt-in worker log streaming (`[logs] stream`). A fake OTLP listener --
+# 78-79. Opt-in per-worker log streaming (`[worker.NAME] stream`). A fake OTLP listener --
 # the same shape as test 65 (ephemeral port, port-file readiness, reads
 # Content-Length, answers 200) -- records every /v1/logs body it receives, plus
 # every request path so a negative can be proven non-vacuous. The streamed line
@@ -1203,6 +1203,7 @@ else bad "secret formats" "exit $c: $(grep -E '^\[sh\] (OTP|BLOB)' "$TMP/77")"; 
 # resource attribute, so a raw byte-substring check on the body is sufficient
 # (no full protobuf decode). Poll/readiness-based throughout: no fixed sleeps.
 MARK="MANDOR_STREAM_MARKER_7F3A9"
+MARK2="MANDOR_QUIET_MARKER_B21C4"
 cat > "$TMP/listen_logs.py" <<'PY'
 import socket, sys
 srv = socket.socket()
@@ -1242,8 +1243,11 @@ while True:
         bodies.write(buf.partition(b"\r\n\r\n")[2] + b"\n---FRAME---\n"); bodies.flush()
 PY
 
-# 78. stream ON: the worker's unique stdout line must land at photon /v1/logs,
-# carrying the worker's overridden service.name ("streamer").
+# 78. PER-WORKER stream ON: two workers, only one marked `[worker.NAME] stream`.
+# The streaming worker's unique stdout line must land at photon /v1/logs carrying
+# its overridden service.name ("streamer"); the NON-streaming worker's line (a
+# distinct marker) must NOT reach photon even though it prints to the supervisor's
+# own stdout. This proves the gate is per-worker, not global.
 rm -f "$TMP/78port" "$TMP/78paths" "$TMP/78bodies"
 python3 "$TMP/listen_logs.py" "$TMP/78port" "$TMP/78paths" "$TMP/78bodies" >/dev/null 2>&1 &
 lpid=$!
@@ -1254,27 +1258,34 @@ if [ -z "$p78" ]; then
   kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
 else
 cat > "$TMP/stream78.toml" <<TOML
-workers = ["sh -c 'echo $MARK; sleep 30'"]
+workers = ["sh -c 'echo $MARK; sleep 30'", "sh -c 'echo $MARK2; sleep 30'"]
 photon = "127.0.0.1:$p78"
-[logs]
-stream = true
 [worker.sh]
+stream = true
 name = "streamer"
+[worker."sh-2"]
+name = "quiet"
 TOML
 PHOTON_TOKEN=any "$MANDOR" --config="$TMP/stream78.toml" >"$TMP/78out" 2>&1 &
 mpid=$!
 found=""
 for _ in $(seq 1 250); do
-  grep -q "$MARK" "$TMP/78bodies" 2>/dev/null && { found=1; break; }
+  # Wait for the streaming worker's marker to ship AND for the quiet worker to
+  # have printed to the supervisor's own stdout (so its "not shipped" is proven
+  # non-vacuous: it ran and emitted, yet stayed off the wire).
+  if grep -q "$MARK" "$TMP/78bodies" 2>/dev/null && grep -q "$MARK2" "$TMP/78out" 2>/dev/null; then
+    found=1; break
+  fi
   kill -0 "$mpid" 2>/dev/null || break
   sleep 0.1
 done
 kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
 kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
-if [ -n "$found" ] && grep -q "streamer" "$TMP/78bodies" 2>/dev/null; then
-  ok "log streaming on: worker stdout line reaches photon /v1/logs with its service.name"
-else bad "log streaming on" \
-  "marker_in_body=[$found] logbody_bytes=$(wc -c < "$TMP/78bodies" 2>/dev/null) paths=[$(sort -u "$TMP/78paths" 2>/dev/null | tr '\n' ' ')]"; fi
+if [ -n "$found" ] && grep -q "streamer" "$TMP/78bodies" 2>/dev/null \
+   && ! grep -q "$MARK2" "$TMP/78bodies" 2>/dev/null; then
+  ok "per-worker stream on: only the selected worker's line reaches photon /v1/logs (the other never ships)"
+else bad "per-worker log streaming" \
+  "marker_in_body=[$found] leaked_quiet=$(grep -c "$MARK2" "$TMP/78bodies" 2>/dev/null) logbody_bytes=$(wc -c < "$TMP/78bodies" 2>/dev/null) paths=[$(sort -u "$TMP/78paths" 2>/dev/null | tr '\n' ' ')]"; fi
 fi
 
 # 79. stream OFF (default, no [logs] section): the SAME worker line must NOT

@@ -54,7 +54,6 @@ pub fn spawnDaemon(
     state_dir: []const u8,
     gpu_enabled: bool,
     gpu_interval_ms: u64,
-    logs_stream: bool,
     service_prefix: []const u8,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
@@ -71,7 +70,6 @@ pub fn spawnDaemon(
     var sd_buf: [512]u8 = undefined;
     var gpu_buf: [2]u8 = undefined;
     var gi_buf: [24]u8 = undefined;
-    var ls_buf: [2]u8 = undefined;
     var sp_buf: [96]u8 = undefined;
     const fd_str = std.fmt.bufPrintZ(&fd_buf, "{d}", .{read_fd}) catch {
         _ = linux.close(read_fd);
@@ -99,13 +97,6 @@ pub fn spawnDaemon(
         _ = linux.close(write_end);
         return;
     };
-    // Log-streaming toggle as one trailing argv string ("0"|"1"), so Task 11's
-    // daemon knows whether to ship the log frames it drains.
-    const ls_str = std.fmt.bufPrintZ(&ls_buf, "{d}", .{@intFromBool(logs_stream)}) catch {
-        _ = linux.close(read_fd);
-        _ = linux.close(write_end);
-        return;
-    };
     // Service prefix as one trailing argv string (the origin tag, "" = none).
     // Capped upstream (cli.max_service_prefix) so it always fits sp_buf.
     const sp_str = std.fmt.bufPrintZ(&sp_buf, "{s}", .{service_prefix}) catch {
@@ -114,10 +105,11 @@ pub fn spawnDaemon(
         return;
     };
 
-    // `mandor relay --daemon <endpoint> <state_dir> <read_fd> <gpu> <interval> <logs> <service_prefix>` —
-    // main.zig routes it. The string buffers live on this stack frame;
-    // spawnDetached forks and the child execs from its copy before this function
-    // returns, so they are valid for the exec.
+    // `mandor relay --daemon <endpoint> <state_dir> <read_fd> <gpu> <interval> <service_prefix>` —
+    // main.zig routes it. Log streaming is decided supervisor-side per worker,
+    // so no streaming toggle is passed. The string buffers live on this stack
+    // frame; spawnDetached forks and the child execs from its copy before this
+    // function returns, so they are valid for the exec.
     const argv = [_:null]?[*:0]const u8{
         "/proc/self/exe",
         "relay",
@@ -127,7 +119,6 @@ pub fn spawnDaemon(
         @ptrCast(fd_str.ptr),
         @ptrCast(gpu_str.ptr),
         @ptrCast(gi_str.ptr),
-        @ptrCast(ls_str.ptr),
         @ptrCast(sp_str.ptr),
     };
     const pid = spawner.spawnDetached(&argv, envp, path_env, read_fd);
@@ -217,7 +208,7 @@ pub fn rateDrops() u64 {
     return rate_drops;
 }
 
-/// Emit one streamed worker-log line (opt-in `[logs] stream`). No-op if no
+/// Emit one streamed worker-log line (opt-in `[worker.NAME] stream`). No-op if no
 /// daemon; drops (and counts) if the pipe is full, the daemon is gone, or the
 /// frame will not fit one atomic write. Same non-blocking / zero-alloc / never-
 /// trap contract as emitMetric/emitLifecycle — the supervision loop outranks

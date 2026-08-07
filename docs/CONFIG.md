@@ -80,13 +80,14 @@ never touches one. That child ships three things to photon:
 
 By default mandor does **not** ship raw per-line worker logs and never ships
 traces: it *curates*, so log content travels only inside incident bundles. That
-default is opt-out only for logs — set `[logs] stream = true` (see below) to also
-stream the full worker stdout/stderr firehose to photon's `/v1/logs`. Traces are
+default is opt-out only for logs — set `[worker.NAME] stream = true` (see below)
+on the specific workers whose stdout/stderr firehose you want streamed to photon's
+`/v1/logs`. Traces are
 never shipped either way. The other telemetry behaviours (metrics on when
 `photon` is set, the 5 s sample cadence, the daemon's internal buffer size) are
-fixed and intentionally not exposed as separate keys — `photon` plus the small
-`[logs]` section are the whole telemetry surface, keeping to the four-CLI-flag /
-minimal-key rule. `PHOTON_TOKEN` (env, kept off the process cmdline) sets the
+fixed and intentionally not exposed as separate keys — `photon`, the per-worker
+`stream` toggle, plus the small `[logs]` rate cap are the whole telemetry surface,
+keeping to the four-CLI-flag / minimal-key rule. `PHOTON_TOKEN` (env, kept off the process cmdline) sets the
 bearer token when photon requires auth.
 
 ### GPU metrics (the `[gpu]` section)
@@ -100,14 +101,17 @@ timer, off the supervision path, and is silent when `nvidia-smi` is absent.
 | `enabled` | bool | `false` | Turn on GPU sampling (requires `nvidia-smi` on `PATH`) |
 | `interval` | duration | `15s` | GPU sample cadence |
 
-### Worker log streaming (the `[logs]` section)
+### Worker log streaming (per-worker `stream`, plus the `[logs]` rate cap)
 
 Off by default — mandor **curates** (incident bundles + metrics + lifecycle) and
-does not ship raw per-line logs. Set `[logs] stream = true` to also stream every
-worker stdout/stderr line to photon's `/v1/logs` as OTLP logs (one `service.name`
-per worker, the line as the log `body`, stderr/severity flagged). Streaming also
-requires `photon=` to be set — with no relay daemon there is nowhere to stream to,
-so the toggle is inert on its own.
+does not ship raw per-line logs. Streaming is selected **per worker**: set
+`stream = true` inside a `[worker.NAME]` section to stream that worker's
+stdout/stderr lines to photon's `/v1/logs` as OTLP logs (one `service.name` per
+worker, the line as the log `body`, stderr/severity flagged). Only the workers you
+mark stream; every other worker stays curated. Streaming also requires `photon=`
+to be set — with no relay daemon there is nowhere to stream to, so the toggle is
+inert on its own. The `[logs]` section now holds only the global `max_rate` cap
+that applies across all streaming workers.
 
 This is the **ephemeral, best-effort tier**: streamed lines ride the same
 non-blocking pipe as metrics and are **dropped under backpressure** (slow/absent
@@ -117,13 +121,21 @@ supervision; drops are counted internally.
 
 **PII / volume caveat.** Full worker logs can carry secrets, tokens, and personal
 data, and a chatty fleet is a lot of egress. This is why streaming is strictly
-opt-in and rate-limitable — the operator decides to ship the firehose. Prefer the
-curated tier (leave `stream` off) unless you specifically need raw logs in photon.
+opt-in and rate-limitable — the operator decides which workers ship the firehose.
+Prefer the curated tier (leave `stream` off) unless you specifically need a given
+worker's raw logs in photon.
+
+Per-worker toggle (inside a `[worker.NAME]` section):
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `stream` | bool | `false` | Stream full worker stdout/stderr to photon `/v1/logs` (opt-in; requires `photon=`). Ephemeral/best-effort, never spooled |
-| `max_rate` | int | `0` | Rate cap in lines/sec across all workers. `0` = unlimited; above it, excess lines in each 1-second window are dropped (counted, never spooled) before a frame is built |
+| `stream` | bool | `false` | Stream this worker's stdout/stderr to photon `/v1/logs` (opt-in; requires `photon=`). Ephemeral/best-effort, never spooled |
+
+Global rate cap (the `[logs]` section):
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `max_rate` | int | `0` | Rate cap in lines/sec across all streaming workers. `0` = unlimited; above it, excess lines in each 1-second window are dropped (counted, never spooled) before a frame is built |
 
 ### Deploying mandor as a node monitor
 

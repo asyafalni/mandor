@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Invisible subcommand: `mandor relay <bundle.json>` (photon bridge).
     // The supervisor path never networks; this runs only when invoked.
     if (vec.len >= 3 and std.mem.eql(u8, std.mem.span(vec[1]), "relay")) {
-        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [gpu] [interval] [logs] [service_prefix]`.
+        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [gpu] [interval] [service_prefix]`.
         // Spawned by the supervisor when `photon=` is set (it owns the socket so
         // the supervision path never does). <spool_dir> is the mandor state dir
         // (the one holding incidents/); <pipe_fd> is the inherited read end.
@@ -103,13 +103,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 (std.fmt.parseInt(u64, std.mem.span(vec[7]), 10) catch 15_000)
             else
                 15_000;
-            // Log-streaming toggle appended after GPU: vec[8]="0"|"1". Absent
-            // (an older spawn) -> streaming off. Task 11 uses it to ship logs.
-            const logs_stream = vec.len >= 9 and std.mem.eql(u8, std.mem.span(vec[8]), "1");
-            // Service prefix appended after the logs toggle: vec[9] = origin tag
+            // Service prefix appended after GPU config: vec[8] = origin tag
             // ("" = none). Absent (an older spawn) -> empty (unchanged OTLP).
-            const service_prefix: []const u8 = if (vec.len >= 10) std.mem.span(vec[9]) else "";
-            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_enabled, gpu_interval_ms, logs_stream, service_prefix, init.environ.block.slice);
+            // Log streaming is decided supervisor-side per worker, so no toggle
+            // is threaded to the daemon anymore.
+            const service_prefix: []const u8 = if (vec.len >= 9) std.mem.span(vec[8]) else "";
+            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_enabled, gpu_interval_ms, service_prefix, init.environ.block.slice);
         }
         const endpoint: ?[]const u8 = if (vec.len >= 4) std.mem.span(vec[3]) else null;
         return @import("relay.zig").run(vec[2], endpoint, init.environ.block.slice);
@@ -197,7 +196,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (file_cfg.service_prefix) |v| cfg.service_prefix = v;
             if (file_cfg.gpu_enabled) |v| cfg.gpu.enabled = v;
             if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
-            if (file_cfg.logs_stream) |v| cfg.logs.stream = v;
             if (file_cfg.logs_max_rate) |v| cfg.logs.max_rate = v;
             if (cfg.psi_mem_pct == 0) {
                 if (file_cfg.psi_mem_pct) |v| cfg.psi_mem_pct = v;
@@ -217,6 +215,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.cwd_pairs_n = file_cfg.cwd_pairs_n;
             cfg.oneshot = file_cfg.oneshot;
             cfg.oneshot_n = file_cfg.oneshot_n;
+            cfg.stream = file_cfg.stream;
+            cfg.stream_n = file_cfg.stream_n;
             cfg.user_pairs = file_cfg.user_pairs;
             cfg.user_pairs_n = file_cfg.user_pairs_n;
             cfg.cap_drop_pairs = file_cfg.cap_drop_pairs;
