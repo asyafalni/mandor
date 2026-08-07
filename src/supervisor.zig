@@ -332,7 +332,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // path never does), watches the spool for incidents, and drains the
         // telemetry pipe for metrics/lifecycle events. Best-effort — if the
         // spawn fails, telemetry is simply off and supervision is unaffected.
-        telemetry.spawnDaemon(endpoint, state_dir, cfg.gpu.enabled, cfg.gpu.interval_ms, cfg.logs.stream, envp, path_env);
+        telemetry.spawnDaemon(endpoint, state_dir, cfg.gpu.enabled, cfg.gpu.interval_ms, cfg.logs.stream, cfg.service_prefix, envp, path_env);
         logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
         // Opt-in full log streaming: only arm the per-line enqueue when the
         // operator set `[logs] stream` AND photon is configured (so a daemon

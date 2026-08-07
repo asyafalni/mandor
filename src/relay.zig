@@ -123,6 +123,35 @@ fn scanStr(chunk: []const u8, comptime key: []const u8) ?[]const u8 {
 var unesc_buf: [4 * 1024]u8 = undefined;
 var unesc_pos: usize = 0;
 
+// ------------------------------------------------------- service-name prefix
+//
+// Multi-tenancy: photon is shared, and two mandor origins may run a worker with
+// the same name (e.g. `api`), colliding on `service.name`. An operator sets
+// `service_prefix` (config) to tag every OTLP emission with an origin prefix so
+// the origins stay distinct (docs/…/2026-08-06-log-signal-v2-design.md). Default
+// "" is byte-identical to a build without this feature. The prefix is applied in
+// ONE place — the putServiceName/serviceKvLen helpers below — and touches ONLY
+// `service.name`: the bare worker name is unchanged everywhere else (log `[name]`
+// echo, report, Prometheus label, the incident bundle's own JSON).
+
+/// Max prefix length. Matches cli.max_service_prefix (config rejects anything
+/// longer), so the daemon's copy below never truncates.
+pub const service_prefix_cap = 64;
+
+/// The active prefix, copied into BSS at daemon start (setServicePrefix) so the
+/// slice is stable for the daemon's whole life regardless of argv storage.
+var service_prefix_buf: [service_prefix_cap]u8 = undefined;
+var service_prefix: []const u8 = "";
+
+/// Install the origin prefix (runDaemon calls this once before the loop). Copies
+/// into BSS and clamps to the cap; an over-long value is a config error caught
+/// earlier, but clamp here too so this can never overflow or trap.
+pub fn setServicePrefix(p: []const u8) void {
+    const n = @min(p.len, service_prefix_buf.len);
+    @memcpy(service_prefix_buf[0..n], p[0..n]);
+    service_prefix = service_prefix_buf[0..n];
+}
+
 /// Decode JSON string source into the bytes it denotes.
 ///
 /// `scanStr` hands back *source* text — the spool writer escaped it. A JSON
@@ -277,6 +306,44 @@ fn putKeyValue(w: *Writer, comptime field: u8, k: []const u8, v: []const u8) voi
     putAnyValue(w, 2, v); // KeyValue.value
 }
 
+/// Scratch for `service_prefix ++ name`, formed and consumed within a single
+/// putServiceName call (single-threaded daemon, no cross-call state). Sized to
+/// the prefix cap plus the largest name any encoder passes: the incident path's
+/// name_txt is bounded by unesc_buf and every frame-sourced name is far smaller,
+/// so the join never truncates in practice — meaning an empty prefix yields the
+/// bare name verbatim (byte-identical to a build without this feature).
+var svc_buf: [service_prefix_cap + unesc_buf.len]u8 = undefined;
+
+/// Encoded value length of the prefixed `service.name` (prefix.len + name.len),
+/// clamped to the scratch so the sizing pass and the write can never disagree.
+/// Length-only: pass 1 needs no scratch and never concatenates.
+fn svcNameLen(name: []const u8) usize {
+    return @min(service_prefix.len +| name.len, svc_buf.len);
+}
+
+/// KeyValue length for `service.name = service_prefix ++ name`. Drop-in for
+/// `keyValueLen("service.name", name)` in every sizing pass. Expands to the same
+/// shape keyValueLen produces: delimLen(key.len) + delimLen(anyValueLen(vlen)),
+/// where anyValueLen(v) == delimLen(v.len).
+fn serviceKvLen(name: []const u8) usize {
+    const vlen = svcNameLen(name);
+    return delimLen("service.name".len) + delimLen(delimLen(vlen));
+}
+
+/// Write `service.name = service_prefix ++ name` as resource attribute (field 1).
+/// Forms the joined value in svc_buf and hands it to putKeyValue, so the on-wire
+/// bytes are exactly serviceKvLen(name). With an empty prefix the value is the
+/// bare name — byte-identical to the previous putKeyValue(w, 1, "service.name",
+/// name) call sites.
+fn putServiceName(w: *Writer, name: []const u8) void {
+    const vlen = svcNameLen(name);
+    const plen = @min(service_prefix.len, vlen);
+    @memcpy(svc_buf[0..plen], service_prefix[0..plen]);
+    const nlen = vlen - plen;
+    @memcpy(svc_buf[plen..][0..nlen], name[0..nlen]);
+    putKeyValue(w, 1, "service.name", svc_buf[0..vlen]);
+}
+
 /// OTLP SeverityNumber. INFO for routine lifecycle, WARN for recoverable
 /// trouble, ERROR for a failed/killed worker or an incident.
 const sev_info: u64 = 9;
@@ -321,7 +388,7 @@ pub fn buildOtlp(bundle: []const u8) BuildError![]const u8 {
         delimLen(keyValueLen("mandor.bundle", bundle)); // attributes (field 6)
     const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
     const resource_len =
-        delimLen(keyValueLen("service.name", name_txt)) +
+        delimLen(serviceKvLen(name_txt)) +
         delimLen(keyValueLen("service.version", release_txt));
     const rl_len = delimLen(resource_len) + delimLen(scope_len);
     const total = delimLen(rl_len); // ExportLogsServiceRequest.resource_logs
@@ -331,7 +398,7 @@ pub fn buildOtlp(bundle: []const u8) BuildError![]const u8 {
     var w = Writer{ .buf = &body_buf };
     w.delim(1, rl_len); // resource_logs
     w.delim(1, resource_len); //   resource
-    putKeyValue(&w, 1, "service.name", name_txt); //     attributes
+    putServiceName(&w, name_txt); //     attributes (origin-prefixed)
     putKeyValue(&w, 1, "service.version", release_txt);
     w.delim(2, scope_len); //   scope_logs
     w.delim(2, rec_len); //     log_records
@@ -436,7 +503,7 @@ pub fn buildOtlpMetrics(samples: []const frame.MetricSample, host_name: []const 
         for (gauge_metrics) |g| scope_len += delimLen(gaugeMetricLen(g.name, g.unit));
         scope_len += delimLen(sumMetricLen(restart_metric_name, restart_metric_unit));
 
-        const resource_len = delimLen(keyValueLen("service.name", s.name)) +
+        const resource_len = delimLen(serviceKvLen(s.name)) +
             delimLen(keyValueLen("host.name", host_name));
         const rm_len = delimLen(resource_len) + delimLen(scope_len);
         total += delimLen(rm_len);
@@ -449,13 +516,13 @@ pub fn buildOtlpMetrics(samples: []const frame.MetricSample, host_name: []const 
         var scope_len: usize = 0;
         for (gauge_metrics) |g| scope_len += delimLen(gaugeMetricLen(g.name, g.unit));
         scope_len += delimLen(sumMetricLen(restart_metric_name, restart_metric_unit));
-        const resource_len = delimLen(keyValueLen("service.name", s.name)) +
+        const resource_len = delimLen(serviceKvLen(s.name)) +
             delimLen(keyValueLen("host.name", host_name));
         const rm_len = delimLen(resource_len) + delimLen(scope_len);
 
         w.delim(1, rm_len); // resource_metrics
         w.delim(1, resource_len); //   resource
-        putKeyValue(&w, 1, "service.name", s.name); //     attributes
+        putServiceName(&w, s.name); //     attributes (origin-prefixed)
         putKeyValue(&w, 1, "host.name", host_name); //     (so the process is attributable to its node)
         w.delim(2, scope_len); //   scope_metrics
 
@@ -970,7 +1037,7 @@ pub fn buildOtlpEvent(e: frame.Lifecycle) error{TooLarge}![]const u8 {
         attr_len + // attributes (field 6)
         9; // observed_time_unix_nano (fixed64, field 11)
     const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
-    const resource_len = delimLen(keyValueLen("service.name", e.name));
+    const resource_len = delimLen(serviceKvLen(e.name));
     const rl_len = delimLen(resource_len) + delimLen(scope_len);
     const total = delimLen(rl_len); // ExportLogsServiceRequest.resource_logs
     if (total > body_buf.len) return error.TooLarge;
@@ -979,7 +1046,7 @@ pub fn buildOtlpEvent(e: frame.Lifecycle) error{TooLarge}![]const u8 {
     var w = Writer{ .buf = &body_buf };
     w.delim(1, rl_len); // resource_logs
     w.delim(1, resource_len); //   resource
-    putKeyValue(&w, 1, "service.name", e.name); //     attributes
+    putServiceName(&w, e.name); //     attributes (origin-prefixed)
     w.delim(2, scope_len); //   scope_logs
     w.delim(2, rec_len); //     log_records
     w.fixed64(1, ns); //       time_unix_nano
@@ -1041,7 +1108,7 @@ fn logRlLen(r: LogRecord, host_name: []const u8, host_id: []const u8) usize {
         delimLen(keyValueLen("log.iostream", ioStreamName(r.iostream))); // attributes (field 6)
     const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
     const resource_len =
-        delimLen(keyValueLen("service.name", r.name)) +
+        delimLen(serviceKvLen(r.name)) +
         delimLen(keyValueLen("host.name", host_name)) +
         delimLen(keyValueLen("host.id", host_id)) +
         delimLen(keyValueLen("os.type", "linux"));
@@ -1083,7 +1150,7 @@ pub fn buildOtlpLogs(records: []const LogRecord, host_name: []const u8, host_id:
             delimLen(keyValueLen("log.iostream", ioStreamName(r.iostream)));
         const scope_len = delimLen(rec_len);
         const resource_len =
-            delimLen(keyValueLen("service.name", r.name)) +
+            delimLen(serviceKvLen(r.name)) +
             delimLen(keyValueLen("host.name", host_name)) +
             delimLen(keyValueLen("host.id", host_id)) +
             delimLen(keyValueLen("os.type", "linux"));
@@ -1091,7 +1158,7 @@ pub fn buildOtlpLogs(records: []const LogRecord, host_name: []const u8, host_id:
 
         w.delim(1, rl_len); // resource_logs
         w.delim(1, resource_len); //   resource
-        putKeyValue(&w, 1, "service.name", r.name); //     attributes
+        putServiceName(&w, r.name); //     attributes (origin-prefixed)
         putKeyValue(&w, 1, "host.name", host_name); //     (SAME identity as the worker's metrics)
         putKeyValue(&w, 1, "host.id", host_id);
         putKeyValue(&w, 1, "os.type", "linux");
@@ -1514,8 +1581,14 @@ pub fn runDaemon(
     gpu_enabled: bool,
     gpu_interval_ms: u64,
     logs_stream: bool,
+    service_prefix_arg: []const u8,
     environ: [:null]const ?[*:0]const u8,
 ) u8 {
+    // Install the origin prefix once, up front: every encoder's service.name
+    // helper reads the module global, and copying to BSS here keeps the slice
+    // stable for the daemon's whole life independent of argv storage. Empty ""
+    // leaves OTLP byte-identical to a build without the feature.
+    setServicePrefix(service_prefix_arg);
     // Log-line frames are drained, batched, and shipped to /v1/logs by drainPipe.
     // The operator's `[logs] stream` toggle is the real gate: the SUPERVISOR only
     // writes log frames when it is on, so with it off no frames reach the pipe and
@@ -2679,4 +2752,98 @@ test "buildOtlpEvent renders body, severity, and service.name" {
     try testing.expectEqual(sev_warn, Fields.get(rec2, 2).?.int);
     try testing.expectEqualStrings("WARN", Fields.get(rec2, 3).?.bytes);
     try testing.expectEqualStrings("worker db unhealthy", avStr(Fields.get(rec2, 5).?.bytes));
+}
+
+// ------------------------------------------------- service_prefix (multi-tenant)
+
+/// service.name of a logs-shaped request (buildOtlp / buildOtlpEvent / logs):
+/// request → resource_logs(1) → resource(1) → attributes[0] → value string. The
+/// per-worker metrics request nests under resource_metrics but with the SAME
+/// resource(1)→attr[0] shape, so this reader works for it too.
+fn firstServiceName(body: []const u8) []const u8 {
+    const rl = Fields.get(body, 1).?.bytes; // resource_logs / resource_metrics
+    const res = Fields.get(rl, 1).?.bytes; // resource
+    var attrs = Fields{ .b = res };
+    const a1 = attrs.next().?.bytes; // service.name is attribute 0
+    // Guard against a silent attribute reordering making this read the wrong one.
+    std.debug.assert(std.mem.eql(u8, "service.name", Fields.get(a1, 1).?.bytes));
+    return avStr(Fields.get(a1, 2).?.bytes);
+}
+
+test "serviceKvLen agrees with the actual encoded service.name length" {
+    // With a prefix set, serviceKvLen must equal keyValueLen for the JOINED value
+    // (prefix ++ name). This is the mutation guard: drop `service_prefix.len` from
+    // serviceKvLen and this fails directly, and every prefixed encoder's
+    // `w.pos == total` assert traps too.
+    setServicePrefix("t-");
+    defer setServicePrefix("");
+    try testing.expectEqual(keyValueLen("service.name", "t-api"), serviceKvLen("api"));
+
+    // Default empty prefix: identical to the bare keyValueLen (byte-identical).
+    setServicePrefix("");
+    try testing.expectEqual(keyValueLen("service.name", "api"), serviceKvLen("api"));
+}
+
+test "service_prefix prepends to service.name in every OTLP encoder" {
+    setServicePrefix("t-");
+    defer setServicePrefix(""); // restore the default for the other tests
+
+    // incident (buildOtlp)
+    {
+        const body = try buildOtlp("{\"name\":\"api\",\"kind\":\"crash\"}");
+        try testing.expectEqualStrings("t-api", firstServiceName(body));
+    }
+    // per-worker process metrics (buildOtlpMetrics)
+    {
+        const s = frame.MetricSample{ .name = "api", .rss_kb = 1, .cpu_pct = 1, .fds = 1, .threads = 1, .restarts = 1, .t_unix_ns = 1 };
+        const body = try buildOtlpMetrics(&.{s}, "node-1");
+        try testing.expectEqualStrings("t-api", firstServiceName(body));
+    }
+    // lifecycle (buildOtlpEvent)
+    {
+        const e = frame.Lifecycle{ .name = "worker", .ev = .started, .t_unix_ns = 1 };
+        const body = try buildOtlpEvent(e);
+        try testing.expectEqualStrings("t-worker", firstServiceName(body));
+    }
+    // streamed logs (buildOtlpLogs)
+    {
+        const recs = [_]LogRecord{.{ .name = "cron", .line = "tick", .iostream = 0, .severity = 0, .t_ns = 1 }};
+        const body = try buildOtlpLogs(&recs, "node-1", "id");
+        try testing.expectEqualStrings("t-cron", firstServiceName(body));
+    }
+}
+
+test "empty service_prefix leaves service.name byte-identical (bare name)" {
+    setServicePrefix(""); // the default; explicit for clarity
+    // incident
+    {
+        const body = try buildOtlp("{\"name\":\"api\",\"kind\":\"crash\"}");
+        try testing.expectEqualStrings("api", firstServiceName(body));
+    }
+    // metrics
+    {
+        const s = frame.MetricSample{ .name = "api", .rss_kb = 1, .cpu_pct = 1, .fds = 1, .threads = 1, .restarts = 1, .t_unix_ns = 1 };
+        const body = try buildOtlpMetrics(&.{s}, "node-1");
+        try testing.expectEqualStrings("api", firstServiceName(body));
+    }
+    // lifecycle
+    {
+        const e = frame.Lifecycle{ .name = "worker", .ev = .started, .t_unix_ns = 1 };
+        const body = try buildOtlpEvent(e);
+        try testing.expectEqualStrings("worker", firstServiceName(body));
+    }
+    // logs
+    {
+        const recs = [_]LogRecord{.{ .name = "cron", .line = "tick", .iostream = 0, .severity = 0, .t_ns = 1 }};
+        const body = try buildOtlpLogs(&recs, "node-1", "id");
+        try testing.expectEqualStrings("cron", firstServiceName(body));
+    }
+}
+
+test "setServicePrefix clamps an over-long prefix to the cap" {
+    const long = "p" ** (service_prefix_cap + 10);
+    setServicePrefix(long);
+    defer setServicePrefix("");
+    // Copied into the fixed BSS buffer, clamped — never overflows, never traps.
+    try testing.expectEqual(@as(usize, service_prefix_cap), service_prefix.len);
 }

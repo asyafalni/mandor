@@ -12,6 +12,10 @@ const secret = @import("secret.zig");
 pub const FileConfig = struct {
     backoff_max_ms: ?u64 = null,
     state_dir: ?[]const u8 = null, // slice into the file buffer
+    /// Tenant/origin tag prepended to `service.name` on every OTLP emission so
+    /// multiple mandor origins publishing to one multi-tenant photon stay
+    /// distinct. null = key absent (caller keeps the cli.Config default of "").
+    service_prefix: ?[]const u8 = null, // slice into the file buffer
     metrics_port: ?u16 = null,
     stop_grace_ms: ?u64 = null,
     expected_exit: ?[256]bool = null,
@@ -223,6 +227,13 @@ pub fn parse(
             cfg.backoff_max_ms = cli.parseDuration(s) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "state_dir")) {
             cfg.state_dir = parseString(value) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "service_prefix")) {
+            // Origin tag for multi-tenant photon. Capped so it always fits the
+            // daemon's fixed BSS copy buffer (relay.service_prefix_cap); an
+            // over-long value is a hard error, never a silent truncation.
+            const s = parseString(value) orelse return error.BadValue;
+            if (s.len > cli.max_service_prefix) return error.BadValue;
+            cfg.service_prefix = s;
         } else if (std.mem.eql(u8, key, "stop_grace")) {
             const s = parseString(value) orelse return error.BadValue;
             cfg.stop_grace_ms = cli.parseDuration(s) orelse return error.BadValue;
@@ -656,6 +667,22 @@ test "full config parses" {
     try t.expectEqual(@as(u16, 9464), cfg.metrics_port.?);
     try t.expectEqual(@as(usize, 2), cfg.commands.len);
     try t.expectEqualStrings("./api --port 8080", cfg.commands[0]);
+}
+
+test "service_prefix parses and rejects an over-long value" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // A short prefix parses (slice into the file text).
+    const cfg = try parseTest("service_prefix = \"tenant-a-\"", &storage);
+    try t.expectEqualStrings("tenant-a-", cfg.service_prefix.?);
+    // Absent -> null (caller keeps the cli.Config default of "").
+    const none = try parseTest("workers = [\"./a\"]", &storage);
+    try t.expectEqual(@as(?[]const u8, null), none.service_prefix);
+    // Exactly at the cap is accepted; one past it is a hard BadValue (no silent
+    // truncation — the daemon's copy buffer is fixed at cli.max_service_prefix).
+    const at_cap = "service_prefix = \"" ++ ("p" ** cli.max_service_prefix) ++ "\"";
+    _ = try parseTest(at_cap, &storage);
+    const over = "service_prefix = \"" ++ ("p" ** (cli.max_service_prefix + 1)) ++ "\"";
+    try t.expectError(error.BadValue, parseTest(over, &storage));
 }
 
 test "health, ready_fd and health_interval keys" {

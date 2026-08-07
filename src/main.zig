@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Invisible subcommand: `mandor relay <bundle.json>` (photon bridge).
     // The supervisor path never networks; this runs only when invoked.
     if (vec.len >= 3 and std.mem.eql(u8, std.mem.span(vec[1]), "relay")) {
-        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [gpu] [interval]`.
+        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [gpu] [interval] [logs] [service_prefix]`.
         // Spawned by the supervisor when `photon=` is set (it owns the socket so
         // the supervision path never does). <spool_dir> is the mandor state dir
         // (the one holding incidents/); <pipe_fd> is the inherited read end.
@@ -106,7 +106,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // Log-streaming toggle appended after GPU: vec[8]="0"|"1". Absent
             // (an older spawn) -> streaming off. Task 11 uses it to ship logs.
             const logs_stream = vec.len >= 9 and std.mem.eql(u8, std.mem.span(vec[8]), "1");
-            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_enabled, gpu_interval_ms, logs_stream, init.environ.block.slice);
+            // Service prefix appended after the logs toggle: vec[9] = origin tag
+            // ("" = none). Absent (an older spawn) -> empty (unchanged OTLP).
+            const service_prefix: []const u8 = if (vec.len >= 10) std.mem.span(vec[9]) else "";
+            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_enabled, gpu_interval_ms, logs_stream, service_prefix, init.environ.block.slice);
         }
         const endpoint: ?[]const u8 = if (vec.len >= 4) std.mem.span(vec[3]) else null;
         return @import("relay.zig").run(vec[2], endpoint, init.environ.block.slice);
@@ -191,6 +194,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
             if (cfg.photon == null) cfg.photon = file_cfg.photon;
+            if (file_cfg.service_prefix) |v| cfg.service_prefix = v;
             if (file_cfg.gpu_enabled) |v| cfg.gpu.enabled = v;
             if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
             if (file_cfg.logs_stream) |v| cfg.logs.stream = v;

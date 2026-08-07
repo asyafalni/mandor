@@ -7,6 +7,11 @@ pub const max_workers = 64;
 pub const max_health = 8;
 pub const default_state_dir = "/var/lib/mandor";
 
+/// Max length of the `service_prefix` origin tag. Must not exceed the daemon's
+/// fixed BSS copy buffer (relay.service_prefix_cap); config rejects anything
+/// longer so the prefix is never silently truncated.
+pub const max_service_prefix = 64;
+
 /// `[secret.NAME]` sections (TOML-only). A secret may be granted to every
 /// worker, so its grant list is capped at the worker cap.
 pub const max_secrets = 16;
@@ -96,6 +101,9 @@ pub const Config = struct {
     on_incident: ?[]const u8 = null,
     /// photon OTLP endpoint ("ip:port"); when set, incidents auto-forward.
     photon: ?[]const u8 = null,
+    /// Tenant/origin tag prepended to `service.name` on every OTLP emission
+    /// (TOML-only; telemetry surface only). "" = no prefix (unchanged behavior).
+    service_prefix: []const u8 = "",
     /// Container-wide PSI stall thresholds (whole percent; 0 = off).
     psi_mem_pct: u16 = 0,
     psi_cpu_pct: u16 = 0,
