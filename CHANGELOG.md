@@ -3,6 +3,57 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.11.0] - 2026-08-07
+
+Log signal v2: three tiers of log → photon. Tier 1 incidents (durable, unchanged);
+**Tier 2 a new curated warn/error digest that is on by default when `photon=` is
+set**; Tier 3 the full firehose, now selectable per worker. All still gated by
+`photon=` — with no `photon` key nothing opens a socket, so offline-by-default is
+unchanged.
+
+### Added
+- **Curated warn/error digest (`[logs] digest`, default ON when `photon=` is
+  set).** A worker that is healthy but *logs* warnings and errors produces no
+  incident, so mandor used to stay silent about it. mandor now deduplicates every
+  warn/error-flagged capture line by signature into a bounded per-run table and
+  periodically ships a compact digest to photon as OTLP `/v1/logs` — **one log
+  record per signature**: body = a sample line, severity = warn/error, attributes
+  `mandor.count` / `mandor.first_ts` / `mandor.last_ts`, `service.name` = worker.
+  Flushed every `digest_interval` (default `30s`), **early** when any one
+  signature's count crosses `digest_threshold` (default `100`), and once at
+  shutdown. **Flood-proof by construction:** a million identical `ERROR db
+  timeout` lines collapse to ONE record with `count=1000000`, sent once per
+  window, never a per-line firehose — accumulation is O(1)/flagged-line against a
+  fixed table. This is the "tell me about warnings and errors even without a
+  crash" signal: curated, not real-time. Harness case 80 proves a warn/error
+  worker that never crashes produces a deduped digest (5 identical lines → one
+  record) at photon.
+- **`service_prefix` (top-level, default `""`).** An origin/tenant tag prepended
+  to `service.name` on **every** OTLP emission (metrics, incidents, lifecycle,
+  streamed logs, the digest) so several mandor origins can share one multi-tenant
+  photon without their worker `service.name`s colliding. Applied in one shared
+  helper; the bare worker name is unchanged everywhere else (log `[name]` prefix,
+  `report`, Prometheus labels), and `host.id` still distinguishes hosts. Empty =
+  unchanged behaviour.
+- **Automatic backpressure shedding for Tier 3 streaming.** When a pipe write to
+  the relay daemon hits `EAGAIN` (daemon behind), `emitLog` flips to a shed state
+  and drops subsequent lines **before encoding** for a short cooldown, then
+  probes again. A flood into a backed-up daemon costs ~O(1)/line instead of
+  encode + write, so mandor's streaming CPU self-caps — no config. Drops are
+  counted, never spooled. (Unit-tested.)
+
+### Changed
+- **Breaking (config): full log streaming is now per-worker.** The global
+  `[logs] stream` toggle is **removed**; opt in per worker with `[worker.NAME]
+  stream = true`. Leaving a flooding worker's `stream` off keeps its CPU cost off
+  the streaming path while Tier 2 still surfaces its errors. `[logs] max_rate`
+  (global lines/sec cap) is kept.
+- Config-surface budget 40 → 44 for the net key change: added `service_prefix`
+  and the three `[logs]` digest keys (`digest`, `digest_interval`,
+  `digest_threshold`); the removed global `[logs] stream` is replaced by the
+  per-worker `stream` key, so it is count-neutral (43 documented keys, one slot
+  headroom).
+
 ## [1.10.0] - 2026-08-06
 
 ### Added

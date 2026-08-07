@@ -1327,6 +1327,68 @@ else bad "log streaming off" \
   "log_path_live=[$live] leaked_marker=$(grep -c "$MARK" "$TMP/79bodies" 2>/dev/null) printed=$(grep -c "$MARK" "$TMP/79out" 2>/dev/null)"; fi
 fi
 
+# 80. Tier-2 curated warn/error digest WITHOUT a crash + dedup. A worker prints
+# several IDENTICAL error lines and then sleeps -- it never crashes, so no
+# incident fires; the only way its trouble reaches photon is the curated digest.
+# With `photon=` set the digest is on by default; a short `digest_interval` makes
+# the timed flush land inside the poll window. mandor dedups the flagged lines by
+# signature, so photon receives ONE /v1/logs digest record for that signature
+# (body = a sample line, plus the digest-only `mandor.count` attribute) -- not one
+# record per line. Reuses the listen_logs.py listener defined for 78/79 (ephemeral
+# port, port-file readiness, records /v1/logs bodies). A fresh unique marker means
+# a stale body file cannot satisfy it. Poll/readiness-based: no fixed sleeps.
+DGMARK="MANDOR_DIGEST_MARKER_C4E1B"
+cat > "$TMP/dirty80.sh" <<SH
+for _ in 1 2 3 4 5; do echo "ERROR db timeout $DGMARK"; done
+sleep 30
+SH
+rm -f "$TMP/80port" "$TMP/80paths" "$TMP/80bodies"
+python3 "$TMP/listen_logs.py" "$TMP/80port" "$TMP/80paths" "$TMP/80bodies" >/dev/null 2>&1 &
+lpid=$!
+for _ in $(seq 1 100); do [ -s "$TMP/80port" ] && break; sleep 0.1; done
+p80=$(cat "$TMP/80port" 2>/dev/null)
+if [ -z "$p80" ]; then
+  bad "curated digest" "listener never bound (harness setup)"
+  kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
+else
+cat > "$TMP/digest80.toml" <<TOML
+workers = ["sh $TMP/dirty80.sh"]
+photon = "127.0.0.1:$p80"
+[logs]
+digest_interval = "1s"
+TOML
+PHOTON_TOKEN=any "$MANDOR" --config="$TMP/digest80.toml" >"$TMP/80out" 2>&1 &
+mpid=$!
+found=""
+for _ in $(seq 1 250); do
+  # A /v1/logs body must carry BOTH the sample substring (`db timeout` marker) AND
+  # the digest's own attribute key `mandor.count`; AND the worker must have printed
+  # to the supervisor's own stdout, so "a digest shipped" is non-vacuous -- the
+  # worker really ran and logged, yet its 5 lines were collapsed, not streamed.
+  # `-a`: the /v1/logs body is binary protobuf, and grep skips -o/-c matches on a
+  # binary file without it (grep -q still detects a match, so the poll can advance,
+  # but the dfreq count below must see every occurrence).
+  if grep -qa "$DGMARK" "$TMP/80bodies" 2>/dev/null \
+     && grep -qa "mandor.count" "$TMP/80bodies" 2>/dev/null \
+     && grep -q "$DGMARK" "$TMP/80out" 2>/dev/null; then
+    found=1; break
+  fi
+  kill -0 "$mpid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
+# Dedup: the 5 identical lines collapse to ONE digest record, so the marker
+# appears in the shipped digest bodies exactly ONCE (grep -o counts every match,
+# across all frames) -- even though the supervisor echoed it 5x to its own stdout.
+dfreq=$(grep -oa "$DGMARK" "$TMP/80bodies" 2>/dev/null | wc -l | tr -d ' ')
+sfreq=$(grep -c "$DGMARK" "$TMP/80out" 2>/dev/null)
+if [ -n "$found" ] && [ "${dfreq:-0}" -eq 1 ]; then
+  ok "curated digest: a non-crashing warn/error worker ships one deduped /v1/logs digest record (5 identical lines collapse to 1)"
+else bad "curated digest dedup" \
+  "found=[$found] digest_marker_freq=${dfreq:-0} stdout_marker_freq=$sfreq logbody_bytes=$(wc -c < "$TMP/80bodies" 2>/dev/null) paths=[$(sort -u "$TMP/80paths" 2>/dev/null | tr '\n' ' ')]"; fi
+fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

@@ -21,6 +21,7 @@ names stay safe in the Prometheus exposition format.
 | `state_dir = "/path"` | `--state-dir=` / `MANDOR_STATE_DIR` | `/var/lib/mandor` | State file + incident spool + history |
 | `metrics_port = 9464` | `--metrics=` | off | Prometheus text endpoint on 127.0.0.1 |
 | `photon = "127.0.0.1:4318"` | — | off | Ship incidents + metrics + lifecycle events to photon as OTLP; fully offline without it. Auth via `PHOTON_TOKEN` env. See "photon telemetry" below |
+| `service_prefix = "tenant-a-"` | — | `""` | Origin/tenant tag prepended to `service.name` on **every** OTLP emission (metrics, incidents, lifecycle, streamed logs, the digest), so several mandor origins can share one multi-tenant photon without `service.name` colliding. Telemetry-only — the bare worker name is unchanged in the log `[name]` prefix, `report`, and Prometheus labels; `host.id` still distinguishes hosts. Default `""` = unchanged; inert without `photon=` |
 | `on_incident = "CMD"` | — | off | Exec CMD after each bundle write, bundle path appended |
 | `health_interval = "30s"` | — | `30s` | Probe cadence |
 | `health_start_period = "10s"` | — | `10s` | Probe failures ignored this long after spawn (until first success) |
@@ -100,6 +101,51 @@ timer, off the supervision path, and is silent when `nvidia-smi` is absent.
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | Turn on GPU sampling (requires `nvidia-smi` on `PATH`) |
 | `interval` | duration | `15s` | GPU sample cadence |
+
+### The three-tier log → photon model
+
+There are three ways worker log signal reaches photon, in increasing volume and
+decreasing curation. **All three are gated by `photon=`** — with no `photon` key
+mandor opens no socket, spawns no relay child, and ships no digest, so the
+offline-by-default guarantee is absolute.
+
+- **Tier 1 — Incidents (durable, always on).** Crash / OOM / unhealthy /
+  restart-loop / leak bundles → OTLP `/v1/logs`, read from the durable spool and
+  **retried, never dropped**. Each bundle already carries the flagged log-tail
+  and deduplicated error signatures, so this is how log *content* normally
+  reaches photon.
+- **Tier 2 — Curated warn/error digest (NEW; default ON when `photon=` is set).**
+  A healthy worker that only *logs* warnings and errors produces no incident, so
+  mandor would otherwise stay silent about real trouble. This tier deduplicates
+  warn/error-flagged capture lines by signature into a bounded per-run table and
+  periodically ships a compact digest — **one OTLP `/v1/logs` record per
+  signature**: body = a sample line, severity = warn/error, attributes
+  `mandor.count` / `mandor.first_ts` / `mandor.last_ts`, `service.name` = worker.
+  Flushed every `digest_interval` (default 30s), **early** when any one
+  signature's count crosses `digest_threshold` (default 100), and once at
+  shutdown. **Flood-proof by construction:** a million identical
+  `ERROR db timeout` lines collapse to ONE record with `count=1000000`, sent once
+  per window — never a per-line firehose. This is the "tell me about warnings and
+  errors even without a crash" signal: **curated, not real-time.** Turn it off
+  with `[logs] digest = false`; tune it with `digest_interval` /
+  `digest_threshold`.
+- **Tier 3 — Full per-worker streaming (opt-in firehose).** `[worker.NAME]
+  stream = true` streams *every* stdout/stderr line of that worker to
+  `/v1/logs`. Ephemeral, best-effort, **dropped under backpressure** (including
+  automatic shedding when the daemon falls behind), never spooled, capped by
+  `[logs] max_rate`. Use it for the specific workers whose raw firehose you need;
+  leave it off and Tier 2 still surfaces their errors.
+
+The default curated signal is Tier 2 (plus Tier 1 on a real incident). Tier 3 is
+the opt-in exception, per worker.
+
+Curated warn/error digest (the `[logs] digest*` keys):
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `digest` | bool | `true` | The curated Tier-2 warn/error digest, **on by default when `photon=` is set**. Dedups flagged capture lines by signature and ships one OTLP `/v1/logs` record per signature. `false` disables it |
+| `digest_interval` | duration | `30s` | Flush cadence — the digest table is emitted and reset on this timer |
+| `digest_threshold` | int | `100` | Early-flush the whole table as soon as any one signature's count crosses this within a window (`0` = timer only) |
 
 ### Worker log streaming (per-worker `stream`, plus the `[logs]` rate cap)
 
