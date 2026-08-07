@@ -20,11 +20,39 @@ and even then the supervision path itself opens no socket).
 > photon's standalone `photon-agent`**. By default mandor still *curates* — it
 > does **not** ship raw per-line worker logs and never ships traces, so log
 > content reaches photon inside incident bundles (their flagged log-tail
-> summary). Full per-line log streaming exists but is strictly opt-in
-> (`[logs] stream`, see channel 2). The Prometheus `--metrics` endpoint remains a
-> local pull option; it is **no longer required** to get metrics into photon.
+> summary) and — as of the log-signal-v2 work — a curated **warn/error digest**
+> (deduplicated signatures, low-rate, default ON when `photon=` is set; see
+> channel 2). Full per-line log streaming exists but is strictly opt-in and is
+> now selected **per worker** (`[worker.NAME] stream = true`, see channel 2). The
+> Prometheus `--metrics` endpoint remains a local pull option; it is **no longer
+> required** to get metrics into photon.
 
 ## The story channels
+
+Every OTLP emission below carries two identity attributes photon groups on: the
+**host** (`host.name` / `host.id`, from machine-id) and the **service**
+(`service.name` — the worker name, or `mandor` for the supervisor's own
+metrics). Both stay constant across channels so a worker's metrics, logs,
+incidents, and lifecycle events line up under one node and one service.
+
+**Multi-tenancy — `service_prefix`.** photon is multi-tenant: several mandor
+origins (deployments / environments / tenants) can publish to one photon, and
+two of them may run a same-named worker (e.g. `api`), colliding on
+`service.name`. The top-level `service_prefix` config key prepends an
+origin/tenant tag to `service.name` on **every** OTLP emission — per-process +
+supervisor metrics (channel 1), streamed logs and the warn/error digest
+(channel 2), incidents (channel 3), and lifecycle events (channel 4) — so
+`service.name` becomes e.g. `tenant-a-api` and origins stay distinct on one
+photon. `host.id` still distinguishes hosts; the prefix is the service-level
+tenant tag. Default `""` = unchanged (the bare worker name, byte-identical to a
+build without the key). The prefix is **telemetry-only**: the `[name]` log
+prefix, `mandor report`, and the Prometheus `worker=` label all keep the bare
+worker name. Each section below flags its `service.name` as origin-prefixed.
+
+```toml
+photon = "photon:4318"
+service_prefix = "tenant-a-"     # service.name becomes e.g. "tenant-a-api"
+```
 
 ### 1. Metrics — native OTLP push when `photon=` is set
 
@@ -34,7 +62,8 @@ relay daemon) — no collector needed. Three resource scopes, all carrying the S
 one node:
 
 - **Per-process + supervisor.** One `ResourceMetrics` per worker
-  (`service.name=<worker>`) with OTel-semconv `process.memory.usage`,
+  (`service.name=<worker>`, origin-prefixed by `service_prefix` when set) with
+  OTel-semconv `process.memory.usage`,
   `process.cpu.utilization`, `process.unix.file_descriptor.count`,
   `process.thread.count` gauges and a `process.restarts` monotonic sum; plus one
   `service.name="mandor"` supervisor self-metric. Each worker resource also
@@ -73,23 +102,87 @@ series (stable names): `mandor_worker_up`, `mandor_worker_restarts_total`,
 photon's uptime checker can also probe the metrics port: mandor answering =
 supervisor alive; `mandor_worker_up == 0` = worker down.
 
-### 2. Worker logs — curated by default, full streaming opt-in
+### 2. Worker logs — curated digest by default, full streaming opt-in
 
 By default mandor does **not** ship raw per-line logs: it multiplexes worker
 output to its own stdout/stderr with `[name]` prefixes (each line wall-clock
 timestamped in the capture ring), and log *content* reaches photon only inside
 incident bundles (the flagged log-tail summary). A container runtime or OTEL
-collector can still forward mandor's stdout independently.
+collector can still forward mandor's stdout independently. Traces are never
+shipped, either way.
 
-Set `[logs] stream = true` (requires `photon=`) to also stream every worker
-stdout/stderr line to photon's `/v1/logs` as OTLP logs — one `service.name` per
-worker, the line as the log `body`, stderr/severity flagged, same host identity
-as the metrics. This is the **ephemeral, best-effort** tier: streamed lines ride
-the same non-blocking pipe as metrics, are **dropped under backpressure** (and by
-the `[logs] max_rate` lines/sec cap), and are **never spooled or retried** —
-incidents are the only durable tier. Full logs can carry secrets and are a lot of
-egress, so streaming is deliberately opt-in and rate-limitable. Traces are never
-shipped either way.
+Beyond incidents (channel 3 — the durable tier), the log-signal-v2 work gives
+photon two log signals, both OTLP logs to `/v1/logs` carrying the same host +
+service identity as the metrics: a **curated warn/error digest** (2a,
+default ON) and **full per-worker streaming** (2b, opt-in). Both are
+**ephemeral** — best-effort, dropped under backpressure, **never spooled or
+retried** (incidents are the only durable tier).
+
+#### 2a. Curated warn/error digest (NEW; default ON when `photon=` is set)
+
+mandor flags every warn/error line at capture time, **deduplicates the flagged
+lines by signature** (the same digit-insensitive signature logic incidents use,
+so `conn 17 refused` and `conn 42 refused` collapse into one), and ships a
+compact summary to `/v1/logs` — **one `LogRecord` per deduplicated signature**.
+The digest surfaces a worker that is *healthy but logging trouble* (warnings and
+errors with no crash), which would otherwise produce no incident. It flushes
+every `digest_interval` (default **30 s**), **early** when any one signature's
+count crosses `digest_threshold` (default **100**), and once **at shutdown**.
+On by default when `photon=` is set — it is the "tell me about warnings and
+errors" behavior and is low-rate/curated, consistent with incidents and metrics.
+`[logs] digest = false` turns it off; `[logs] digest_interval` /
+`[logs] digest_threshold` tune it.
+
+Per digest `LogRecord`:
+
+| field | value |
+|---|---|
+| `body` (AnyValue string) | a representative sample line for the signature (the first line seen for it) |
+| `severity_number` / `severity_text` | `ERROR` or `WARN`, classified by content: a line matching `error` / `warn` / `panic` / `fatal` / `exception` / `traceback` → `ERROR`; a bare (non-matching) stderr line → `WARN`. (info/stdout is not digested.) |
+| `time_unix_nano` / `observed_time_unix_nano` | the signature's **last-seen** time (unix ns) |
+| resource attr `service.name` | the worker name, **origin-prefixed** by `service_prefix` when set |
+| attr `log.iostream` | `stderr` for digest records |
+| attr `mandor.count` (int) | how many lines collapsed into this signature this window |
+| attr `mandor.first_ts` (int) | first-seen time for this signature (unix ns) |
+| attr `mandor.last_ts` (int) | last-seen time for this signature (unix ns) |
+
+The three `mandor.*` int attributes are present **only on digest records** — a
+plain streamed line (2b) carries none — so photon can tell a curated digest
+record from a raw streamed line by the **presence of `mandor.count`**.
+
+**Flood behavior.** A flood of N identical lines collapses to **one** record
+with `mandor.count = N`, sent once per window — never a per-line firehose.
+Distinct signatures beyond the fixed **64-entry** per-window table cap are
+summarized as **one** overflow record with `service.name = "(other)"`, body
+`distinct warn/error signatures dropped (digest table full)`, and
+`mandor.count` = the number of dropped distinct-signature lines. Under a dirty
+flooding app the digest costs O(signatures) per window, not O(lines).
+
+#### 2b. Full per-worker streaming (opt-in, per worker)
+
+Streaming every stdout/stderr line to photon's `/v1/logs` as OTLP logs is opt-in
+**per worker** (this replaced the old global `[logs] stream` toggle):
+
+```toml
+[worker.api]
+stream = true            # only `api` streams every line
+```
+
+Each streamed line is one `LogRecord`: the line as the log `body`,
+`service.name` = worker (origin-prefixed by `service_prefix` when set),
+`log.iostream` + severity flagged, same host identity as the metrics. Leave a
+flooding worker's `stream` off and the digest (2a) still surfaces its errors.
+Streamed lines ride the same non-blocking pipe as metrics, are **dropped under
+backpressure** (see below) and by the `[logs] max_rate` lines/sec cap, and are
+**never spooled or retried**. Full logs can carry secrets and are a lot of
+egress, so streaming is deliberately opt-in and rate-limitable.
+
+**Delivery semantics — automatic backpressure shedding.** When a streamed-line
+pipe write to the daemon hits `EAGAIN` (daemon behind), the emit path flips to a
+**shed** state and drops subsequent lines *before encoding* (a counter bump only)
+for a short cooldown, then probes again — so a flood into a backed-up daemon
+self-caps at ~O(1)/line rather than encode+write, and never spikes PID-1 CPU. All
+such drops are counted; the shed is lossy by design (ephemeral tier).
 
 ### 3. Incidents — the real story; shipped and durable
 
@@ -207,7 +300,7 @@ integration, and mandor no longer waits on it.
 | `ts` | `time_unix_nano` |
 | `cause.kind` + `verdict` | `body` |
 | severity | `ERROR` (exit/signal/oom/unhealthy), `WARN` (leak/restart-loop) |
-| `process.name` | resource attr `service.name` |
+| `process.name` | resource attr `service.name` (origin-prefixed by `service_prefix` when set) |
 | `process.build.release` / `elf_build_id` | resource attrs `service.version`, `build.id` |
 | `exception.type` / `message` | attrs `exception.type`, `exception.message` (OTEL semconv) |
 | `trace.frames` | attr `exception.stacktrace` (rendered) |
@@ -219,7 +312,8 @@ The relay daemon also emits process-lifecycle events to `/v1/logs`: `started`,
 `exited` (ok / error / OOM), `restarting` (with backoff), and `unhealthy`.
 Best-effort over the same non-blocking pipe as metrics — so photon shows a
 worker's timeline (start → restart → crash) next to its metrics and any incident
-bundle, all under the same host identity.
+bundle, all under the same host identity and the same `service.name` (the worker,
+origin-prefixed by `service_prefix` when set).
 
 ## What we need, concretely — done
 
