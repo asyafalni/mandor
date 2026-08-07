@@ -190,6 +190,34 @@ pub fn logDrops() u64 {
     return log_drops;
 }
 
+/// Backpressure shed state (Tier 3 flood defense). When a streamed-log write
+/// hits EAGAIN (pipe full ⇒ the daemon is behind) emitLog opens a short shed
+/// window ending at this timestamp. While `t_ns < shed_until_ns` a line is
+/// dropped BEFORE the encode — an O(1) timestamp compare + counter bump instead
+/// of encode + write — so a flood into a backed-up daemon costs ~O(1)/line, not
+/// encode+write per line. Once the window elapses a single line is attempted
+/// again (a probe): if the pipe is still full a fresh window opens; if the write
+/// succeeds no new window is set, so shedding ends naturally when the daemon
+/// catches up. The clock is the per-line `t_ns` the caller already computed — no
+/// extra syscall. 0 = not shedding.
+var shed_until_ns: u64 = 0;
+
+/// One shed window's length before the next probe. Short (100 ms) so recovery is
+/// prompt once the daemon drains, yet long enough that a sustained flood pays the
+/// encode+write only ~once per window.
+const shed_cooldown_ns: u64 = 100 * 1000 * 1000; // 100ms
+
+/// Streamed log lines dropped by backpressure shedding (pre-encode, inside a
+/// shed window). A SIBLING of `log_drops` so the cheap shed drops stay
+/// distinguishable from encode-too-large / write-failure drops. Saturating so a
+/// sustained flood cannot wrap-trap.
+var shed_drops: u64 = 0;
+
+/// Number of streamed log lines shed under backpressure (for tests / diagnostics).
+pub fn shedDrops() u64 {
+    return shed_drops;
+}
+
 /// Streamed log lines dropped by the `[logs] max_rate` cap: the operator asked
 /// mandor to shed load past N lines/sec, so these drops are deliberate, not
 /// backpressure. Kept a SIBLING of `log_drops` so the two causes stay
@@ -216,6 +244,13 @@ pub fn rateDrops() u64 {
 /// error (see capture.severityFromFlags).
 pub fn emitLog(name: []const u8, iostream: u8, severity: u8, t_ns: u64, line: []const u8) void {
     if (write_fd < 0) return;
+    // Backpressure shedding: inside a shed window (the daemon fell behind) a line
+    // costs only this compare + a counter bump — NOT the encode below. This is
+    // the O(1)/line self-cap under a sustained flood into a backed-up daemon.
+    if (t_ns < shed_until_ns) {
+        shed_drops +|= 1;
+        return;
+    }
     const bytes = frame.encodeLog(&emit_log_buf, .{
         .name = name,
         .iostream = iostream,
@@ -226,7 +261,15 @@ pub fn emitLog(name: []const u8, iostream: u8, severity: u8, t_ns: u64, line: []
         log_drops +|= 1; // name/line too large for one atomic pipe write → drop
         return;
     };
-    if (!writeFrame(bytes)) log_drops +|= 1; // pipe full / daemon gone → drop
+    if (!writeFrame(bytes)) {
+        log_drops +|= 1; // pipe full / daemon gone → drop
+        // Distinguish "pipe full but still connected" (EAGAIN — daemon behind)
+        // from "daemon gone": writeFrame closes write_fd (sets -1) on EPIPE, so
+        // write_fd >= 0 here means the write was EAGAIN. Only that is
+        // backpressure — open a shed window so subsequent lines drop pre-encode
+        // until the daemon catches up. Saturating so a late clock can't trap.
+        if (write_fd >= 0) shed_until_ns = t_ns +| shed_cooldown_ns;
+    }
 }
 
 /// One non-blocking write; drop on anything but a full success. Never blocks,
@@ -309,4 +352,114 @@ test "emitLog drops and counts an over-large line, ships a normal one" {
     // A normal line fits and the (empty) pipe has room → written, no new drop.
     emitLog("api", 1, 2, 1, "boom");
     try testing.expectEqual(saved_drops + 1, log_drops);
+}
+
+/// Fill a non-blocking pipe's write end until a raw write would block (EAGAIN),
+/// so the next emitLog write hits backpressure just like a daemon that fell
+/// behind. Bounded by pipe capacity, so the loop terminates.
+fn fillPipe(fd: i32) void {
+    var filler: [4096]u8 = undefined;
+    @memset(&filler, 'z');
+    while (true) {
+        const rc = linux.write(fd, &filler, filler.len);
+        if (posix.errno(rc) != .SUCCESS) break; // EAGAIN: pipe full
+    }
+}
+
+test "emitLog enters shed on a full pipe and cheap-drops within the window" {
+    // MUTATION TARGET: remove the pre-encode `if (t_ns < shed_until_ns)` gate,
+    // or never set `shed_until_ns` on EAGAIN, and this test fails.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var fds: [2]i32 = undefined;
+    if (posix.errno(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true })) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const saved_fd = write_fd;
+    const saved_log = log_drops;
+    const saved_shed = shed_drops;
+    const saved_until = shed_until_ns;
+    defer {
+        write_fd = saved_fd; // LIFO: restore before the fds close
+        shed_until_ns = saved_until;
+    }
+    write_fd = fds[1];
+    shed_until_ns = 0;
+
+    fillPipe(write_fd); // no reader ⇒ the pipe is now full
+
+    // This line's write hits EAGAIN with write_fd still connected ⇒ enter shed.
+    const t0: u64 = 1_000_000_000;
+    emitLog("api", 0, 2, t0, "boom");
+    try testing.expectEqual(saved_log + 1, log_drops); // the write-failure drop
+    try testing.expectEqual(t0 +| shed_cooldown_ns, shed_until_ns); // window opened
+    try testing.expectEqual(saved_shed, shed_drops); // it was attempted, not shed
+
+    // A line INSIDE the window drops pre-encode: shed_drops rises and log_drops
+    // does NOT (no encode, no write attempted).
+    const log_before = log_drops;
+    emitLog("api", 0, 2, t0 + 1, "boom");
+    try testing.expectEqual(saved_shed + 1, shed_drops);
+    try testing.expectEqual(log_before, log_drops);
+}
+
+test "emitLog probes past the shed window and re-arms if still full" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var fds: [2]i32 = undefined;
+    if (posix.errno(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true })) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const saved_fd = write_fd;
+    const saved_log = log_drops;
+    const saved_until = shed_until_ns;
+    defer {
+        write_fd = saved_fd;
+        shed_until_ns = saved_until;
+    }
+    write_fd = fds[1];
+    // Pretend a prior shed window ends at t=500; the pipe is still full.
+    shed_until_ns = 500;
+    fillPipe(write_fd);
+
+    // t_ns past the window ⇒ a line is PROBED (encode + write attempt). The pipe
+    // is full, so the write fails (log_drops++) and a fresh window opens.
+    const t: u64 = 1000;
+    emitLog("api", 0, 2, t, "boom");
+    try testing.expectEqual(saved_log + 1, log_drops); // a write was attempted
+    try testing.expectEqual(t +| shed_cooldown_ns, shed_until_ns); // re-armed
+}
+
+test "emitLog with a draining reader never enters shed" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var fds: [2]i32 = undefined;
+    if (posix.errno(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true })) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const saved_fd = write_fd;
+    const saved_shed = shed_drops;
+    const saved_until = shed_until_ns;
+    defer {
+        write_fd = saved_fd;
+        shed_until_ns = saved_until;
+    }
+    write_fd = fds[1];
+    shed_until_ns = 0;
+
+    // The reader keeps draining, so every write succeeds and no window opens.
+    var t: u64 = 1;
+    while (t <= 5) : (t += 1) {
+        emitLog("api", 0, 0, t, "hi");
+        var sink: [512]u8 = undefined;
+        _ = linux.read(fds[0], &sink, sink.len);
+    }
+    try testing.expectEqual(saved_shed, shed_drops); // no shed drops
+    try testing.expectEqual(@as(u64, 0), shed_until_ns); // window never opened
 }
