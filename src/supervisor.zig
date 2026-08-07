@@ -23,6 +23,7 @@ const metrics = @import("metrics.zig");
 const cost = @import("cost.zig");
 const telemetry = @import("telemetry.zig");
 const frame = @import("frame.zig");
+const digest = @import("digest.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -352,6 +353,12 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // (so a daemon exists to drain it); no photon ⇒ the cap stays 0 and
         // nothing ships (emitLog no-ops without a daemon).
         stream_max_rate = cfg.logs.max_rate;
+        // Tier-2 curated warn/error digest: default ON when photon is set. Arming
+        // it here (and only here) keeps a no-photon run fully inert — `digest_on`
+        // stays false, so the capture-path feed and the flush timer never run.
+        digest_on = cfg.logs.digest;
+        digest_interval_ms = cfg.logs.digest_interval_ms;
+        digest_threshold = cfg.logs.digest_threshold;
     }
 
     var waiting: [cli.max_workers]bool = .{false} ** cli.max_workers;
@@ -359,6 +366,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     var sd: Shutdown = .{};
     const run_start_ms = nowMs();
     var next_sample_ms: u64 = run_start_ms + sampler.interval_ms;
+    var next_digest_ms: u64 = run_start_ms +| digest_interval_ms;
     var sample_tick: u32 = 0;
     var oom_kills: u64 = cgroup.readOomKills() orelse 0;
     var stall_det: detector.StallState = .{};
@@ -433,6 +441,11 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         if (!sd.active) runHealth(cfg, workers, state_dir, envp, path_env);
 
         var wake_at: u64 = next_sample_ms;
+        // The digest flush is time-driven and applies during shutdown too: a
+        // shutdown should still get a final periodic flush (the explicit
+        // shutdown flush below is the backstop). Unconditional, unlike the
+        // health/deadline contributors gated on `!sd.active`.
+        if (digest_on and next_digest_ms < wake_at) wake_at = next_digest_ms;
         if (!sd.active and next_deadline != 0 and next_deadline < wake_at)
             wake_at = next_deadline;
         if (!sd.active) {
@@ -524,6 +537,16 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
             sample_tick +%= 1;
             runSamplerTick(workers, cfg, state_dir, &stall_det, sample_tick, now_sample);
         }
+
+        // Tier-2 digest flush: on the timer, or early when any one signature's
+        // count crosses the threshold (a burst). Off the per-line path — this
+        // fires at most once per loop iteration and ships ≤ (max_sigs + 1) frames.
+        if (digest_on and (nowMs() >= next_digest_ms or
+            (digest_threshold != 0 and digest.maxCount() >= digest_threshold)))
+        {
+            flushDigest();
+            next_digest_ms = nowMs() +| digest_interval_ms;
+        }
     }
 
     report.writeState(state_dir, workers, nowMs());
@@ -536,6 +559,10 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     // Long enough for a relay to finish a local round trip (resolve, connect,
     // POST); short enough that a wedged hook costs a moment, not the container.
     const forward_drain_ms: u64 = 2000;
+    // A final Tier-2 digest flush so the last window's accumulation isn't lost
+    // on exit. Must precede telemetry.shutdown — the frames go down the pipe the
+    // shutdown then closes (EOF → the daemon's final flush ships them).
+    if (digest_on) flushDigest();
     // The relay daemon may still be shipping the very incident that explains
     // this crash: close its pipe (EOF → final flush), SIGTERM it, and give it
     // the same bounded budget to exit before we do. Then drain any on_incident
@@ -1290,6 +1317,13 @@ const EchoCtx = struct { w: *spawner.Worker, err: bool, t_ms: u64 = 0 };
 /// (the default) ⇒ `rateAllows` returns immediately with no window bookkeeping,
 /// so an uncapped stream pays nothing for the limiter.
 var stream_max_rate: u32 = 0;
+/// Tier-2 curated warn/error digest. `digest_on` is armed only when `photon=`
+/// is set (see the photon block in run()); a no-photon run leaves it false, so
+/// the whole tier — the capture-path feed AND the flush timer — stays inert
+/// (offline-by-default). Cadence and early-flush threshold mirror cfg.logs.
+var digest_on: bool = false;
+var digest_interval_ms: u64 = 30_000;
+var digest_threshold: u32 = 100;
 /// The current 1-second rate window (wall-clock second) and lines emitted in it.
 /// A cheap O(1) token counter: the window resets when the second rolls over,
 /// using the wall-clock timestamp already taken on the capture path.
@@ -1314,6 +1348,23 @@ fn rateAllows(t_ms: u64) bool {
     }
     rate_window_count += 1;
     return true;
+}
+
+/// Ship the accumulated Tier-2 digest to the daemon and reset the window. One
+/// OTLP log per live signature (via telemetry.emitDigest, non-blocking / drop-
+/// on-full), plus a synthetic "(other)" record for signatures that overflowed
+/// the fixed table. Off the per-line path — called at most once per loop
+/// iteration (timer or threshold) and at shutdown; ≤ (max_sigs + 1) frames.
+fn flushDigest() void {
+    const n = digest.count();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const e = digest.get(i);
+        telemetry.emitDigest(e.nameSlice(), e.sev, e.count, e.first_ns, e.last_ns, e.sampleSlice());
+    }
+    const of = digest.overflowLines();
+    if (of > 0) telemetry.emitDigest("(other)", 2, of, 0, telemetry.nowNs(), "distinct warn/error signatures dropped (digest table full)");
+    digest.clear();
 }
 
 /// Ring-record the line and echo it, `[name] `-prefixed, to our own
@@ -1346,6 +1397,15 @@ fn flushEcho(ctx: *EchoCtx) void {
 
 fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     _ = ctx.w.log.push(text, flags, ctx.t_ms);
+    // Tier-2 digest feed: accumulate warn/error lines into the bounded signature
+    // table. Gated on `digest_on` so a no-photon run pays nothing; only warn/
+    // error (sev >= 1) is recorded (info is untouched); dedup collapses a flood
+    // to one O(1)+hash entry — no encode/write on this path. `ctx.t_ms` is the
+    // wall-clock ms already taken for this drain, scaled to ns (no extra syscall).
+    if (digest_on) {
+        const dsev = capture.severityFromFlags(flags);
+        if (dsev >= 1) digest.record(ctx.w.nameSlice(), dsev, ctx.t_ms *| 1_000_000, text);
+    }
     // Opt-in full log streaming (default off ⇒ this branch is never taken, so
     // the capture path pays nothing). Non-blocking, drop-on-full, zero-alloc:
     // a slow/absent photon or a log storm drops lines (counted in telemetry),

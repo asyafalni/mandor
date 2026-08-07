@@ -41,17 +41,27 @@ pub const GpuConfig = struct {
     interval_ms: u64 = 15_000,
 };
 
-/// `[logs]` section (TOML-only). Holds only the GLOBAL rate cap — log streaming
-/// is now selected PER WORKER (`[worker.NAME] stream = true`), and additionally
-/// requires `photon=` (so `photon=` alone still ships only the curated tier:
-/// incidents + metrics + lifecycle). Each streamed line is shipped to photon as
-/// an OTLP log (best-effort, lossy — the ephemeral telemetry tier).
+/// `[logs]` section (TOML-only). Carries the GLOBAL streaming rate cap (Tier 3)
+/// and the Tier-2 curated warn/error digest knobs. Log streaming is selected PER
+/// WORKER (`[worker.NAME] stream = true`); the digest is on by default (when
+/// `photon=` is set). All of it requires `photon=` (so `photon=` alone still
+/// ships only the curated tier: incidents + metrics + lifecycle + this digest).
+/// Streamed lines ship as OTLP logs (best-effort, lossy — the ephemeral tier);
+/// the digest ships one OTLP log per signature per window.
 pub const LogsConfig = struct {
     /// Rate cap for streamed log lines, lines/sec. 0 = unlimited (the default):
     /// the limiter is skipped entirely so streaming costs nothing beyond the
     /// enqueue. When > 0, lines past the cap in a 1-second window are dropped
     /// (counted, never spooled) before a frame is even built.
     max_rate: u32 = 0,
+    /// Tier-2 curated warn/error digest. Default ON (only actually armed when
+    /// `photon=` is set — a no-photon run leaves the whole tier inert).
+    digest: bool = true,
+    /// Digest flush cadence: the accumulated table is shipped every this many ms.
+    digest_interval_ms: u64 = 30_000,
+    /// Early-flush trigger: when any single signature's count crosses this in a
+    /// window, flush before the timer. 0 = timer only (no early flush).
+    digest_threshold: u32 = 100,
 };
 
 pub const Config = struct {
@@ -154,8 +164,9 @@ pub const Config = struct {
     secrets_n: usize = 0,
     /// `[gpu]` NVIDIA GPU sampling (TOML-only): off by default, daemon-side.
     gpu: GpuConfig = .{},
-    /// `[logs]` global streaming rate cap (TOML-only). Per-worker streaming
-    /// opt-in lives in `stream`/`stream_n` above; this holds only `max_rate`.
+    /// `[logs]` global streaming rate cap + Tier-2 digest knobs (TOML-only).
+    /// Per-worker streaming opt-in lives in `stream`/`stream_n` above; this holds
+    /// `max_rate` and the `digest`/`digest_interval_ms`/`digest_threshold` knobs.
     logs: LogsConfig = .{},
 };
 

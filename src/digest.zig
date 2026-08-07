@@ -63,6 +63,12 @@ var overflow_lines: u64 = 0;
 /// Total warn/error lines accepted since the last clear (dedup'd + overflowed).
 /// Task 4 uses this for the threshold early-flush decision.
 var pending_total: u64 = 0;
+/// Largest single-signature `count` seen this window (across all live entries).
+/// Task 4's threshold early-flush watches this: a burst of ONE signature past
+/// `digest_threshold` flushes early even though `pending_total` would too — this
+/// tracks the per-signature max so the threshold means "any one signature", not
+/// "total lines". Updated on every count bump / new entry, reset by clear().
+var max_count: u64 = 0;
 
 // ---------------------------------------------------------------------- record
 
@@ -84,6 +90,7 @@ pub fn record(name: []const u8, sev: u8, t_ns: u64, line: []const u8) void {
     for (entries[0..live]) |*e| {
         if (e.sig == sig) {
             e.count +|= 1;
+            if (e.count > max_count) max_count = e.count;
             e.last_ns = t_ns;
             if (sev > e.sev) e.sev = sev; // defensive: sig encodes sev, so this
             // never actually raises given the caller contract — but it costs
@@ -102,6 +109,7 @@ pub fn record(name: []const u8, sev: u8, t_ns: u64, line: []const u8) void {
     const e = &entries[live];
     e.sig = sig;
     e.count = 1;
+    if (e.count > max_count) max_count = e.count;
     e.first_ns = t_ns;
     e.last_ns = t_ns;
     e.sev = sev;
@@ -141,12 +149,20 @@ pub fn pending() u64 {
     return pending_total;
 }
 
+/// Largest single-signature count this window. Task 4's threshold early-flush
+/// fires when this crosses `digest_threshold` (a burst of ONE signature), so a
+/// storm is shipped promptly rather than waiting for the timer.
+pub fn maxCount() u64 {
+    return max_count;
+}
+
 /// Reset the table and all counters for the next window. Task 4 calls this
 /// immediately after emitting a digest snapshot.
 pub fn clear() void {
     live = 0;
     overflow_lines = 0;
     pending_total = 0;
+    max_count = 0;
 }
 
 // ---------------------------------------------------------------------- tests
@@ -265,6 +281,24 @@ test "digest: clear resets entries, pending, and overflow" {
     try testing.expectEqual(@as(usize, 0), count());
     try testing.expectEqual(@as(u64, 0), pending());
     try testing.expectEqual(@as(u64, 0), overflowLines());
+}
+
+test "digest: maxCount tracks the largest single-signature count, reset by clear" {
+    clear();
+    // Same signature 5 times (digit-variants collapse) → one bucket, count 5.
+    record("api", 2, 1, "conn 1 refused");
+    record("api", 2, 2, "conn 2 refused");
+    record("api", 2, 3, "conn 3 refused");
+    record("api", 2, 4, "conn 4 refused");
+    record("api", 2, 5, "conn 5 refused");
+    // A different signature twice → its own bucket, count 2 (< 5).
+    record("api", 2, 6, "disk full");
+    record("api", 2, 7, "disk full");
+
+    try testing.expectEqual(@as(u64, 5), maxCount());
+
+    clear();
+    try testing.expectEqual(@as(u64, 0), maxCount());
 }
 
 test "digest: info severity is a no-op" {

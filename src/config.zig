@@ -32,6 +32,11 @@ pub const FileConfig = struct {
     gpu_interval_ms: ?u64 = null,
     /// `[logs]` section: null = key absent (caller keeps the cli.Config default).
     logs_max_rate: ?u32 = null,
+    /// `[logs]` Tier-2 digest knobs: null = key absent (caller keeps the
+    /// cli.Config default of on / 30s / 100).
+    logs_digest: ?bool = null,
+    logs_digest_interval_ms: ?u64 = null,
+    logs_digest_threshold: ?u32 = null,
     psi_mem_pct: ?u16 = null,
     psi_cpu_pct: ?u16 = null,
     /// "dependent=dependency" worker-name pairs.
@@ -361,6 +366,22 @@ fn logsSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!
         // (parseInt rejects the sign for an unsigned type) is a hard BadValue so a
         // typo cannot silently disable the cap.
         cfg.logs_max_rate = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
+    } else if (std.mem.eql(u8, key, "digest")) {
+        // Bare bool, parsed the same way `[gpu] enabled` / `restart_dependents`
+        // are: anything but true/false is a hard BadValue (a typo can't silently
+        // flip the Tier-2 digest).
+        cfg.logs_digest = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return error.BadValue;
+    } else if (std.mem.eql(u8, key, "digest_interval")) {
+        const s = parseString(value) orelse return error.BadValue;
+        cfg.logs_digest_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "digest_threshold")) {
+        // Bare int (a signature count). Negative/non-numeric → BadValue.
+        cfg.logs_digest_threshold = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
     } else {
         return error.Syntax; // unknown key inside a [logs] section
     }
@@ -1037,6 +1058,29 @@ test "logs section: max_rate parses, defaults absent, rejects bad values" {
     try t.expectError(error.BadValue, parseTest("[logs]\nmax_rate = -1", &storage));
     // A value past u32 overflows parseInt -> BadValue (guards the upper bound).
     try t.expectError(error.BadValue, parseTest("[logs]\nmax_rate = 9999999999", &storage));
+}
+
+test "logs section: digest knobs parse, default absent, reject bad values" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // digest = false parses to an explicit false.
+    const off = try parseTest("[logs]\ndigest = false", &storage);
+    try t.expectEqual(@as(?bool, false), off.logs_digest);
+    // digest_interval is a quoted duration; digest_threshold a bare int.
+    const tuned = try parseTest("[logs]\ndigest_interval = \"10s\"\ndigest_threshold = 250", &storage);
+    try t.expectEqual(@as(?u64, 10_000), tuned.logs_digest_interval_ms);
+    try t.expectEqual(@as(?u32, 250), tuned.logs_digest_threshold);
+    // Absent -> all null (caller keeps the cli.Config defaults of on / 30s / 100).
+    const none = try parseTest("workers = [\"./a\"]", &storage);
+    try t.expectEqual(@as(?bool, null), none.logs_digest);
+    try t.expectEqual(@as(?u64, null), none.logs_digest_interval_ms);
+    try t.expectEqual(@as(?u32, null), none.logs_digest_threshold);
+    // Bad bool, bad duration, non-numeric and negative threshold are hard errors.
+    try t.expectError(error.BadValue, parseTest("[logs]\ndigest = yes", &storage));
+    try t.expectError(error.BadValue, parseTest("[logs]\ndigest_interval = \"soon\"", &storage));
+    try t.expectError(error.BadValue, parseTest("[logs]\ndigest_threshold = lots", &storage));
+    try t.expectError(error.BadValue, parseTest("[logs]\ndigest_threshold = -1", &storage));
+    // An unknown [logs] key is still a hard Syntax error.
+    try t.expectError(error.Syntax, parseTest("[logs]\nbogus = 1", &storage));
 }
 
 test "secret section: bare (non-derived) collision between two default envs" {

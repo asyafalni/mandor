@@ -197,6 +197,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (file_cfg.gpu_enabled) |v| cfg.gpu.enabled = v;
             if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
             if (file_cfg.logs_max_rate) |v| cfg.logs.max_rate = v;
+            if (file_cfg.logs_digest) |v| cfg.logs.digest = v;
+            if (file_cfg.logs_digest_interval_ms) |v| cfg.logs.digest_interval_ms = v;
+            if (file_cfg.logs_digest_threshold) |v| cfg.logs.digest_threshold = v;
             if (cfg.psi_mem_pct == 0) {
                 if (file_cfg.psi_mem_pct) |v| cfg.psi_mem_pct = v;
             }
