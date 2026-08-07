@@ -33,6 +33,7 @@ const ring = @import("ring.zig");
 const backoff = @import("backoff.zig");
 const relay = @import("relay.zig");
 const gpu = @import("gpu.zig");
+const frame = @import("frame.zig");
 
 /// Real crash output — the seeds worth mutating. Doubles as the fixture set
 /// CLAUDE.md calls for.
@@ -661,25 +662,104 @@ fn gpuTarget(bytes: []const u8) void {
     std.debug.assert(protoWalk(body, 0));
 }
 
+/// Draw a little-endian u64 from up to 8 bytes of `t` starting at `at`
+/// (zero-padded past the end). Lets a log-fuzz target pull the digest
+/// count/first/last straight out of the mutated byte stream, the same way the
+/// other targets derive scalars from their input bytes.
+fn draw64(t: []const u8, at: usize) u64 {
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const idx = at + i;
+        if (idx < t.len) v |= @as(u64, t[idx]) << @intCast(i * 8);
+    }
+    return v;
+}
+
 /// Streamed worker log lines are arbitrary process output — any bytes, any
 /// length, any severity byte. buildOtlpLogs must always emit a decodable
 /// protobuf (or refuse via TooLarge), never trap, whatever the name/line bytes.
+///
+/// log-signal-v2 added the curated digest fields (count/first_ns/last_ns): when
+/// count > 0, buildOtlpLogs emits the mandor.count/.first_ts/.last_ts int
+/// attributes via putKeyValueInt. One drawn bit selects digest vs plain so both
+/// the digest int-attr path AND the byte-identical count==0 streamed path stay
+/// covered; the values themselves come from the byte stream.
 fn logsTarget(bytes: []const u8) void {
     const half = bytes.len / 2;
     var name = bytes[0..half];
     if (name.len > 255) name = name[0..255]; // frame caps the worker name at 255
+    const is_digest = bytes.len > 1 and (bytes[1] & 1) == 1;
     const recs = [_]relay.LogRecord{.{
         .name = name,
         .line = bytes[half..],
         .iostream = if (bytes.len > 0) bytes[bytes.len - 1] & 1 else 0,
         .severity = if (bytes.len > 0) bytes[0] % 3 else 0,
         .t_ns = bytes.len,
+        // count > 0 flips this into a digest record. `| 1` keeps it non-zero
+        // even when the drawn bytes are all zero, so the digest attribute path
+        // is reliably exercised on a digest iteration.
+        .count = if (is_digest) draw64(bytes, 0) | 1 else 0,
+        .first_ns = if (is_digest) draw64(bytes, 8) else 0,
+        .last_ns = if (is_digest) draw64(bytes, 16) else 0,
     }};
     const body = relay.buildOtlpLogs(&recs, "node", "id") catch return;
     std.debug.assert(protoWalk(body, 0));
 }
 
 const logs_seed = "api\npanic: runtime error: invalid memory address or nil pointer dereference";
+
+var frame_name_scratch: [256]u8 = undefined;
+var frame_out: [8192]u8 = undefined;
+
+/// The pipe wire format the relay daemon reads off a non-blocking pipe: a
+/// corrupt or partial write can leave any byte sequence in the buffer, so
+/// `frame.decode` must be total — a record or null, never a trap — on ANY input,
+/// including the log-signal-v2 `digest_entry` kind (4). Two halves:
+///   (a) totality — feed the mutated bytes to `decode` and assert it never traps
+///       (the mutator plants kind bytes and boundary ints, so kind 4 is reached);
+///   (b) round-trip — build an in-caps `DigestEntry` from drawn bytes,
+///       `encodeDigest` it, and assert `decode` restores every field.
+fn frameTarget(rnd: std.Random, text: []const u8) !void {
+    // (a) Totality: arbitrary bytes must never trap decode. Result ignored.
+    _ = frame.decode(text, &frame_name_scratch);
+
+    // (b) Round-trip of a digest_entry frame. Draw the string fields with the
+    // shared `pick.s` helper and cap them under the frame's limits (name 255,
+    // sample line_cap 4095) so encodeDigest doesn't just always Overflow.
+    var name = pick.s(rnd, text);
+    if (name.len > 255) name = name[0..255]; // name_cap
+    var sample = pick.s(rnd, text);
+    if (sample.len > 4095) sample = sample[0..4095]; // line_cap
+    const d = frame.DigestEntry{
+        .name = name,
+        .severity = rnd.int(u8),
+        .count = rnd.int(u64),
+        .first_unix_ns = rnd.int(u64),
+        .last_unix_ns = rnd.int(u64),
+        .sample = sample,
+    };
+    const encoded = frame.encodeDigest(&frame_out, d) catch return;
+    // A frame we just encoded, within caps, must decode and round-trip exactly.
+    const got = frame.decode(encoded, &frame_name_scratch) orelse {
+        std.debug.assert(false);
+        return;
+    };
+    const e = got.rec.digest_entry;
+    try std.testing.expectEqual(encoded.len, got.used);
+    try std.testing.expectEqualStrings(name, e.name);
+    try std.testing.expectEqual(d.severity, e.severity);
+    try std.testing.expectEqual(d.count, e.count);
+    try std.testing.expectEqual(d.first_unix_ns, e.first_unix_ns);
+    try std.testing.expectEqual(d.last_unix_ns, e.last_unix_ns);
+    try std.testing.expectEqualStrings(sample, e.sample);
+}
+
+// A real digest_entry frame, built at test time (encodeDigest is a runtime fn,
+// so this cannot be a comptime string like the other seeds). Mutating a valid
+// frame keeps the mutant near the framing structure — kind byte 4 reachable —
+// instead of bouncing off decode's header/length checks every iteration.
+var frame_seed_buf: [512]u8 = undefined;
 
 const gpu_seed =
     "0, NVIDIA RTX 4090, 55, 2048, 24576, 61, 320.50\n" ++
@@ -838,12 +918,59 @@ test "seed valid: relay log batch" {
     try std.testing.expect(std.mem.indexOf(u8, body, "service.name") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "log.iostream") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "panic: boom") != null);
+
+    // log-signal-v2 digest record (count > 0): the same encoder must still emit
+    // a walkable body and carry the mandor.count/.first_ts/.last_ts int attrs.
+    const digest = [_]relay.LogRecord{
+        .{ .name = "api", .line = "ERROR: db timeout", .iostream = 1, .severity = 2, .t_ns = 30, .count = 42, .first_ns = 1, .last_ns = 2 },
+    };
+    const dbody = try relay.buildOtlpLogs(&digest, "node", "id");
+    try std.testing.expect(protoWalk(dbody, 0));
+    try std.testing.expect(std.mem.indexOf(u8, dbody, "mandor.count") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dbody, "mandor.first_ts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dbody, "mandor.last_ts") != null);
 }
 
 test "fuzz: relay log encoder survives mutated log lines" {
     var p = prng();
     const rnd = p.random();
     for (0..iterations) |_| logsTarget(mutate(rnd, logs_seed, &buf));
+}
+
+test "seed valid: frame digest entry" {
+    // Prove the frame seed is a real digest_entry (kind 4) that round-trips,
+    // before spending iterations mutating it — the same seed-validity guard the
+    // other targets use so the mutator starts from a valid input, not an early
+    // return.
+    const seed = try frame.encodeDigest(&frame_seed_buf, .{
+        .name = "api",
+        .severity = 2,
+        .count = 7,
+        .first_unix_ns = 1,
+        .last_unix_ns = 2,
+        .sample = "ERROR: boom",
+    });
+    var scratch: [256]u8 = undefined;
+    const d = frame.decode(seed, &scratch) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(seed.len, d.used);
+    try std.testing.expectEqual(frame.Kind.digest_entry, std.meta.activeTag(d.rec));
+    try std.testing.expectEqualStrings("ERROR: boom", d.rec.digest_entry.sample);
+}
+
+test "fuzz: frame decoder survives mutated pipe frames and digest round-trips" {
+    var p = prng();
+    const rnd = p.random();
+    // Seed = a real digest_entry frame, so the mutant stays near the framing
+    // structure (kind 4 reachable) instead of failing decode's header check.
+    const seed = try frame.encodeDigest(&frame_seed_buf, .{
+        .name = "api",
+        .severity = 2,
+        .count = 7,
+        .first_unix_ns = 1,
+        .last_unix_ns = 2,
+        .sample = "ERROR: boom",
+    });
+    for (0..iterations) |_| try frameTarget(rnd, mutate(rnd, seed, &buf));
 }
 
 test "seed valid: gpu csv" {
