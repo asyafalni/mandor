@@ -415,6 +415,7 @@ test {
     _ = @import("jsonbuf.zig");
     _ = @import("cgroup.zig");
     _ = @import("summarize.zig");
+    _ = @import("digest.zig");
     _ = @import("detector.zig");
     _ = @import("parsers/go.zig");
     _ = @import("parsers/rust.zig");
