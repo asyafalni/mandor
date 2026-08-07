@@ -24,6 +24,7 @@ const cost = @import("cost.zig");
 const telemetry = @import("telemetry.zig");
 const frame = @import("frame.zig");
 const digest = @import("digest.zig");
+const summarize = @import("summarize.zig");
 
 // Worker table lives in BSS, not on the stack: each worker embeds a 256 KB
 // log ring, and untouched pages cost nothing until logs actually flow.
@@ -1398,12 +1399,16 @@ fn flushEcho(ctx: *EchoCtx) void {
 fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     _ = ctx.w.log.push(text, flags, ctx.t_ms);
     // Tier-2 digest feed: accumulate warn/error lines into the bounded signature
-    // table. Gated on `digest_on` so a no-photon run pays nothing; only warn/
-    // error (sev >= 1) is recorded (info is untouched); dedup collapses a flood
-    // to one O(1)+hash entry — no encode/write on this path. `ctx.t_ms` is the
-    // wall-clock ms already taken for this drain, scaled to ns (no extra syscall).
+    // table. Gated on `digest_on` so a no-photon run pays nothing. Severity is by
+    // CONTENT (summarize.errorish → error), so an app that logs "ERROR …" to
+    // stdout is caught too — not just stderr; a bare stderr line is a warning;
+    // plain stdout info is skipped. (The capture path never sets flag_errorish,
+    // so severityFromFlags alone would miss stdout errors — the whole point of
+    // the digest is to surface them.) Dedup collapses a flood to one O(1)+hash
+    // entry — no encode/write here. `ctx.t_ms` is the wall-clock ms already taken
+    // for this drain, scaled to ns (no extra syscall).
     if (digest_on) {
-        const dsev = capture.severityFromFlags(flags);
+        const dsev: u8 = if (summarize.errorish(text)) 2 else capture.severityFromFlags(flags);
         if (dsev >= 1) digest.record(ctx.w.nameSlice(), dsev, ctx.t_ms *| 1_000_000, text);
     }
     // Opt-in full log streaming (default off ⇒ this branch is never taken, so
