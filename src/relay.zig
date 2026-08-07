@@ -306,6 +306,29 @@ fn putKeyValue(w: *Writer, comptime field: u8, k: []const u8, v: []const u8) voi
     putAnyValue(w, 2, v); // KeyValue.value
 }
 
+/// AnyValue{int_value=3} — a varint-encoded int64 (used for the Tier-2 digest's
+/// numeric attributes mandor.count / .first_ts / .last_ts). The string arm above
+/// uses field 1; this is the same AnyValue message with the int_value arm.
+fn anyValueIntLen(v: u64) usize {
+    return 1 + varintLen(v); // tag(field 3, varint) + the varint value
+}
+
+/// KeyValue{key=1, value=AnyValue(int)=2} — the int-valued sibling of keyValueLen.
+fn keyValueIntLen(k: []const u8, v: u64) usize {
+    return delimLen(k.len) + delimLen(anyValueIntLen(v));
+}
+
+fn putAnyValueInt(w: *Writer, comptime field: u8, v: u64) void {
+    w.delim(field, anyValueIntLen(v));
+    w.uint(3, v); // AnyValue.int_value
+}
+
+fn putKeyValueInt(w: *Writer, comptime field: u8, k: []const u8, v: u64) void {
+    w.delim(field, keyValueIntLen(k, v));
+    w.string(1, k); // KeyValue.key
+    putAnyValueInt(w, 2, v); // KeyValue.value
+}
+
 /// Scratch for `service_prefix ++ name`, formed and consumed within a single
 /// putServiceName call (single-threaded daemon, no cross-call state). Sized to
 /// the prefix cap plus the largest name any encoder passes: the incident path's
@@ -1080,6 +1103,12 @@ pub const LogRecord = struct {
     iostream: u8, // 0 = stdout, 1 = stderr
     severity: u8, // 0 = info, 1 = warn, 2 = error (frame tier)
     t_ns: u64,
+    // Curated Tier-2 digest fields. Default 0: a plain streamed line leaves them
+    // 0, and `count == 0` means "not a digest" — no extra attributes are emitted,
+    // so the streamed-log output stays byte-identical to before this feature.
+    count: u64 = 0, // deduplicated occurrences (> 0 ⇒ this is a digest record)
+    first_ns: u64 = 0, // first occurrence in the window
+    last_ns: u64 = 0, // last occurrence in the window
 };
 
 /// Frame severity tier (0/1/2) → OTLP severity_number + text. Anything outside
@@ -1096,16 +1125,42 @@ fn ioStreamName(io: u8) []const u8 {
     return if (io == 1) "stderr" else "stdout";
 }
 
+/// Encoded bytes of the Tier-2 digest attributes for one record: the three int
+/// KeyValues (all field 6) when this is a digest record (count > 0), or 0 for a
+/// plain streamed line. ONE source of truth shared by pass 1 (logRlLen) and pass
+/// 2 (putDigestAttrs) so the two-pass sizing can never drift.
+fn digestAttrsLen(r: LogRecord) usize {
+    if (r.count == 0) return 0;
+    return delimLen(keyValueIntLen("mandor.count", r.count)) +
+        delimLen(keyValueIntLen("mandor.first_ts", r.first_ns)) +
+        delimLen(keyValueIntLen("mandor.last_ts", r.last_ns));
+}
+
+/// Write the Tier-2 digest attributes (count > 0) into the log_record's
+/// attributes (field 6, same as log.iostream). No-op for a plain streamed line so
+/// the streamed output is byte-identical. Writes exactly digestAttrsLen(r) bytes.
+fn putDigestAttrs(w: *Writer, r: LogRecord) void {
+    if (r.count == 0) return;
+    putKeyValueInt(w, 6, "mandor.count", r.count);
+    putKeyValueInt(w, 6, "mandor.first_ts", r.first_ns);
+    putKeyValueInt(w, 6, "mandor.last_ts", r.last_ns);
+}
+
 /// Bytes of the resource_logs entry for one record (one resource per record).
 fn logRlLen(r: LogRecord, host_name: []const u8, host_id: []const u8) usize {
     const sev = logSeverity(r.severity);
-    const rec_len =
+    var rec_len =
         9 + // time_unix_nano (fixed64, field 1)
         9 + // observed_time_unix_nano (fixed64, field 11)
         (1 + varintLen(sev.num)) + // severity_number (field 2)
         delimLen(sev.text.len) + // severity_text (field 3)
         delimLen(anyValueLen(r.line)) + // body (field 5)
         delimLen(keyValueLen("log.iostream", ioStreamName(r.iostream))); // attributes (field 6)
+    // Curated Tier-2 digest: a digest record (count > 0) carries three int
+    // attributes alongside log.iostream (all field 6). A plain streamed line
+    // (count == 0) adds none — byte-identical to the pre-digest output. Sized
+    // here in pass 1 and written in buildOtlpLogs pass 2 so `w.pos == total`.
+    rec_len += digestAttrsLen(r);
     const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
     const resource_len =
         delimLen(serviceKvLen(r.name)) +
@@ -1141,13 +1196,14 @@ pub fn buildOtlpLogs(records: []const LogRecord, host_name: []const u8, host_id:
     var w = Writer{ .buf = &body_buf };
     for (records[0..nfit]) |r| {
         const sev = logSeverity(r.severity);
-        const rec_len =
+        var rec_len =
             9 +
             9 +
             (1 + varintLen(sev.num)) +
             delimLen(sev.text.len) +
             delimLen(anyValueLen(r.line)) +
             delimLen(keyValueLen("log.iostream", ioStreamName(r.iostream)));
+        rec_len += digestAttrsLen(r); // digest ints (count > 0); 0 for a streamed line
         const scope_len = delimLen(rec_len);
         const resource_len =
             delimLen(serviceKvLen(r.name)) +
@@ -1170,6 +1226,7 @@ pub fn buildOtlpLogs(records: []const LogRecord, host_name: []const u8, host_id:
         w.string(3, sev.text); //       severity_text
         putAnyValue(&w, 5, r.line); //       body
         putKeyValue(&w, 6, "log.iostream", ioStreamName(r.iostream)); // attributes
+        putDigestAttrs(&w, r); //       mandor.count/.first_ts/.last_ts (digest only)
     }
     std.debug.assert(w.pos == total); // sizing and writing must agree
     return body_buf[0..w.pos];
@@ -1455,6 +1512,37 @@ fn batchLog(l: frame.LogLine) bool {
     return true;
 }
 
+/// Append one decoded Tier-2 digest entry to the current log batch, copying its
+/// name+sample into the arena (the frame's slices borrow buffers reused on the
+/// next decode). Same record-cap + arena bounds as batchLog — if either would be
+/// exceeded the entry is refused (returns false, arena untouched) so the caller
+/// drops it. Digest records ride the SAME batch/POST as streamed lines; the
+/// count/first/last fields make buildOtlpLogs emit the mandor.* int attributes.
+/// The digest has no stream, so iostream is tagged stderr; t_ns is the window's
+/// last occurrence.
+fn batchDigest(d: frame.DigestEntry) bool {
+    if (n_logs >= max_log_batch) return false;
+    const need = d.name.len + d.sample.len;
+    if (log_arena_used + need > log_arena.len) return false;
+    const name_off = log_arena_used;
+    @memcpy(log_arena[name_off..][0..d.name.len], d.name);
+    const sample_off = name_off + d.name.len;
+    @memcpy(log_arena[sample_off..][0..d.sample.len], d.sample);
+    log_arena_used = sample_off + d.sample.len;
+    log_records[n_logs] = .{
+        .name = log_arena[name_off..][0..d.name.len],
+        .line = log_arena[sample_off..][0..d.sample.len], // sample → body
+        .iostream = 1, // digest has no stream; stderr is the reasonable tag
+        .severity = d.severity,
+        .t_ns = d.last_unix_ns,
+        .count = d.count,
+        .first_ns = d.first_unix_ns,
+        .last_ns = d.last_unix_ns,
+    };
+    n_logs += 1;
+    return true;
+}
+
 // Host identity for the `system.*` resource, read ONCE at daemon start (it does
 // not change for the daemon's life) into these fixed buffers; the node-sample
 // ship path (runDaemon) and the per-worker metric batch (drainPipe, host.name)
@@ -1515,6 +1603,12 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
                 // arena drops the line with a counter, never blocking or spooling.
                 log_frames_seen +|= 1;
                 if (!batchLog(l)) log_drops +|= 1;
+            },
+            .digest_entry => |dg| {
+                // Curated Tier-2 digest: ride the SAME log batch/POST as streamed
+                // lines. A full batch or arena drops the entry with a counter,
+                // never blocking or spooling (curated, best-effort like metrics).
+                if (!batchDigest(dg)) log_drops +|= 1;
             },
         }
         off += d.used;
@@ -2137,6 +2231,108 @@ test "log batch refuses lines once the arena is full" {
     try testing.expect(log_arena_used <= log_arena.len); // never overran the arena
     const body = try buildOtlpLogs(log_records[0..n_logs], "node", "id");
     try testing.expect(body.len > 0);
+}
+
+test "buildOtlpLogs emits mandor digest int attributes when count > 0" {
+    // MUTATION TARGET: in buildOtlpLogs, gate the three digest attributes on
+    // `r.count >= 2` instead of `> 0` (a count==1 digest then loses them) OR drop
+    // `mandor.count` from pass 2 while keeping it in pass 1 (w.pos != total, the
+    // assert fires). Either way this test fails.
+    const recs = [_]LogRecord{
+        // count==1 so the `>= 2` mutation is caught too (a single-occurrence digest).
+        .{ .name = "api", .line = "ERROR: db timeout", .iostream = 1, .severity = 2, .t_ns = 2000, .count = 1, .first_ns = 1000, .last_ns = 2000 },
+    };
+    const body = try buildOtlpLogs(&recs, "node-1", "abc123");
+
+    const rl = Fields.get(body, 1).?.bytes;
+    // service.name is still emitted via putServiceName (origin-prefixed).
+    const res = Fields.get(rl, 1).?.bytes;
+    const a_svc = Fields.get(res, 1).?.bytes;
+    try testing.expectEqualStrings("service.name", Fields.get(a_svc, 1).?.bytes);
+    try testing.expectEqualStrings("api", avStr(Fields.get(a_svc, 2).?.bytes));
+
+    const sl = Fields.get(rl, 2).?.bytes;
+    const rec = Fields.get(sl, 2).?.bytes;
+    // Walk EVERY field-6 attribute; pull the three int-valued digest keys.
+    var count_v: ?u64 = null;
+    var first_v: ?u64 = null;
+    var last_v: ?u64 = null;
+    var it = Fields{ .b = rec };
+    while (it.next()) |f| {
+        if (f.num != 6) continue;
+        const kv = f.bytes;
+        const key = Fields.get(kv, 1).?.bytes;
+        const av = Fields.get(kv, 2).?.bytes; // AnyValue
+        if (std.mem.eql(u8, key, "mandor.count")) count_v = Fields.get(av, 3).?.int;
+        if (std.mem.eql(u8, key, "mandor.first_ts")) first_v = Fields.get(av, 3).?.int;
+        if (std.mem.eql(u8, key, "mandor.last_ts")) last_v = Fields.get(av, 3).?.int;
+    }
+    try testing.expectEqual(@as(u64, 1), count_v.?);
+    try testing.expectEqual(@as(u64, 1000), first_v.?);
+    try testing.expectEqual(@as(u64, 2000), last_v.?);
+}
+
+test "buildOtlpLogs emits no mandor attributes for a plain streamed line (count == 0)" {
+    // Protects the existing streamed-log shape: a count==0 record must produce
+    // exactly one field-6 attribute (log.iostream) and none of the mandor.* keys,
+    // so streamed output stays byte-identical to the pre-digest encoder.
+    const recs = [_]LogRecord{
+        .{ .name = "api", .line = "listening on :8080", .iostream = 0, .severity = 0, .t_ns = 1 },
+    };
+    const body = try buildOtlpLogs(&recs, "node-1", "abc123");
+
+    const rl = Fields.get(body, 1).?.bytes;
+    const sl = Fields.get(rl, 2).?.bytes;
+    const rec = Fields.get(sl, 2).?.bytes;
+    var it = Fields{ .b = rec };
+    var n_attrs: usize = 0;
+    while (it.next()) |f| {
+        if (f.num != 6) continue;
+        n_attrs += 1;
+        const key = Fields.get(f.bytes, 1).?.bytes;
+        try testing.expect(!std.mem.startsWith(u8, key, "mandor.")); // no digest keys
+    }
+    try testing.expectEqual(@as(usize, 1), n_attrs); // only log.iostream
+}
+
+test "digest batch stops at the record cap" {
+    // Tiny samples so the RECORD cap (not the arena) is the binding bound.
+    // Exactly max_log_batch entries must be taken — mirrors the batchLog test.
+    resetLogBatch();
+    var added: usize = 0;
+    var i: usize = 0;
+    while (i < max_log_batch + 8) : (i += 1) {
+        if (batchDigest(.{ .name = "a", .severity = 2, .count = 3, .first_unix_ns = 1, .last_unix_ns = 2, .sample = "hi" }))
+            added += 1;
+    }
+    try testing.expectEqual(@as(usize, max_log_batch), added);
+    try testing.expectEqual(@as(usize, max_log_batch), n_logs);
+    resetLogBatch();
+}
+
+test "digest batch refuses entries once the arena is full" {
+    // Big samples so the ARENA (not the record cap) is the binding bound; dropping
+    // the "arena can't fit → refuse" check would let batchDigest's @memcpy run off
+    // log_arena. The accepted prefix must still encode (with its digest ints).
+    resetLogBatch();
+    const big = "y" ** 4000;
+    var added: usize = 0;
+    var refused = false;
+    var i: usize = 0;
+    while (i < max_log_batch) : (i += 1) {
+        if (batchDigest(.{ .name = "svc", .severity = 2, .count = 7, .first_unix_ns = 1, .last_unix_ns = 2, .sample = big })) {
+            added += 1;
+        } else {
+            refused = true;
+            break;
+        }
+    }
+    try testing.expect(refused); // hit the arena bound before the record cap
+    try testing.expect(added > 0 and added < max_log_batch);
+    try testing.expect(log_arena_used <= log_arena.len); // never overran the arena
+    const body = try buildOtlpLogs(log_records[0..n_logs], "node", "id");
+    try testing.expect(body.len > 0);
+    resetLogBatch();
 }
 
 test "buildOtlpHostMetrics emits a host resource + system.* metrics photon can walk" {

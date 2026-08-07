@@ -13,7 +13,7 @@
 
 const std = @import("std");
 
-pub const Kind = enum(u8) { metric_sample = 1, lifecycle_event = 2, log_line = 3 };
+pub const Kind = enum(u8) { metric_sample = 1, lifecycle_event = 2, log_line = 3, digest_entry = 4 };
 
 /// Compact fixed payload — mandor's internal form, NOT OTLP. `name` is a slice
 /// into caller-owned memory at encode time; `decode` copies it into caller
@@ -51,13 +51,30 @@ pub const LogLine = struct {
     line: []const u8, // captured line bytes (<= line_cap)
 };
 
-pub const Decoded = union(Kind) { metric_sample: MetricSample, lifecycle_event: Lifecycle, log_line: LogLine };
+/// Curated Tier-2 warn/error digest (default on when `photon=`). One entry per
+/// signature: the worker name (for service.name), a severity tier, the
+/// deduplicated occurrence `count`, the first/last occurrence timestamps of the
+/// window, and one sample line. Emitted low-rate (per window, NOT per line), so
+/// this is the curated tier — never routed through the streaming shed gate.
+/// `name` is copied into caller scratch by `decode`; `sample` borrows the decode
+/// input buffer (same contract as `LogLine.line`).
+pub const DigestEntry = struct {
+    name: []const u8, // worker name (<= name_cap)
+    severity: u8, // 0 = info, 1 = warn, 2 = error
+    count: u64, // deduplicated occurrences this window
+    first_unix_ns: u64, // first occurrence in the window
+    last_unix_ns: u64, // last occurrence in the window
+    sample: []const u8, // one representative line (<= line_cap)
+};
+
+pub const Decoded = union(Kind) { metric_sample: MetricSample, lifecycle_event: Lifecycle, log_line: LogLine, digest_entry: DigestEntry };
 
 /// Fixed bytes after the name in each payload. Kept as named constants so the
 /// encoder's sizing and the decoder's bounds check cannot drift apart.
 const metric_fixed = 8 + 2 + 2 + 2 + 4 + 8; // rss,cpu,fds,threads,restarts,t_ns
 const lifecycle_fixed = 1 + 4 + 4 + 4 + 8; // ev,code,backoff,restarts,t_ns
 const logline_fixed = 1 + 1 + 8; // iostream,severity,t_ns (the line adds a u16 len + bytes)
+const digest_fixed = 1 + 8 + 8 + 8; // severity,count,first_ns,last_ns (the sample adds a u16 len + bytes)
 
 const header = 3; // [u8 kind][u16 len]
 const name_cap = 255; // one length byte
@@ -159,6 +176,42 @@ pub fn encodeLog(out: []u8, l: LogLine) error{Overflow}![]const u8 {
     return out[0..total];
 }
 
+/// Encode one curated digest entry into `out`; returns the framed slice or
+/// `error.Overflow` if the name is over 255 bytes, the sample is over `line_cap`,
+/// or the frame will not fit `out`. Layout mirrors encodeLog: name (len byte +
+/// bytes), severity, count, first_unix_ns, last_unix_ns, then a u16 sample length
+/// + the sample bytes.
+pub fn encodeDigest(out: []u8, d: DigestEntry) error{Overflow}![]const u8 {
+    if (d.name.len > name_cap) return error.Overflow;
+    if (d.sample.len > line_cap) return error.Overflow;
+    const nl: u8 = @intCast(d.name.len);
+    const sl: u16 = @intCast(d.sample.len);
+    const payload_len = 1 + @as(usize, nl) + digest_fixed + 2 + @as(usize, sl);
+    const total = header + payload_len;
+    if (total > out.len) return error.Overflow;
+
+    out[0] = @intFromEnum(Kind.digest_entry);
+    std.mem.writeInt(u16, out[1..][0..2], @intCast(payload_len), .little);
+    var p: usize = header;
+    out[p] = nl;
+    p += 1;
+    @memcpy(out[p..][0..nl], d.name);
+    p += nl;
+    out[p] = d.severity;
+    p += 1;
+    std.mem.writeInt(u64, out[p..][0..8], d.count, .little);
+    p += 8;
+    std.mem.writeInt(u64, out[p..][0..8], d.first_unix_ns, .little);
+    p += 8;
+    std.mem.writeInt(u64, out[p..][0..8], d.last_unix_ns, .little);
+    p += 8;
+    std.mem.writeInt(u16, out[p..][0..2], sl, .little);
+    p += 2;
+    @memcpy(out[p..][0..sl], d.sample);
+    p += sl;
+    return out[0..total];
+}
+
 /// Decode one frame from the front of `buf`. Returns the record (with its name
 /// copied into `name_scratch`) and the number of bytes consumed, or `null` if
 /// `buf` holds less than one whole frame, the kind/event byte is unknown, the
@@ -176,6 +229,7 @@ pub fn decode(buf: []const u8, name_scratch: []u8) ?struct { rec: Decoded, used:
         @intFromEnum(Kind.metric_sample) => .metric_sample,
         @intFromEnum(Kind.lifecycle_event) => .lifecycle_event,
         @intFromEnum(Kind.log_line) => .log_line,
+        @intFromEnum(Kind.digest_entry) => .digest_entry,
         else => return null,
     };
 
@@ -274,6 +328,41 @@ pub fn decode(buf: []const u8, name_scratch: []u8) ?struct { rec: Decoded, used:
                 .used = total,
             };
         },
+        .digest_entry => {
+            // name_len(1) + name + severity(1) + count(8) + first(8) + last(8) + sample_len(2)
+            if (payload.len < 1 + @as(usize, nl) + digest_fixed + 2) return null;
+            @memcpy(name_scratch[0..nl], payload[1..][0..nl]);
+            var p: usize = 1 + @as(usize, nl);
+            const severity = payload[p];
+            p += 1;
+            const count = std.mem.readInt(u64, payload[p..][0..8], .little);
+            p += 8;
+            const first = std.mem.readInt(u64, payload[p..][0..8], .little);
+            p += 8;
+            const last = std.mem.readInt(u64, payload[p..][0..8], .little);
+            p += 8;
+            const sl = std.mem.readInt(u16, payload[p..][0..2], .little);
+            p += 2;
+            // The declared sample length must fit the remaining payload, exactly
+            // like the log_line line-length check: a corrupt/truncated frame
+            // returns null instead of slicing past the buffer end (a trap).
+            if (payload.len < p + @as(usize, sl)) return null;
+            return .{
+                .rec = .{
+                    .digest_entry = .{
+                        .name = name_scratch[0..nl],
+                        .severity = severity,
+                        .count = count,
+                        .first_unix_ns = first,
+                        .last_unix_ns = last,
+                        // Borrows `buf` (not name_scratch), same contract as
+                        // log_line.line: consume before the input buffer is reused.
+                        .sample = payload[p..][0..sl],
+                    },
+                },
+                .used = total,
+            };
+        },
     }
 }
 
@@ -357,4 +446,34 @@ test "decode rejects a log frame whose line length overruns its payload" {
     std.mem.writeInt(u16, corrupt[ll_off..][0..2], 9999, .little);
     var scratch: [256]u8 = undefined;
     try testing.expect(decode(corrupt[0..bytes.len], &scratch) == null);
+}
+
+test "digest entry survives encode -> decode" {
+    var out: [512]u8 = undefined;
+    const d = DigestEntry{ .name = "api", .severity = 2, .count = 1_000_000, .first_unix_ns = 1_700_000_000_000_000_000, .last_unix_ns = 1_700_000_030_000_000_000, .sample = "ERROR: db timeout" };
+    const bytes = try encodeDigest(&out, d);
+
+    var scratch: [256]u8 = undefined;
+    const got = decode(bytes, &scratch).?;
+    try testing.expectEqual(@as(usize, bytes.len), got.used);
+    const e = got.rec.digest_entry;
+    try testing.expectEqualStrings("api", e.name);
+    try testing.expectEqual(@as(u8, 2), e.severity);
+    try testing.expectEqual(d.count, e.count);
+    try testing.expectEqual(d.first_unix_ns, e.first_unix_ns);
+    try testing.expectEqual(d.last_unix_ns, e.last_unix_ns);
+    try testing.expectEqualStrings("ERROR: db timeout", e.sample);
+}
+
+test "encodeDigest refuses a sample longer than line_cap" {
+    var out: [8192]u8 = undefined;
+    const big = "x" ** (line_cap + 1);
+    try testing.expectError(error.Overflow, encodeDigest(&out, .{ .name = "api", .severity = 1, .count = 1, .first_unix_ns = 0, .last_unix_ns = 0, .sample = big }));
+}
+
+test "decode returns null on a truncated digest frame" {
+    var out: [512]u8 = undefined;
+    const bytes = try encodeDigest(&out, .{ .name = "api", .severity = 2, .count = 3, .first_unix_ns = 1, .last_unix_ns = 2, .sample = "boom" });
+    var scratch: [256]u8 = undefined;
+    try testing.expect(decode(bytes[0 .. bytes.len - 1], &scratch) == null);
 }

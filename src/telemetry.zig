@@ -272,6 +272,33 @@ pub fn emitLog(name: []const u8, iostream: u8, severity: u8, t_ns: u64, line: []
     }
 }
 
+/// Emit one curated Tier-2 digest entry (default on when `photon=`). No-op if no
+/// daemon; drops (and counts in `log_drops`) if the frame will not fit one atomic
+/// write, the pipe is full, or the daemon is gone. Unlike emitLog this does NOT
+/// consult or arm the backpressure shed gate: the digest is the curated tier —
+/// low-rate (one message per signature per window, never per line), so it is not
+/// the streaming firehose the shed state defends against. Same non-blocking /
+/// zero-alloc / never-trap contract as emitMetric/emitLifecycle/emitLog.
+/// `severity`: 0 info / 1 warn / 2 error (see capture.severityFromFlags).
+pub fn emitDigest(name: []const u8, severity: u8, count: u64, first_ns: u64, last_ns: u64, sample: []const u8) void {
+    if (write_fd < 0) return;
+    // Reuse emit_log_buf: a digest sample is capped at line_cap just like a
+    // streamed line, so the frame's max size is comparable and one BSS scratch
+    // serves both (single-threaded, fully consumed here before the next call).
+    const bytes = frame.encodeDigest(&emit_log_buf, .{
+        .name = name,
+        .severity = severity,
+        .count = count,
+        .first_unix_ns = first_ns,
+        .last_unix_ns = last_ns,
+        .sample = sample,
+    }) catch {
+        log_drops +|= 1; // name/sample too large for one atomic pipe write → drop
+        return;
+    };
+    if (!writeFrame(bytes)) log_drops +|= 1; // pipe full / daemon gone → drop (no shed arm)
+}
+
 /// One non-blocking write; drop on anything but a full success. Never blocks,
 /// never retries — the supervision loop outranks telemetry. Frames are far
 /// below PIPE_BUF (4096), so a pipe write is atomic: it either writes the whole
@@ -462,4 +489,33 @@ test "emitLog with a draining reader never enters shed" {
     }
     try testing.expectEqual(saved_shed, shed_drops); // no shed drops
     try testing.expectEqual(@as(u64, 0), shed_until_ns); // window never opened
+}
+
+test "emitDigest writes a digest frame the daemon can decode" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var fds: [2]i32 = undefined;
+    if (posix.errno(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true })) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const saved_fd = write_fd;
+    defer write_fd = saved_fd; // LIFO: restore before the fds close
+    write_fd = fds[1];
+
+    emitDigest("api", 2, 42, 1000, 2000, "db timeout");
+
+    var sink: [512]u8 = undefined;
+    const n = linux.read(fds[0], &sink, sink.len);
+    try testing.expect(posix.errno(n) == .SUCCESS and n > 0);
+    var scratch: [256]u8 = undefined;
+    const d = frame.decode(sink[0..n], &scratch).?;
+    const got = d.rec.digest_entry;
+    try testing.expectEqualStrings("api", got.name);
+    try testing.expectEqual(@as(u8, 2), got.severity);
+    try testing.expectEqual(@as(u64, 42), got.count);
+    try testing.expectEqual(@as(u64, 1000), got.first_unix_ns);
+    try testing.expectEqual(@as(u64, 2000), got.last_unix_ns);
+    try testing.expectEqualStrings("db timeout", got.sample);
 }
