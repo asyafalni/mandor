@@ -1408,7 +1408,11 @@ fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     // entry — no encode/write here. `ctx.t_ms` is the wall-clock ms already taken
     // for this drain, scaled to ns (no extra syscall).
     if (digest_on) {
-        const dsev: u8 = if (summarize.errorish(text)) 2 else capture.severityFromFlags(flags);
+        // Classify by CONTENT (single pass): error-class keyword → error, "warn" →
+        // warn, else fall back to the stream flag (stderr = warn, stdout = info).
+        // errorish() would mislabel a warning as an error (it matches "warn" too).
+        const csev = summarize.logSeverity(text);
+        const dsev: u8 = if (csev > 0) csev else capture.severityFromFlags(flags);
         if (dsev >= 1) digest.record(ctx.w.nameSlice(), dsev, ctx.t_ms *| 1_000_000, text);
     }
     // Opt-in full log streaming (default off ⇒ this branch is never taken, so

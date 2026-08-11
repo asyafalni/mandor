@@ -171,6 +171,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                         "death should not stop the run takes essential = false",
                     error.UnhealthyKeyRemoved => "'restart_on_unhealthy' was removed — " ++
                         "a configured health probe is always acted on",
+                    error.LogsStreamRemoved => "'[logs] stream' was removed — streaming is now " ++
+                        "per worker: set stream = true inside a [worker.NAME] section. The " ++
+                        "curated warn/error digest ships by default; [logs] keeps max_rate/digest*",
                     error.Syntax => "syntax",
                     error.BadValue => "bad value",
                     error.TooManyWorkers => "too many workers (max 64)",

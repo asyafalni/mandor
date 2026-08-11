@@ -3,6 +3,37 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.11.1] - 2026-08-10
+
+Hardening pass over the v1.11.0 log-signal-v2 work (a high-effort code review of
+the whole diff). All fixes carry a regression test.
+
+### Fixed
+- **PID 1 could busy-spin at 100% CPU on `[logs] digest_interval = "0s"`.** A zero
+  flush cadence left the supervisor's digest deadline permanently in the past, so
+  the poll timeout clamped to 0 and the loop never slept. `0` is now rejected at
+  config parse with a clear error.
+- **Warnings were shipped to photon as errors.** The digest classified severity
+  with `summarize.errorish`, which matches the substring `warn`, so every warning
+  line went out at `severity=error` (and tripped error-level alerting). Severity is
+  now a dedicated single-pass content classifier: error-class keywords → error,
+  `warn` → warn, else the stream flag. The single pass also removes the extra
+  per-line scan cost the old six-`containsIgnoreCase` path added to capture.
+- **An upgrade with an existing `[logs] stream` key failed to boot with an opaque
+  "syntax" error.** The removed key now emits a dedicated migration message
+  pointing at per-worker `[worker.NAME] stream` (mirroring the `restart` /
+  `restart_on_unhealthy` removals).
+- **A backward wall-clock step could stall streamed logs for the length of the
+  jump.** The backpressure shed window is keyed on `CLOCK_REALTIME`; a large NTP
+  correction left the window stranded in the future. It is now re-anchored so a
+  clock step can't stall streaming beyond one cooldown.
+- **The wrong-endpoint (2xx-HTML) guard could condemn a working endpoint to
+  retry-forever.** It now keys strictly on a `text/html` content type (a real OTLP
+  receiver answers `application/x-protobuf`), instead of loose `<html`/`<!doctype`
+  body substrings that could appear inside a legitimate protobuf response.
+- Removed a duplicate case-insensitive substring scanner in `relay.zig` (reuses
+  `summarize.containsIgnoreCase`).
+
 ## [1.11.0] - 2026-08-07
 
 Log signal v2: three tiers of log → photon. Tier 1 incidents (durable, unchanged);

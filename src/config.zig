@@ -126,7 +126,7 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
     };
 }
 
-pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved };
+pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved };
 
 /// Parse TOML-subset text. String values are slices into `text`; worker
 /// commands land in `cmd_storage`.
@@ -378,10 +378,21 @@ fn logsSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!
             return error.BadValue;
     } else if (std.mem.eql(u8, key, "digest_interval")) {
         const s = parseString(value) orelse return error.BadValue;
-        cfg.logs_digest_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
+        const ms = cli.parseDuration(s) orelse return error.BadValue;
+        // 0 is not a valid flush cadence: it makes the supervisor's flush deadline
+        // never advance into the future, busy-spinning PID 1 at 100% CPU. Reject it
+        // so the operator gets a clear error instead of a wedged container.
+        if (ms == 0) return error.BadValue;
+        cfg.logs_digest_interval_ms = ms;
     } else if (std.mem.eql(u8, key, "digest_threshold")) {
         // Bare int (a signature count). Negative/non-numeric → BadValue.
         cfg.logs_digest_threshold = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
+    } else if (std.mem.eql(u8, key, "stream")) {
+        // Removed in v1.11 (log-signal-v2): streaming is now per worker. Give a
+        // migration hint, not a bare Syntax error, so an upgrade doesn't hard-fail
+        // to boot with no clue — mirrors the `restart` / `restart_on_unhealthy`
+        // removed-key treatment.
+        return error.LogsStreamRemoved;
     } else {
         return error.Syntax; // unknown key inside a [logs] section
     }
@@ -1036,9 +1047,11 @@ test "worker section: stream collects the worker name; others stay non-streaming
 
 test "logs section: stream key is no longer accepted (now per-worker)" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    // `[logs] stream` was removed in log-signal-v2: streaming is per-worker now,
-    // so an old `[logs] stream` key is an unknown-key Syntax error.
-    try t.expectError(error.Syntax, parseTest("[logs]\nstream = true", &storage));
+    // `[logs] stream` was removed in log-signal-v2: streaming is per-worker now.
+    // It gets a dedicated migration error (not a bare Syntax) so an upgrade fails
+    // with an actionable message instead of an opaque "syntax" — mirrors the
+    // removed `restart` / `restart_on_unhealthy` keys.
+    try t.expectError(error.LogsStreamRemoved, parseTest("[logs]\nstream = true", &storage));
 }
 
 test "logs section: max_rate parses, defaults absent, rejects bad values" {
@@ -1077,6 +1090,8 @@ test "logs section: digest knobs parse, default absent, reject bad values" {
     // Bad bool, bad duration, non-numeric and negative threshold are hard errors.
     try t.expectError(error.BadValue, parseTest("[logs]\ndigest = yes", &storage));
     try t.expectError(error.BadValue, parseTest("[logs]\ndigest_interval = \"soon\"", &storage));
+    // A 0 interval would busy-spin PID 1 (flush deadline never advances) — rejected.
+    try t.expectError(error.BadValue, parseTest("[logs]\ndigest_interval = \"0s\"", &storage));
     try t.expectError(error.BadValue, parseTest("[logs]\ndigest_threshold = lots", &storage));
     try t.expectError(error.BadValue, parseTest("[logs]\ndigest_threshold = -1", &storage));
     // An unknown [logs] key is still a hard Syntax error.

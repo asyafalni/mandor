@@ -67,6 +67,34 @@ pub fn errorish(line: []const u8) bool {
         containsIgnoreCase(line, "warn");
 }
 
+/// Case-insensitive keyword match at a fixed position (comptime lowercase needle).
+inline fn kwAt(line: []const u8, at: usize, comptime kw: []const u8) bool {
+    if (at + kw.len > line.len) return false;
+    inline for (kw, 0..) |c, k| {
+        if (std.ascii.toLower(line[at + k]) != c) return false;
+    }
+    return true;
+}
+
+/// Content severity of a log line for the Tier-2 digest: 2 = error-class keyword
+/// (error/panic/fatal/exception/traceback), 1 = "warn", 0 = none. Error outranks
+/// warn. ONE pass over the line (early per-position rejection) — not six separate
+/// `containsIgnoreCase` scans — because the digest classifies on the capture path
+/// and telemetry must never slow supervision. Unlike `errorish` (which lumps warn
+/// in with error), this keeps warnings at severity 1 so photon doesn't alert on
+/// them as errors.
+pub fn logSeverity(line: []const u8) u8 {
+    var sev: u8 = 0;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (kwAt(line, i, "error") or kwAt(line, i, "panic") or
+            kwAt(line, i, "fatal") or kwAt(line, i, "exception") or
+            kwAt(line, i, "traceback")) return 2;
+        if (sev == 0 and kwAt(line, i, "warn")) sev = 1;
+    }
+    return sev;
+}
+
 /// Dedup signature: FNV-1a over cause kind + worker name + the error line
 /// with digits stripped (so "worker 17 died" == "worker 42 died").
 pub fn signature(cause_kind: []const u8, name: []const u8, err_line: []const u8) u64 {
@@ -434,6 +462,23 @@ test "errorish detection" {
     try std.testing.expect(errorish("Traceback (most recent call last):"));
     try std.testing.expect(!errorish("listening on :8080"));
     try std.testing.expect(!errorish(""));
+}
+
+test "logSeverity separates error, warn, and info by content" {
+    // error-class keywords → 2
+    try std.testing.expectEqual(@as(u8, 2), logSeverity("PANIC: oh no"));
+    try std.testing.expectEqual(@as(u8, 2), logSeverity("some Error occurred"));
+    try std.testing.expectEqual(@as(u8, 2), logSeverity("fatal: boom"));
+    try std.testing.expectEqual(@as(u8, 2), logSeverity("Traceback (most recent call last):"));
+    // "warn" → 1 (must NOT be lumped in as error — the whole point of the fix)
+    try std.testing.expectEqual(@as(u8, 1), logSeverity("[WARN] disk full"));
+    try std.testing.expectEqual(@as(u8, 1), logSeverity("Warning: retry scheduled"));
+    // error outranks warn regardless of order
+    try std.testing.expectEqual(@as(u8, 2), logSeverity("warn: then ERROR later"));
+    try std.testing.expectEqual(@as(u8, 2), logSeverity("ERROR after a warning"));
+    // no keyword → 0
+    try std.testing.expectEqual(@as(u8, 0), logSeverity("listening on :8080"));
+    try std.testing.expectEqual(@as(u8, 0), logSeverity(""));
 }
 
 test "signature ignores digits, distinguishes cause and name" {

@@ -244,6 +244,13 @@ pub fn rateDrops() u64 {
 /// error (see capture.severityFromFlags).
 pub fn emitLog(name: []const u8, iostream: u8, severity: u8, t_ns: u64, line: []const u8) void {
     if (write_fd < 0) return;
+    // `t_ns` is wall-clock (CLOCK_REALTIME). A backward wall-clock step (early-boot
+    // NTP sync, a large correction) would otherwise strand an open shed window far
+    // in the future and drop every streamed line until real time caught back up. A
+    // window can only legitimately be up to one cooldown ahead of "now"; if it is
+    // further, the clock jumped — re-anchor so a step can't stall streaming beyond
+    // one cooldown. During normal shedding this never fires (t_ns only advances).
+    if (shed_until_ns > t_ns +| shed_cooldown_ns) shed_until_ns = t_ns +| shed_cooldown_ns;
     // Backpressure shedding: inside a shed window (the daemon fell behind) a line
     // costs only this compare + a counter bump — NOT the encode below. This is
     // the O(1)/line self-cap under a sustained flood into a backed-up daemon.
@@ -459,6 +466,36 @@ test "emitLog probes past the shed window and re-arms if still full" {
     emitLog("api", 0, 2, t, "boom");
     try testing.expectEqual(saved_log + 1, log_drops); // a write was attempted
     try testing.expectEqual(t +| shed_cooldown_ns, shed_until_ns); // re-armed
+}
+
+test "emitLog re-anchors a shed window stranded in the far future by a clock step" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var fds: [2]i32 = undefined;
+    if (posix.errno(linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true })) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const saved_fd = write_fd;
+    const saved_until = shed_until_ns;
+    const saved_shed = shed_drops;
+    defer {
+        write_fd = saved_fd;
+        shed_until_ns = saved_until;
+    }
+    write_fd = fds[1];
+    // A shed window opened, then the wall clock stepped BACKWARD: the deadline is
+    // now absurdly far ahead of the new (small) t_ns. Without the re-anchor guard
+    // every streamed line would be shed until real time caught up — a long stall.
+    shed_until_ns = 1_000_000_000_000;
+    const t: u64 = 1000; // "now" after the backward step
+    emitLog("api", 0, 2, t, "boom");
+    // Clamped to at most one cooldown ahead of t: the stall is bounded, and a line
+    // past t + cooldown ships again instead of being stuck. This line is itself
+    // shed (t < the re-anchored deadline), but the window is no longer unbounded.
+    try testing.expectEqual(t +| shed_cooldown_ns, shed_until_ns);
+    try testing.expectEqual(saved_shed + 1, shed_drops);
 }
 
 test "emitLog with a draining reader never enters shed" {

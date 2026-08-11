@@ -14,6 +14,7 @@ const spool = @import("spool.zig");
 const hostmetrics = @import("hostmetrics.zig");
 const sampler = @import("sampler.zig");
 const gpu = @import("gpu.zig");
+const summarize = @import("summarize.zig");
 
 /// Wall-clock ceiling on each blocking socket call. Generous enough that a
 /// merely slow collector still succeeds, short enough that a hung one cannot
@@ -1246,30 +1247,17 @@ fn statusOk(resp: []const u8) bool {
     return resp[9] == '2';
 }
 
-/// Case-insensitive substring scan. `needle` MUST be lowercase. Pure, no alloc.
-fn containsCi(hay: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or hay.len < needle.len) return false;
-    var i: usize = 0;
-    outer: while (i + needle.len <= hay.len) : (i += 1) {
-        var j: usize = 0;
-        while (j < needle.len) : (j += 1) {
-            if (std.ascii.toLower(hay[i + j]) != needle[j]) continue :outer;
-        }
-        return true;
-    }
-    return false;
-}
-
-/// Does a 2xx response look like an HTML page rather than OTLP? photon's web UI
-/// answers `200 OK` with an SPA `<!doctype html>…` for any unknown path, so a
-/// mandor pointed at the UI port (not the OTLP ingest port, e.g. :4318) gets a
-/// 200 for `/v1/logs` and the payload is silently swallowed by the SPA
-/// catch-all — never ingested. This signature turns that into a loud warning and
-/// a NOT-delivered verdict instead of counted-as-shipped data loss.
+/// Does a 2xx response come from a web UI rather than an OTLP receiver? photon's
+/// UI answers `200 OK` with an SPA (`Content-Type: text/html`) for any unknown
+/// path, so a mandor pointed at the UI port (not the OTLP ingest port, e.g. :4318)
+/// gets a 200 for `/v1/logs` and the payload is swallowed by the SPA catch-all —
+/// never ingested. We key ONLY on a `text/html` content type, not loose body
+/// substrings: a real OTLP receiver answers `application/x-protobuf`
+/// (ExportLogsServiceResponse), so `text/html` is an unambiguous wrong-endpoint
+/// signal, while `<html`/`<!doctype` bytes could in principle appear inside a
+/// legitimate protobuf body and wrongly condemn a working endpoint to retry-forever.
 fn looksLikeHtml(resp: []const u8) bool {
-    return containsCi(resp, "text/html") or
-        containsCi(resp, "<!doctype") or
-        containsCi(resp, "<html");
+    return summarize.containsIgnoreCase(resp, "text/html");
 }
 
 /// One-time guard so a wrong-endpoint warning is logged once, not per POST
@@ -1908,23 +1896,19 @@ test "statusOk accepts real 2xx and nothing else" {
 }
 
 test "looksLikeHtml flags a web-UI 200 but not a real OTLP response" {
-    // photon's SPA catch-all: 200 with an HTML page (the wrong-endpoint case).
+    // photon's SPA catch-all: 200 with a text/html content type (wrong endpoint).
     try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<x>"));
-    try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\ncontent-length: 210\r\n\r\n210\r\n<!doctype html>\n<html>"));
-    // Case-insensitive: header/body casing varies across servers.
-    try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: TEXT/HTML\r\n\r\n"));
-    try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\n\r\n<!DOCTYPE HTML>"));
+    // Case-insensitive: header casing varies across servers.
+    try testing.expect(looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: TEXT/HTML; charset=utf-8\r\n\r\n"));
 
     // A genuine OTLP/HTTP receiver: protobuf ExportLogsServiceResponse (\n\x00 =
     // empty partial_success = 0 rejected). Must NOT be mistaken for HTML.
     try testing.expect(!looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\n\r\n\n\x00"));
     try testing.expect(!looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}"));
+    // We key on the content type only — stray `<html`/`<!doctype` bytes in a
+    // protobuf body must NOT condemn a working endpoint (the retry-forever risk).
+    try testing.expect(!looksLikeHtml("HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\n\r\n<html>"));
     try testing.expect(!looksLikeHtml(""));
-
-    // containsCi contract: needle must be lowercase; matches any-case haystack.
-    try testing.expect(containsCi("aXBcd", "xbc"));
-    try testing.expect(!containsCi("abc", "xyz"));
-    try testing.expect(!containsCi("ab", "abcd")); // needle longer than haystack
 }
 
 test "parseHostPort accepts and rejects" {
