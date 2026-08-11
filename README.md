@@ -346,6 +346,49 @@ Multi-tenant photon? Set `service_prefix` to tag `service.name` on every emissio
 so several mandor origins can share one photon without their worker names
 colliding.
 
+### The warn/error digest — telling you about trouble that never crashes
+
+Most log signal never becomes an incident. A service that is *up* but spraying
+`ERROR db timeout` a thousand times a minute is in trouble, yet nothing died, so
+a crash-only supervisor stays silent — and full log streaming to catch it means
+paying a per-line encode+send for a firehose you mostly don't want. The digest is
+the middle path: **on by default the moment `photon=` is set**, no streaming
+required.
+
+At capture time mandor already flags every warn/error line (by content —
+`error`/`warn`/`panic`/`fatal`/`exception`/`traceback` — on stdout *or* stderr).
+The digest folds each flagged line into a fixed 64-entry table keyed by its
+*signature* (the line with digits stripped, so `conn 17 refused` and
+`conn 4021 refused` are the same entry), bumping a count. Every `digest_interval`
+(default 30s), early when any one signature crosses `digest_threshold`, and once
+at shutdown, it ships the table as OTLP `/v1/logs` — **one record per signature**,
+never per line. A distinct-signature flood past the 64 slots collapses into one
+`(other)` overflow record, so both memory and CPU are bounded no matter how dirty
+the app's logging gets.
+
+```toml
+photon = "photon:4318"      # the OTLP ingest port (not photon's web UI)
+# digest is on by default; these are the knobs, all optional:
+[logs]
+digest           = true     # false to turn the whole tier off
+digest_interval  = "30s"    # flush cadence
+digest_threshold = 100      # early-flush when one signature hits this count
+```
+
+What one signature looks like in photon after a burst of identical errors —
+1287 lines became a single record carrying the count and the first/last sighting:
+
+```json
+{ "service": "api", "severity": "error", "body": "ERROR db timeout",
+  "attributes": { "mandor.count": "1287", "log.iostream": "stderr",
+                  "mandor.first_ts": "1786119239510000000",
+                  "mandor.last_ts":  "1786119271884000000" } }
+```
+
+Curated, not real-time — the trade is a bounded delay for a signal that can't be
+drowned out by volume. When you *do* need every line, opt a specific worker into
+Tier 3 streaming; the digest keeps working for the rest.
+
 Run one mandor with the host `/proc`, `/sys`, `/etc/machine-id` (and
 `/dev/nvidia*` for GPU) mounted in and it reports the **host** — node-exporter
 style, superseding a standalone node agent — while still supervising its workers.
