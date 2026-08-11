@@ -406,6 +406,7 @@ with no `photon=` key none of it activates. Full contract in
 | 50 ✅ | App-shared secret store (`[secret.NAME]`) | ● ● ● ○ | v1.8.0 — per-session secrets handed to granted workers over inherited pipe fds (`$CONFD_<NAME>` = the fd number); deny-by-default; value never in env/argv/disk |
 | 51 ✅ | Absorb photon-agent: fine-grained node + GPU metrics | ● ● ● ● | v1.9.0 — per-core CPU, per-mount fs, per-interface net, swap, disk.io, uptime, load 1/5/15m, cpu temp; GPU via `nvidia-smi` (NVIDIA) + DRM sysfs (AMD/Intel), opt-in `[gpu]`. Node sampling moved into the daemon. One mandor with host `/proc`,`/sys` mounted supersedes a standalone node agent |
 | 52 ✅ | Opt-in full log streaming (`[logs] stream`) | ● ● ○ ○ | v1.10.0 — every worker line → OTLP `/v1/logs`, ephemeral/best-effort (dropped under backpressure, `[logs] max_rate` cap), never spooled. Default off: mandor curates (log content otherwise travels only inside incident bundles) unless explicitly asked |
+| 53 ✅ | Log signal v2 — curated digest + per-worker streaming + multi-tenancy | ● ● ● ○ | v1.11.0 — three tiers of log → photon. **Tier 2 curated warn/error digest** (default-on when `photon=`): warn/error lines deduped by signature into a bounded table, shipped as OTLP `/v1/logs` (one record per signature, `mandor.count`/`first_ts`/`last_ts`) every `digest_interval` + threshold early-flush + at shutdown — flood-proof, surfaces log trouble with no crash. Streaming (#52) is now **per worker** (`[worker.NAME] stream`, replacing the global toggle) with automatic backpressure shedding. `service_prefix` tags `service.name` per origin for multi-tenant photon. Relay warns on a 2xx-HTML reply (web-UI port mistaken for OTLP ingest) |
 
 ## Backlog status
 
@@ -417,15 +418,17 @@ v0.20). The original feature backlog is empty.
 
 **Post-1.6 (Tier 10) is a new, user-directed arc**, not from the research
 rounds: opt-in OTLP self-sufficiency, node + GPU host metrics (absorbing the
-role of a standalone node agent), an app-shared secret store, and opt-in log
-streaming — all shipped through v1.10.0, all off by default. That closes the
-observability story; no feature backlog remains beyond the non-feature work
-noted at the end.
+role of a standalone node agent), an app-shared secret store, per-worker log
+streaming, and the log-signal-v2 curated warn/error digest with `service_prefix`
+multi-tenancy — all shipped through v1.11.0, all gated by `photon=` (with it
+unset nothing opens a socket). That closes the observability story; no feature
+backlog remains beyond the non-feature work noted at the end.
 
 **v1.0 fuzz-hardening: done (v1.0.0).** `src/fuzz.zig` mutation-fuzzes the
 whole untrusted-input surface — the six trace parsers, the worker ELF header,
-`mandor.toml`, `/proc` + cgroup text, and mandor's own state files — seeded
-from real crash output in `test/fixtures/`. It now runs **13 targets** and has
+`mandor.toml`, `/proc` + cgroup text, the relay's OTLP encoders and pipe-frame
+decoder (including the Tier-2 digest frame), and mandor's own state files —
+seeded from real crash output in `test/fixtures/`. It now runs **17 targets** and has
 found **seven** PID-1-fatal traps plus a Prometheus label-injection bug and a
 backoff-cap violation across the v1.0.x passes; all fixed
 and pinned by regression tests. Every one was an integer overflow on a value

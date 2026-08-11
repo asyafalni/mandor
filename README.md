@@ -292,11 +292,12 @@ unchanged — CI runs the full integration harness on all three distro bases.
 
 ## Status
 
-**Stable (1.x).** Core supervision has been stable since 1.0; the 1.7–1.9 line
+**Stable (1.x).** Core supervision has been stable since 1.0; the 1.7–1.11 line
 added opt-in OTLP telemetry, node + GPU host metrics (superseding a standalone
-node agent), an app-shared secret store, and opt-in log streaming — all off by
-default, none of it on the supervision path. The incident-bundle schema is a
-versioned contract, the untrusted-input surface is fuzz-hardened in CI, and every
+node agent), an app-shared secret store, per-worker log streaming, and a curated
+warn/error digest that surfaces an app's own log trouble without a crash — all
+gated by `photon=`, none of it on the supervision path. The incident-bundle schema
+is a versioned contract, the untrusted-input surface is fuzz-hardened in CI, and every
 build is soaked under load to prove the supervisor's own footprint stays flat.
 Version history:
 [CHANGELOG.md](CHANGELOG.md) · every
@@ -326,10 +327,24 @@ What it ships when `photon` is set:
   via DRM sysfs. Fail-closed when no GPU is present.
 - **Process-lifecycle events** → OTLP logs (started / exited / restarting /
   unhealthy).
-- **Full worker logs** (opt-in, `[logs] stream`) → OTLP logs. By default mandor
-  *curates* — log content otherwise reaches photon only inside incident bundles;
-  the firehose is off unless you ask for it (and rate-limitable via
-  `[logs] max_rate`). Traces are never shipped.
+- **Curated warn/error digest** (on by default when `photon=` is set) → OTLP logs.
+  A worker that is healthy but *logs* warnings and errors produces no incident, so
+  mandor deduplicates its warn/error lines by signature into a bounded table and
+  ships a compact digest — one record per signature (body = a sample line,
+  `mandor.count` / `mandor.first_ts` / `mandor.last_ts`), every `digest_interval`
+  (default 30s), early when a signature crosses `digest_threshold`, and at shutdown.
+  A million identical `ERROR db timeout` lines collapse to **one** record with
+  `count=1000000` — flood-proof, curated, not real-time. Turn off with
+  `[logs] digest = false`.
+- **Full per-worker log streaming** (opt-in, `[worker.NAME] stream = true`) → OTLP
+  logs. The real-time firehose, selected per worker (not global) so a chatty worker
+  can stay curated while another streams; rate-limitable via `[logs] max_rate` and
+  self-capping under backpressure (drops before encode, never stalls supervision).
+  Traces are never shipped.
+
+Multi-tenant photon? Set `service_prefix` to tag `service.name` on every emission
+so several mandor origins can share one photon without their worker names
+colliding.
 
 Run one mandor with the host `/proc`, `/sys`, `/etc/machine-id` (and
 `/dev/nvidia*` for GPU) mounted in and it reports the **host** — node-exporter

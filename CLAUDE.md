@@ -91,12 +91,15 @@ forever). New work follows the same discipline — compile early, size-gate, shi
 4. **v0.4 — polish.** ✅ cgroup v2 OOM detection, optional Prometheus text
    endpoint (hand-rolled, one route), mandor.toml config (CLI-only must
    always work — zero-config is a feature).
-5. **Telemetry milestones (post-1.0, all SHIPPED through v1.9.0).** ✅ OPT-IN
+5. **Telemetry milestones (post-1.0, all SHIPPED through v1.11.0).** ✅ OPT-IN
    OTLP telemetry via the `mandor relay --daemon` child (incidents, per-process
    + supervisor metrics, node/host metrics, opt-in GPU metrics, lifecycle
-   events); ✅ opt-in full log streaming (`[logs] stream`); ✅ app-shared secret
-   store (`[secret.NAME]`). Offline-by-default is unchanged — none of this
-   activates without `photon=`.
+   events); ✅ log-signal v2 (v1.11.0) — a curated warn/error **digest**
+   (default-on when `photon=`, dedup-by-signature, flood-proof, `[logs] digest`),
+   **per-worker** full streaming (`[worker.NAME] stream`, replacing the old global
+   toggle) with automatic backpressure shedding, and `service_prefix` for
+   multi-tenant photon; ✅ app-shared secret store (`[secret.NAME]`).
+   Offline-by-default is unchanged — none of this activates without `photon=`.
 6. **v1.x — premium sidecar** (separate repo/binary, possibly Rust for rustls):
    watches spool dir, POSTs to relay, license check. NOT in this binary.
 
@@ -194,9 +197,11 @@ sampling, `gpu.zig`, `resolve.zig` DNS) is inert unless `photon=` is set.
   socket, and telemetry must never stall or slow supervision (non-blocking pipe,
   drop-under-backpressure — incidents are the one durable tier). Any new
   telemetry follows this shape.
-- **Curate by default.** mandor ships log *content* only inside incident
-  bundles; full per-line log streaming and GPU sampling are strictly opt-in
-  (`[logs] stream`, `[gpu] enabled`). Traces are never shipped.
+- **Curate by default.** mandor ships log *content* two curated ways — inside
+  incident bundles, and as the default-on warn/error **digest** (deduped by
+  signature, low-rate, flood-proof). Full per-line streaming is strictly opt-in
+  and **per worker** (`[worker.NAME] stream`), as is GPU sampling (`[gpu] enabled`).
+  Traces are never shipped.
 - Premium (AI-fix) logic lives in the sidecar + relay only. The spool dir JSON
   is the tier boundary the sidecar watches; photon consumes the same contracts
   over OTLP.

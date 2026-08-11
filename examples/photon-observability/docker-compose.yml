@@ -23,5 +23,7 @@ volumes:
 #   max_restarts = 3
 #   photon       = "photon:4318"
 #   workers      = ["./api --port 3000", "./worker"]
-#   # [gpu]        enabled = true      # opt-in NVIDIA/AMD/Intel GPU metrics
-#   # [logs]       stream  = true      # opt-in full log streaming to /v1/logs
+#   # service_prefix = "tenant-a-"     # tag service.name per origin (multi-tenant photon)
+#   # [gpu]         enabled = true     # opt-in NVIDIA/AMD/Intel GPU metrics
+#   # a curated warn/error digest ships to /v1/logs by default when photon= is set
+#   # [worker.api]  stream  = true     # opt-in FULL per-line streaming for one worker
