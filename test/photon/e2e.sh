@@ -101,7 +101,7 @@ ok "built the app image (mandor + photon key)"
 
 # Crash a worker under mandor; the photon key forwards the incident by itself.
 app_out=$("$ENGINE" run --rm --name "$APP" --network "$NET" \
-  -e PHOTON_TOKEN="$TOKEN" -e MANDOR_RELEASE="api@9.9.9" \
+  -e PHOTON_OTLP_TOKEN="$TOKEN" -e MANDOR_RELEASE="api@9.9.9" \
   "$APP_IMAGE" 2>&1)
 if echo "$app_out" | grep -q "exited with code 3"; then
   ok "mandor supervised the crash and wrote an incident"

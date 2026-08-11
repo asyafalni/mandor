@@ -65,7 +65,7 @@ pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const
         return 1;
     };
     // photon requires a bearer token; inherited env keeps it off /proc cmdline.
-    const token = spawner.findEnv(environ, "PHOTON_TOKEN") orelse "";
+    const token = spawner.findEnv(environ, "PHOTON_OTLP_TOKEN") orelse "";
     return post(host, port, "/v1/logs", body, token);
 }
 
@@ -1726,7 +1726,7 @@ pub fn runDaemon(
         err("bad photon endpoint (want ip:port)");
         return 2;
     };
-    const token = spawner.findEnv(environ, "PHOTON_TOKEN") orelse "";
+    const token = spawner.findEnv(environ, "PHOTON_OTLP_TOKEN") orelse "";
 
     // Block SIGPIPE so a photon that resets the connection mid-write makes the
     // socket write return EPIPE (handled as an ordinary send failure) instead of

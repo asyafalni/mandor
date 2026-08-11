@@ -1266,7 +1266,7 @@ name = "streamer"
 [worker."sh-2"]
 name = "quiet"
 TOML
-PHOTON_TOKEN=any "$MANDOR" --config="$TMP/stream78.toml" >"$TMP/78out" 2>&1 &
+PHOTON_OTLP_TOKEN=any "$MANDOR" --config="$TMP/stream78.toml" >"$TMP/78out" 2>&1 &
 mpid=$!
 found=""
 for _ in $(seq 1 250); do
@@ -1309,7 +1309,7 @@ photon = "127.0.0.1:$p79"
 [worker.sh]
 name = "streamer"
 TOML
-PHOTON_TOKEN=any "$MANDOR" --config="$TMP/stream79.toml" >"$TMP/79out" 2>&1 &
+PHOTON_OTLP_TOKEN=any "$MANDOR" --config="$TMP/stream79.toml" >"$TMP/79out" 2>&1 &
 mpid=$!
 live=""
 for _ in $(seq 1 250); do
@@ -1357,7 +1357,7 @@ photon = "127.0.0.1:$p80"
 [logs]
 digest_interval = "1s"
 TOML
-PHOTON_TOKEN=any "$MANDOR" --config="$TMP/digest80.toml" >"$TMP/80out" 2>&1 &
+PHOTON_OTLP_TOKEN=any "$MANDOR" --config="$TMP/digest80.toml" >"$TMP/80out" 2>&1 &
 mpid=$!
 found=""
 for _ in $(seq 1 250); do
