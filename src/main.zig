@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Invisible subcommand: `mandor relay <bundle.json>` (photon bridge).
     // The supervisor path never networks; this runs only when invoked.
     if (vec.len >= 3 and std.mem.eql(u8, std.mem.span(vec[1]), "relay")) {
-        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [gpu] [interval] [service_prefix]`.
+        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [interval] [service_prefix]`.
         // Spawned by the supervisor when `photon=` is set (it owns the socket so
         // the supervision path never does). <spool_dir> is the mandor state dir
         // (the one holding incidents/); <pipe_fd> is the inherited read end.
@@ -97,19 +97,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const endpoint = std.mem.span(vec[3]);
             const spool_dir = std.mem.span(vec[4]);
             const pipe_fd = std.fmt.parseInt(i32, std.mem.span(vec[5]), 10) catch return 2;
-            // GPU config is appended by spawnDaemon: vec[6]="0"|"1" enabled,
-            // vec[7]=interval ms. Absent (an older spawn) -> GPU off / 15s.
-            const gpu_enabled = vec.len >= 7 and std.mem.eql(u8, std.mem.span(vec[6]), "1");
-            const gpu_interval_ms: u64 = if (vec.len >= 8)
-                (std.fmt.parseInt(u64, std.mem.span(vec[7]), 10) catch 15_000)
+            // vec[6] = gpu interval ms (absent on an older spawn -> 15s). vec[7] =
+            // service prefix ("" = none). GPU on/off is auto-detected by the daemon,
+            // not passed. Log streaming is per-worker, so no toggle is threaded.
+            const gpu_interval_ms: u64 = if (vec.len >= 7)
+                (std.fmt.parseInt(u64, std.mem.span(vec[6]), 10) catch 15_000)
             else
                 15_000;
-            // Service prefix appended after GPU config: vec[8] = origin tag
-            // ("" = none). Absent (an older spawn) -> empty (unchanged OTLP).
-            // Log streaming is decided supervisor-side per worker, so no toggle
-            // is threaded to the daemon anymore.
-            const service_prefix: []const u8 = if (vec.len >= 9) std.mem.span(vec[8]) else "";
-            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_enabled, gpu_interval_ms, service_prefix, init.environ.block.slice);
+            const service_prefix: []const u8 = if (vec.len >= 8) std.mem.span(vec[7]) else "";
+            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_interval_ms, service_prefix, init.environ.block.slice);
         }
         const endpoint: ?[]const u8 = if (vec.len >= 4) std.mem.span(vec[3]) else null;
         return @import("relay.zig").run(vec[2], endpoint, init.environ.block.slice);
@@ -175,6 +171,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     error.LogsStreamRemoved => "'[logs] stream' was removed — streaming is now " ++
                         "per worker: set stream = true inside a [worker.NAME] section. The " ++
                         "curated warn/error digest ships by default; [logs] keeps max_rate/digest*",
+                    error.GpuEnabledRemoved => "'[gpu] enabled' was removed — GPU metrics are " ++
+                        "now auto-detected (on when a device is present, off otherwise); " ++
+                        "[gpu] keeps only 'interval'",
                     error.Syntax => "syntax",
                     error.BadValue => "bad value",
                     error.TooManyWorkers => "too many workers (max 64)",
@@ -196,7 +195,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
-            if (file_cfg.gpu_enabled) |v| cfg.gpu.enabled = v;
             if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
             if (file_cfg.logs_max_rate) |v| cfg.logs.max_rate = v;
             if (file_cfg.logs_digest) |v| cfg.logs.digest = v;

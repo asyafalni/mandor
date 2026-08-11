@@ -28,7 +28,7 @@ pub const FileConfig = struct {
     on_incident: ?[]const u8 = null,
     photon: ?[]const u8 = null,
     /// `[gpu]` section: null = key absent (caller keeps the cli.Config default).
-    gpu_enabled: ?bool = null,
+    /// GPU sampling itself is auto-detected by the daemon (no `enabled` key).
     gpu_interval_ms: ?u64 = null,
     /// `[logs]` section: null = key absent (caller keeps the cli.Config default).
     logs_max_rate: ?u32 = null,
@@ -126,7 +126,7 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
     };
 }
 
-pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved };
+pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuEnabledRemoved };
 
 /// Parse TOML-subset text. String values are slices into `text`; worker
 /// commands land in `cmd_storage`.
@@ -337,19 +337,17 @@ fn sectionHeader(line: []const u8) ParseError!Section {
     return error.Syntax;
 }
 
-/// Apply one `key = value` inside `[gpu]`. `enabled` is a bare bool; `interval`
-/// is a quoted duration string ("15s"). Unknown key -> hard Syntax error.
+/// Apply one `key = value` inside `[gpu]`. `interval` is a quoted duration
+/// string ("15s"). `enabled` was removed in v1.12 — GPU sampling is now
+/// auto-detected by the daemon (on when a device is present). Unknown key ->
+/// hard Syntax error.
 fn gpuSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!void {
-    if (std.mem.eql(u8, key, "enabled")) {
-        cfg.gpu_enabled = if (std.mem.eql(u8, value, "true"))
-            true
-        else if (std.mem.eql(u8, value, "false"))
-            false
-        else
-            return error.BadValue;
-    } else if (std.mem.eql(u8, key, "interval")) {
+    if (std.mem.eql(u8, key, "interval")) {
         const s = parseString(value) orelse return error.BadValue;
         cfg.gpu_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "enabled")) {
+        // Removed in v1.12: GPU is auto-detected (on when a device is present).
+        return error.GpuEnabledRemoved;
     } else {
         return error.Syntax; // unknown key inside a [gpu] section
     }
@@ -996,32 +994,36 @@ test "secret section: every rejection is a hard error" {
     ));
 }
 
-test "gpu section: enabled + interval" {
+test "gpu section: interval" {
     var storage: [cli.max_workers][]const u8 = undefined;
     const text =
         \\[gpu]
-        \\enabled = true
         \\interval = "10s"
     ;
     const cfg = try parseTest(text, &storage);
-    try t.expectEqual(@as(?bool, true), cfg.gpu_enabled);
     try t.expectEqual(@as(?u64, 10_000), cfg.gpu_interval_ms);
 }
 
 test "gpu section: absent keys stay null; bad values and unknown key rejected" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    // No [gpu] section at all -> both fields null (caller keeps cli defaults).
+    // No [gpu] section at all -> field stays null (caller keeps cli default).
     const none = try parseTest("workers = [\"./a\"]", &storage);
-    try t.expectEqual(@as(?bool, null), none.gpu_enabled);
     try t.expectEqual(@as(?u64, null), none.gpu_interval_ms);
-    // enabled defaults off when the section exists but omits it.
     const off = try parseTest("[gpu]\ninterval = \"5s\"", &storage);
-    try t.expectEqual(@as(?bool, null), off.gpu_enabled);
     try t.expectEqual(@as(?u64, 5_000), off.gpu_interval_ms);
-    // Bad bool, bad duration, unknown key.
-    try t.expectError(error.BadValue, parseTest("[gpu]\nenabled = yes", &storage));
+    // Bad duration, unknown key.
     try t.expectError(error.BadValue, parseTest("[gpu]\ninterval = \"soon\"", &storage));
     try t.expectError(error.Syntax, parseTest("[gpu]\nbogus = \"x\"", &storage));
+}
+
+test "gpu section: enabled key removed gives a migration error" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // `[gpu] enabled` was removed in v1.12 (GPU auto-detected). It must give a
+    // dedicated migration error, not a bare Syntax error.
+    try t.expectError(error.GpuEnabledRemoved, parseTest("[gpu]\nenabled = true", &storage));
+    // `[gpu] interval` still parses.
+    const cfg = try parseTest("[gpu]\ninterval = \"20s\"", &storage);
+    try t.expectEqual(@as(?u64, 20_000), cfg.gpu_interval_ms);
 }
 
 test "worker section: stream collects the worker name; others stay non-streaming" {

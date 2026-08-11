@@ -1704,7 +1704,6 @@ pub fn runDaemon(
     endpoint: []const u8,
     spool_dir: []const u8,
     pipe_fd: i32,
-    gpu_enabled: bool,
     gpu_interval_ms: u64,
     service_prefix_arg: []const u8,
     environ: [:null]const ?[*:0]const u8,
@@ -1763,16 +1762,27 @@ pub fn runDaemon(
     var node_primed = false;
     var next_node_sample_ms: u64 = monoMs() +| sampler.interval_ms;
 
-    // GPU sampling ([gpu] enabled): its own timer on the daemon, off PID 1.
-    // TWO sources under this ONE toggle: gpu.sample() forks/execs nvidia-smi
-    // (bounded + timed, fail-closed), and gpu.sampleDrm() reads AMD/Intel DRM
-    // sysfs (pure file reads, no subprocess, fail-closed). Both are fail-closed
-    // (empty slice on any error), so nothing here can affect supervision or the
+    // GPU sampling: its own timer on the daemon, off PID 1. TWO sources feed
+    // one contiguous buffer: gpu.sample() forks/execs nvidia-smi (bounded +
+    // timed, fail-closed), and gpu.sampleDrm() reads AMD/Intel DRM sysfs (pure
+    // file reads, no subprocess, fail-closed). Both are fail-closed (empty
+    // slice on any error), so nothing here can affect supervision or the
     // host/process telemetry. path_env resolves the bare `nvidia-smi`; envp is
     // the daemon's own environment for the child.
     const gpu_path_env = spawner.findPath(environ);
     var gpu_samples: [gpu.max_gpus]gpu.GpuSample = undefined;
-    var next_gpu_sample_ms: u64 = if (gpu_enabled) monoMs() +| gpu_interval_ms else 0;
+
+    // GPU auto-detect (one-time, spec: no re-probe — a GPU appearing later needs
+    // a restart). Probe both sources once; present if either returns a card. On
+    // a GPU-less host say so once, then never sample (no periodic nvidia-smi
+    // fork).
+    const gpu_present = blk: {
+        const nv = gpu.sample(gpu_path_env, environ.ptr, &gpu_samples);
+        const drm = gpu.sampleDrm(&gpu_samples, @intCast(nv.len));
+        break :blk (nv.len + drm.len) > 0;
+    };
+    if (!gpu_present) err("no GPU detected; GPU metrics off");
+    var next_gpu_sample_ms: u64 = if (gpu_present) monoMs() +| gpu_interval_ms else 0;
 
     var shipped: Shipped = .{};
 
@@ -1822,7 +1832,7 @@ pub fn runDaemon(
         // is fail-closed (empty slice on any error), so a GPU-less node ships
         // nothing here and never disturbs the other tiers. A build failure or
         // an empty batch drops the sample (routine telemetry is ephemeral).
-        if (gpu_enabled and monoMs() >= next_gpu_sample_ms) {
+        if (gpu_present and monoMs() >= next_gpu_sample_ms) {
             // TWO GPU sources into ONE contiguous buffer, shipped in ONE POST:
             //   1. nvidia-smi (subprocess, fail-closed) fills gpu_samples[0..nv].
             //   2. DRM sysfs (pure file reads, no subprocess) appends AMD/Intel
@@ -1856,7 +1866,7 @@ pub fn runDaemon(
         }
         // Fold the GPU deadline into the sleep bound too, so an interval shorter
         // than the node cadence still fires on time.
-        if (gpu_enabled and next_gpu_sample_ms > now_ms) {
+        if (gpu_present and next_gpu_sample_ms > now_ms) {
             const until = next_gpu_sample_ms - now_ms;
             if (until < sleep_ms) sleep_ms = until;
         }

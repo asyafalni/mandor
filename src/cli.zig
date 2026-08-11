@@ -34,10 +34,11 @@ pub const SecretDef = struct {
 
 pub const Mode = enum { supervise, report, validate };
 
-/// `[gpu]` section (TOML-only). OFF by default — GPU sampling is 100% opt-in.
-/// When enabled, the relay daemon shells out to `nvidia-smi` on `interval_ms`.
+/// `[gpu]` section (TOML-only). GPU sampling is auto-detected by the relay
+/// daemon (on when a device is present, off otherwise) — no `enabled` key.
+/// When present, the daemon shells out to `nvidia-smi` (and reads DRM sysfs)
+/// on `interval_ms`.
 pub const GpuConfig = struct {
-    enabled: bool = false,
     interval_ms: u64 = 15_000,
 };
 
