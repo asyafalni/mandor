@@ -1,9 +1,14 @@
 # mandor configuration reference
 
-Precedence: **TOML < environment < CLI**. The CLI carries only
+Precedence: **CLI > ENV > TOML > default**. The CLI carries only
 `--max-restarts`, `--config`, `--metrics` and `--state-dir`; every other
 setting is a TOML key, so the command line stays readable. CLI-only always works; `mandor.toml`
 is loaded from `--config=PATH` (must exist) or `./mandor.toml` (best-effort).
+Only four deploy-varying keys are env-settable — `photon` (`PHOTON_OTLP_HTTP_ENDPOINT`),
+the relay bearer token (`PHOTON_OTLP_TOKEN`), `service_prefix`
+(`MANDOR_SERVICE_PREFIX`), and `state_dir` (`MANDOR_STATE_DIR`) — each marked
+below; ENV overrides a TOML value for those four, and CLI (where a flag
+exists) overrides ENV. Everything else is TOML/CLI only.
 Per-worker settings live in `[worker.NAME]` sections (see below). The worker
 name is the basename of the command's first token (duplicates get `-2`,
 `-3`…). Quotes, backslashes, and control characters in a name become `_`, so
@@ -20,8 +25,8 @@ names stay safe in the Prometheus exposition format.
 | `expected_exit = "143,129"` | — | none | Exit codes treated exactly like 0. Overridable per worker |
 | `state_dir = "/path"` | `--state-dir=` / `MANDOR_STATE_DIR` | `/var/lib/mandor` | State file + incident spool + history |
 | `metrics_port = 9464` | `--metrics=` | off | Prometheus text endpoint on 127.0.0.1 |
-| `photon = "127.0.0.1:4318"` | — | off | Ship incidents + metrics + lifecycle events to photon as OTLP; fully offline without it. Auth via `PHOTON_TOKEN` env. See "photon telemetry" below |
-| `service_prefix = "tenant-a-"` | — | `""` | Origin/tenant tag prepended to `service.name` on **every** OTLP emission (metrics, incidents, lifecycle, streamed logs, the digest), so several mandor origins can share one multi-tenant photon without `service.name` colliding. Telemetry-only — the bare worker name is unchanged in the log `[name]` prefix, `report`, and Prometheus labels; `host.id` still distinguishes hosts. Default `""` = unchanged; inert without `photon=` |
+| `photon = "127.0.0.1:4318"` | — / `PHOTON_OTLP_HTTP_ENDPOINT` | off | Ship incidents + metrics + lifecycle events to photon as OTLP; fully offline without it. `PHOTON_OTLP_HTTP_ENDPOINT` overrides the TOML value — a full URL or a bare `host:port`, mandor strips the scheme either way. Auth via `PHOTON_OTLP_TOKEN` env. See "photon telemetry" below |
+| `service_prefix = "tenant-a-"` | — / `MANDOR_SERVICE_PREFIX` | `""` | Origin/tenant tag prepended to `service.name` on **every** OTLP emission (metrics, incidents, lifecycle, streamed logs, the digest), so several mandor origins can share one multi-tenant photon without `service.name` colliding. Telemetry-only — the bare worker name is unchanged in the log `[name]` prefix, `report`, and Prometheus labels; `host.id` still distinguishes hosts. Default `""` = unchanged; inert without `photon=` |
 | `on_incident = "CMD"` | — | off | Exec CMD after each bundle write, bundle path appended |
 | `health_interval = "30s"` | — | `30s` | Probe cadence |
 | `health_start_period = "10s"` | — | `10s` | Probe failures ignored this long after spawn (until first success) |
@@ -68,13 +73,15 @@ never touches one. That child ships three things to photon:
   `k10temp`, `zenpower`, `cpu_thermal`, `k8temp` — emitted only when present).
   Host identity comes from `/proc/sys/kernel/hostname` and
   `/etc/machine-id` (falling back to `boot_id`, then the literal `unknown`).
-- **GPU metrics** (opt-in) → OTLP metrics (`/v1/metrics`). With `[gpu] enabled`,
-  the relay daemon shells out to `nvidia-smi` every `[gpu] interval` (default
-  15 s) and emits per-GPU `system.gpu.utilization`, `system.gpu.memory.usage`,
+- **GPU metrics** (auto-detected) → OTLP metrics (`/v1/metrics`). The relay
+  daemon probes for a GPU once at startup (no `[gpu] enabled` toggle — see
+  "GPU metrics" below) and, if one is present, shells out to `nvidia-smi`
+  every `[gpu] interval` (default 15 s) and emits per-GPU
+  `system.gpu.utilization`, `system.gpu.memory.usage`,
   `system.gpu.memory.utilization`, `system.gpu.temperature`, `system.gpu.power`
   (attrs `gpu=<i>`, `gpu.name=<n>`), same host identity as the node metrics.
-  Fail-closed: no `nvidia-smi`, any error, or no GPU ⇒ no GPU points and no
-  effect on supervision or other telemetry. NVIDIA only; no dynamic linking.
+  Fail-closed: no GPU found at the startup probe ⇒ no GPU points, logged once,
+  and no effect on supervision or other telemetry.
 - **Process-lifecycle events** → OTLP logs (`/v1/logs`): `started`, `exited`
   (ok / error / OOM), `restarting` (with backoff), `unhealthy`. Best-effort,
   same pipe.
@@ -88,18 +95,22 @@ never shipped either way. The other telemetry behaviours (metrics on when
 `photon` is set, the 5 s sample cadence, the daemon's internal buffer size) are
 fixed and intentionally not exposed as separate keys — `photon`, the per-worker
 `stream` toggle, plus the small `[logs]` rate cap are the whole telemetry surface,
-keeping to the four-CLI-flag / minimal-key rule. `PHOTON_TOKEN` (env, kept off the process cmdline) sets the
+keeping to the four-CLI-flag / minimal-key rule. `PHOTON_OTLP_TOKEN` (env, kept
+off the process cmdline; the bearer var's name changed in v1.12) sets the
 bearer token when photon requires auth.
 
 ### GPU metrics (the `[gpu]` section)
 
-Off by default. mandor is a static binary, so it collects GPU metrics by shelling
-out to `nvidia-smi` rather than linking NVML. The relay daemon samples on its own
-timer, off the supervision path, and is silent when `nvidia-smi` is absent.
+Auto-detected, not a toggle: the relay daemon probes for a GPU once at
+startup (no re-probe — a GPU appearing later needs a restart) and samples it
+only if present, off the supervision path. mandor is a static binary, so it
+collects GPU metrics by shelling out to `nvidia-smi` rather than linking
+NVML. `[gpu] enabled` was **removed in v1.12** — GPU sampling is on
+automatically when a device is found, and silent (logged once) when it
+isn't. `[gpu]` now has one key:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `enabled` | bool | `false` | Turn on GPU sampling (requires `nvidia-smi` on `PATH`) |
 | `interval` | duration | `15s` | GPU sample cadence |
 
 ### The three-tier log → photon model
@@ -353,9 +364,12 @@ give-up/essential/oneshot worker's code when those trigger, honoring
 
 ## Conventions read from the environment
 
-`MANDOR_RELEASE` / `GIT_SHA` (release id in bundles), `MANDOR_STATE_DIR`,
-`PHOTON_TOKEN` (relay bearer auth). `/dev/termination-log`, when present
-(Kubernetes), receives the latest incident verdict automatically.
+`MANDOR_RELEASE` / `GIT_SHA` (release id in bundles); the four deploy-varying
+config keys — `MANDOR_STATE_DIR`, `PHOTON_OTLP_HTTP_ENDPOINT`,
+`PHOTON_OTLP_TOKEN` (relay bearer auth, renamed in v1.12),
+`MANDOR_SERVICE_PREFIX` — override their TOML equivalents (see "Precedence"
+above). `/dev/termination-log`, when present (Kubernetes), receives the
+latest incident verdict automatically.
 
 Set `MANDOR_RELEASE` (or `GIT_SHA`) at build time to unlock **release
 correlation**: mandor remembers which builds each crash signature appeared on,

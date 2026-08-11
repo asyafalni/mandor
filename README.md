@@ -9,7 +9,7 @@
 
 [![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.16.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Static binary](https://img.shields.io/badge/binary-static%2C%20~348KB-success)
+![Static binary](https://img.shields.io/badge/binary-static%2C%20~358KB-success)
 ![No dependencies](https://img.shields.io/badge/dependencies-zero-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
@@ -42,7 +42,7 @@ $ mandor --max-restarts=3 -- "./api --port 8080" "./worker" "./cron-loop"
 | Release correlation ("did the fix hold?") | ✅ | ❌ | ❌ |
 | OTLP telemetry to an observability backend | ✅ opt-in | ❌ | ❌ |
 | Node + GPU host metrics (node-exporter style) | ✅ opt-in | ❌ | ❌ |
-| Size | **~348 KB** | ~50 KB | MBs + runtime |
+| Size | **~358 KB** | ~50 KB | MBs + runtime |
 | Network access | **off by default** (opt-in OTLP) | never | varies |
 
 The `mandor` binary is **offline by default** and self-contained: no accounts,
@@ -189,7 +189,11 @@ life without opening a single incident file. Always on, no configuration:
 ### Configuration file (optional)
 
 CLI-only always works — `mandor.toml` just saves typing. CLI flags override
-file values; `MANDOR_STATE_DIR` overrides the file's `state_dir`.
+file values. Four deploy-varying keys also read from the environment, which
+overrides the file (`MANDOR_STATE_DIR` for `state_dir`, and as of v1.12
+`PHOTON_OTLP_HTTP_ENDPOINT` for `photon`, `PHOTON_OTLP_TOKEN` for the relay
+bearer token, `MANDOR_SERVICE_PREFIX` for `service_prefix`) — see
+[Config keys](#config-keys). Everything else is TOML/CLI only.
 
 Global settings sit at the top; anything specific to one worker goes in a
 `[worker.NAME]` section, where `NAME` is the basename of its command.
@@ -311,7 +315,9 @@ its whole story to [photon](https://github.com/nevindra/photon) (mandor's
 OTEL-native sister project) as OTLP, **no collector required**. All network I/O
 lives in a single long-lived `mandor relay --daemon` child; the supervision path
 never touches a socket, and telemetry is dropped under backpressure before it can
-ever stall supervision. Auth via the `PHOTON_TOKEN` env var. With `photon` unset,
+ever stall supervision. Auth via the `PHOTON_OTLP_TOKEN` env var. The endpoint
+and token, along with `service_prefix` and `state_dir`, are also settable from
+the environment — see [Config keys](#config-keys) below. With `photon` unset,
 none of this activates.
 
 What it ships when `photon` is set:
@@ -323,8 +329,9 @@ What it ships when `photon` is set:
   per-core CPU, per-mount filesystem, per-interface network, memory, swap, load
   (1/5/15m), disk I/O, uptime, CPU temperature. Every worker and the node share
   one `host.name`, so photon shows each process against the node it runs on.
-- **GPU metrics** (opt-in, `[gpu] enabled`) → NVIDIA via `nvidia-smi`, AMD/Intel
-  via DRM sysfs. Fail-closed when no GPU is present.
+- **GPU metrics** (auto-detected — no `[gpu] enabled` toggle; the relay daemon
+  probes once at startup) → NVIDIA via `nvidia-smi`, AMD/Intel via DRM sysfs.
+  Fail-closed when no GPU is present.
 - **Process-lifecycle events** → OTLP logs (started / exited / restarting /
   unhealthy).
 - **Curated warn/error digest** (on by default when `photon=` is set) → OTLP logs.
@@ -397,6 +404,62 @@ every config key: [docs/CONFIG.md](docs/CONFIG.md).
 
 A local Prometheus text endpoint (`--metrics=PORT`, 127.0.0.1) is a separate,
 always-offline pull option unrelated to the photon push path.
+
+## Config keys
+
+Every key mandor understands, and where you can set it from. Defaults and full
+descriptions live in [docs/CONFIG.md](docs/CONFIG.md); this is the map of
+TOML/CLI/ENV surface. **ENV overrides TOML (CLI > ENV > TOML > default); only
+these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
+
+| Key | TOML | CLI | ENV |
+|---|---|---|---|
+| `workers` | global | positional args | |
+| `backoff_max` | global | — | |
+| `max_restarts` | global | `--max-restarts=` | |
+| `stop_grace` | global | — | |
+| `expected_exit` | global | — | |
+| `state_dir` | global | `--state-dir=` | `MANDOR_STATE_DIR` |
+| `metrics_port` | global | `--metrics=` | |
+| `photon` | global | — | `PHOTON_OTLP_HTTP_ENDPOINT` |
+| (relay bearer token) | — | — | `PHOTON_OTLP_TOKEN` |
+| `service_prefix` | global | — | `MANDOR_SERVICE_PREFIX` |
+| `on_incident` | global | — | |
+| `health_interval` | global | — | |
+| `health_start_period` | global | — | |
+| `ready_fd` | global | — | |
+| `restart_dependents` | global | — | |
+| `env_file` | global | — | |
+| `psi_mem_pct` | global | — | |
+| `psi_cpu_pct` | global | — | |
+| `interval` | `[gpu]` | — | |
+| `digest` | `[logs]` | — | |
+| `digest_interval` | `[logs]` | — | |
+| `digest_threshold` | `[logs]` | — | |
+| `max_rate` | `[logs]` | — | |
+| `stream` | `[worker.NAME]` | — | |
+| `health` | `[worker.NAME]` | also `--health=NAME=CMD`, repeatable | |
+| `start_after` | `[worker.NAME]` | — | |
+| `oneshot` | `[worker.NAME]` | — | |
+| `essential` | `[worker.NAME]` | — | |
+| `env` | `[worker.NAME]` | — | |
+| `cwd` | `[worker.NAME]` | — | |
+| `user` | `[worker.NAME]` | — | |
+| `cap_drop` | `[worker.NAME]` | — | |
+| `oom_score_adj` | `[worker.NAME]` | — | |
+| `nice` | `[worker.NAME]` | — | |
+| `max_rss_mb` | `[worker.NAME]` | — | |
+| `max_lifetime` | `[worker.NAME]` | — | |
+| `expected_exit` | `[worker.NAME]` | — | |
+| `pre_stop` | `[worker.NAME]` | — | |
+| `name` | `[worker.NAME]` | — | |
+| `workers` | `[secret.NAME]` | — | |
+| `bytes` | `[secret.NAME]` | — | |
+| `format` | `[secret.NAME]` | — | |
+| `env` | `[secret.NAME]` | — | |
+
+GPU metrics are auto-detected (no `[gpu] enabled` toggle) — `[gpu]` now holds
+only the sample `interval`.
 
 ## Contributing
 

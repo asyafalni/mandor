@@ -81,12 +81,14 @@ one node:
   `system.cpu.temperature`. Sampled **inside the daemon** (its own /proc + statfs
   reads on a 5s timer) — the supervision path carries none of it. Emitted
   automatically whenever `photon=` is set; there is no separate toggle.
-- **GPU** (opt-in `[gpu] enabled`, daemon-side, default 15s).
+- **GPU** (auto-detected — no `[gpu] enabled` toggle; the daemon probes once at
+  startup, default 15s sample interval).
   `system.gpu.{utilization,memory.usage,memory.utilization,temperature,power}`
   per GPU (`gpu`, `gpu.name`). NVIDIA via an `nvidia-smi` shell-out (mandor is
   static/libc-free, so it cannot dlopen NVML); AMD/Intel via DRM sysfs.
-  Fail-closed — no GPU, no `nvidia-smi`, or any error ⇒ nothing shipped, no
-  effect on anything else.
+  Fail-closed — no GPU found at the startup probe ⇒ nothing shipped (logged
+  once), no effect on anything else, and no re-probe (a GPU appearing later
+  needs a restart).
 
 Config specifics live in [CONFIG.md](CONFIG.md); the whole telemetry surface is
 `photon=` plus the small `[gpu]` / `[logs]` sections.
@@ -208,7 +210,11 @@ child, not one relay per crash, and a bundle that fails to send is retried from
 the durable spool rather than lost. The supervision path never touches a socket,
 and without the key mandor is fully offline. `photon` is a `mandor.toml` key,
 not a CLI flag — the everyday CLI stays at four flags (`--config` loads the
-TOML). Auth: set `PHOTON_TOKEN` in the environment and the relay sends
+TOML). As of v1.12, mandor also reads `PHOTON_OTLP_HTTP_ENDPOINT` from the
+environment — a full URL or a bare `host:port`, scheme-stripped either way —
+which **overrides** a TOML `photon=` value (CLI > ENV > TOML > default; see
+[CONFIG.md](CONFIG.md)). Auth: set `PHOTON_OTLP_TOKEN` (the bearer env var
+was renamed in v1.12) in the environment and the relay sends
 `Authorization: Bearer …`. The generic `on_incident` hook remains for custom
 tooling and the premium sidecar (a separate, per-incident detached process).
 
@@ -279,7 +285,8 @@ OTLP receiver answers with an `ExportLogsServiceResponse` protobuf (an empty
 > ```
 >
 > photon promoted `service.name` to its own column and stored the whole bundle,
-> `PHOTON_TOKEN` redacted in the captured env. Reproduce with
+> `PHOTON_OTLP_TOKEN` redacted in the captured env (the bearer var's name at
+> the time of this run predates its v1.12 rename). Reproduce with
 > `bash test/photon/e2e.sh`.
 >
 > **Two limitations the live run exposed — both fixed in v1.6.2**, and neither

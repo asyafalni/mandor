@@ -3,6 +3,32 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.12.0] - 2026-08-10
+
+ENV config for mandor's four deploy-varying settings, and GPU metrics become
+auto-detected — so an ENV-native deploy configures mandor via `-e` over a
+static TOML.
+
+### Added
+- **ENV config for the four deploy-varying keys, ENV overriding TOML.** mandor
+  now reads `PHOTON_OTLP_HTTP_ENDPOINT` (→ `photon`), `PHOTON_OTLP_TOKEN` (the
+  relay bearer token), `MANDOR_SERVICE_PREFIX` (→ `service_prefix`), and
+  `MANDOR_STATE_DIR` (→ `state_dir`, unchanged) from the environment.
+  Precedence is **CLI > ENV > TOML > default**; everything else stays
+  TOML/CLI-only. See [docs/CONFIG.md](docs/CONFIG.md) and
+  [README.md](README.md#config-keys).
+- **`photon` / `PHOTON_OTLP_HTTP_ENDPOINT` accepts a full URL.** A leading
+  `http://` or `https://` is stripped, so a full endpoint URL and a bare
+  `host:port` both work.
+
+### Changed (breaking)
+- **`PHOTON_TOKEN` renamed to `PHOTON_OTLP_TOKEN`.** Update deploys that set
+  the relay bearer token — the old name is no longer read.
+- **`[gpu] enabled` removed — GPU is auto-detected.** The relay daemon probes
+  once at startup (on when a device is present, off otherwise, logged once);
+  there is no re-probe, so a GPU that appears later needs a restart. `[gpu]`
+  now holds only `interval`.
+
 ## [1.11.1] - 2026-08-10
 
 Hardening pass over the v1.11.0 log-signal-v2 work (a high-effort code review of
