@@ -2,6 +2,7 @@ const std = @import("std");
 const logmod = @import("log.zig");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
+const env = @import("env.zig");
 
 /// Size diet: a panic is a bug (the supervision path never panics by
 /// design), so skip std.debug's DWARF/ELF/decompression stack-trace
@@ -195,8 +196,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
-            if (cfg.photon == null) cfg.photon = file_cfg.photon;
-            if (file_cfg.service_prefix) |v| cfg.service_prefix = v;
             if (file_cfg.gpu_enabled) |v| cfg.gpu.enabled = v;
             if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
             if (file_cfg.logs_max_rate) |v| cfg.logs.max_rate = v;
@@ -273,6 +272,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             writeOut(usage_text);
             return 2;
         }
+    }
+
+    // Deploy-varying keys resolve CLI > ENV > TOML > default (state_dir just below
+    // follows the same shape). ENV overrides a TOML value; the photon value is
+    // scheme-stripped so PHOTON_OTLP_HTTP_ENDPOINT (a full URL) or a bare host:port
+    // both work. cfg.photon has no CLI flag, so it is null here unless already set.
+    cfg.photon = env.resolvePhoton(
+        cfg.photon,
+        spawner.findEnv(environ, "PHOTON_OTLP_HTTP_ENDPOINT"),
+        file_cfg.photon,
+    );
+    cfg.service_prefix = env.resolveServicePrefix(
+        spawner.findEnv(environ, "MANDOR_SERVICE_PREFIX"),
+        file_cfg.service_prefix,
+    );
+    if (cfg.service_prefix.len > cli.max_service_prefix) {
+        logmod.print("[mandor] service_prefix too long (max {d})\n", .{cli.max_service_prefix});
+        return 2;
     }
 
     const state_dir = cfg.state_dir orelse
@@ -434,6 +451,7 @@ test {
     _ = @import("fuzz.zig");
     _ = @import("secret.zig");
     _ = @import("names.zig");
+    _ = @import("env.zig");
     // relay.zig is only @imported inside a subcommand branch, so it never
     // reaches the test graph on its own — which is exactly why it shipped
     // with no coverage. Reference it explicitly.
