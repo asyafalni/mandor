@@ -41,7 +41,9 @@ mandor (PID 1, this repo)
 ├── summarize      heuristic engine (NO LLM): error dedup by signature,
 │                  trace parsing, pattern verdicts ("restart loop", "leak suspect")
 ├── report         `mandor report` → human text or --json (+ --incidents, --cost)
-├── secret         per-session app secrets (CSPRNG) handed to workers over pipe fds
+├── secret         per-session app secrets (CSPRNG) handed to workers over pipe fds;
+│                  granted by name against the ACTIVE worker set (CLI --, else TOML
+│                  workers=), delivered to the present subset, inert if none present
 ├── spool          incident bundles written to /var/lib/mandor/incidents/*.json
 │                  (premium sidecar watches this dir — clean tier boundary)
 └── telemetry      OPT-IN, only when `photon=` set — else this whole path is dead:
@@ -206,6 +208,15 @@ sampling, `gpu.zig`, `resolve.zig` DNS) is inert unless `photon=` is set.
   and **per worker** (`[worker.NAME] stream`). GPU sampling is **auto-detected**
   (the daemon probes once at startup — on when a device is present, off with a
   one-time log otherwise; no toggle). Traces are never shipped.
+- **TOML is a behavior overlay, the CLI is the source of truth.** The active
+  worker set is whatever the CLI `--` args spawn (else the TOML `workers=`); every
+  `[worker.NAME]` section and `[secret.*]` grant is matched to that set *by name*.
+  A section or grant for a worker not spawned this run is ignored (warned), never
+  an error, and **never itself a reason to spawn anything** — one static,
+  never-rewritten TOML can describe a superset of possible workers. The worker
+  command line stays CLI-only (no `command`/`args` key). Secrets resolve against
+  the active set and degrade to the present subset (inert if none); deny-by-default
+  is preserved — a worker only receives a secret it is listed for.
 - Premium (AI-fix) logic lives in the sidecar + relay only. The spool dir JSON
   is the tier boundary the sidecar watches; photon consumes the same contracts
   over OTLP.
