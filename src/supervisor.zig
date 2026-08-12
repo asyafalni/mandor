@@ -230,10 +230,6 @@ pub fn validate(cfg: *const cli.Config) u8 {
         logmod.print("[mandor] config invalid\n", .{});
         return code;
     }
-    if (setup_warnings > 0) {
-        logmod.print("[mandor] config invalid: {d} unknown worker reference(s)\n", .{setup_warnings});
-        return 1;
-    }
     printPlan(cfg, workers, &dep_of);
     return 0;
 }
@@ -289,6 +285,16 @@ fn planLine(w: *const spawner.Worker, note: []const u8) void {
 fn initSecrets(cfg: *const cli.Config, workers: []spawner.Worker) ?u8 {
     secret_count = 0;
     for (cfg.secrets[0..cfg.secrets_n], 0..) |def, si| {
+        if (def.workers_len == 0) {
+            logmod.print("[mandor] secret {s}: no present worker to grant to (ignored)\n", .{def.name});
+            // A later secret in the loop can still bump secret_count past this
+            // index (secret_count = si + 1 is set unconditionally on success),
+            // and wipeSecrets zeroes secret_store[si][0..secret_val_len[si]] for
+            // every si < secret_count — so this skipped slot must have a defined
+            // (zero) length, not leftover/undefined BSS, or shutdown reads garbage.
+            secret_val_len[si] = 0;
+            continue;
+        }
         const val = secret.generate(secret_store[si][0..], def.fmt, def.n) catch {
             logmod.print("[mandor] cannot generate secret {s}\n", .{def.name});
             return 2; // fail-closed: don't start the fleet without it
@@ -1551,4 +1557,21 @@ test "rate limiter: caps lines per second, resets on window roll, unlimited at 0
     var i: usize = 0;
     while (i < 1000) : (i += 1) try testing.expect(rateAllows(3_000));
     try testing.expectEqual(before0, telemetry.rateDrops());
+}
+
+test "validate tolerates an orphan [worker.NAME] section" {
+    // A [worker.NAME] section for a worker not in `commands` is a no-op, not a
+    // failure — a static superset TOML must validate against any CLI subset.
+    var cfg = cli.Config{};
+    var cmds = [_][]const u8{"gateway.sh"};
+    cfg.commands = &cmds;
+    // One name override for a worker that IS spawned, one for an ORPHAN.
+    const name_pairs = [_]cli.HealthSpec{
+        .{ .worker = "gateway.sh", .cmd = "backend" },
+        .{ .worker = "pmtiles.sh", .cmd = "map-svc" }, // orphan — not spawned
+    };
+    cfg.name_pairs = undefined;
+    @memcpy(cfg.name_pairs[0..2], &name_pairs);
+    cfg.name_pairs_n = 2;
+    try testing.expectEqual(@as(u8, 0), validate(&cfg)); // orphan → warn, exit 0
 }
