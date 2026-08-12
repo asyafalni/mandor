@@ -1389,6 +1389,69 @@ else bad "curated digest dedup" \
   "found=[$found] digest_marker_freq=${dfreq:-0} stdout_marker_freq=$sfreq logbody_bytes=$(wc -c < "$TMP/80bodies" 2>/dev/null) paths=[$(sort -u "$TMP/80paths" 2>/dev/null | tr '\n' ' ')]"; fi
 fi
 
+# 81. ENV-only photon config (v1.12): NO `photon=` in the TOML. The endpoint comes
+# from PHOTON_OTLP_HTTP_ENDPOINT as a full URL (to prove the http:// scheme is
+# stripped) and the origin tag from MANDOR_SERVICE_PREFIX. A streamed worker's
+# line must reach the fake /v1/logs listener carrying the PREFIXED service.name —
+# proving env activates telemetry with no TOML key, the scheme is stripped (else
+# parseHostPort would reject "http://…" and mandor would exit 2), and the prefix
+# is read from the environment. Reuses listen_logs.py.
+EMARK="MANDOR_ENV_MARKER_A1B2"
+rm -f "$TMP/81port" "$TMP/81paths" "$TMP/81bodies"
+python3 "$TMP/listen_logs.py" "$TMP/81port" "$TMP/81paths" "$TMP/81bodies" >/dev/null 2>&1 &
+lpid=$!
+for _ in $(seq 1 100); do [ -s "$TMP/81port" ] && break; sleep 0.1; done
+p81=$(cat "$TMP/81port" 2>/dev/null)
+if [ -z "$p81" ]; then
+  bad "env config" "listener never bound (harness setup)"
+  kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
+else
+cat > "$TMP/env81.toml" <<TOML
+workers = ["sh -c 'echo $EMARK; sleep 30'"]
+[worker.sh]
+stream = true
+name = "svc"
+TOML
+PHOTON_OTLP_HTTP_ENDPOINT="http://127.0.0.1:$p81" \
+PHOTON_OTLP_TOKEN=any \
+MANDOR_SERVICE_PREFIX="envpfx-" \
+  "$MANDOR" --config="$TMP/env81.toml" >"$TMP/81out" 2>&1 &
+mpid=$!
+found=""
+for _ in $(seq 1 250); do
+  if grep -qa "$EMARK" "$TMP/81bodies" 2>/dev/null && grep -qa "envpfx-svc" "$TMP/81bodies" 2>/dev/null; then
+    found=1; break
+  fi
+  kill -0 "$mpid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+kill $lpid 2>/dev/null; wait $lpid 2>/dev/null
+# Non-vacuous: the forwarding line shows the SCHEME-STRIPPED host:port (no http://).
+if [ -n "$found" ] && grep -q "photon at 127.0.0.1:$p81" "$TMP/81out" 2>/dev/null; then
+  ok "env config: no TOML photon — PHOTON_OTLP_HTTP_ENDPOINT (scheme-stripped) activates, MANDOR_SERVICE_PREFIX prefixes service.name"
+else bad "env config" \
+  "marker+prefix_in_body=[$found] fwd=[$(grep -o 'photon at [^ ]*' "$TMP/81out" 2>/dev/null | head -1)] bodies=$(wc -c < "$TMP/81bodies" 2>/dev/null)"; fi
+fi
+
+# 82. Empty PHOTON_OTLP_HTTP_ENDPOINT + no TOML photon = OFFLINE. A set-but-empty
+# env var (common from compose `${X:-}`) must NOT activate telemetry: mandor opens
+# no socket and prints no forwarding line. Guards the empty-env regression.
+OMARK="MANDOR_OFFLINE_MARK_Z9"
+cat > "$TMP/env82.toml" <<TOML
+workers = ["sh -c 'echo $OMARK; sleep 2'"]
+TOML
+PHOTON_OTLP_HTTP_ENDPOINT="" PHOTON_OTLP_TOKEN=any \
+  "$MANDOR" --config="$TMP/env82.toml" >"$TMP/82out" 2>&1 &
+mpid=$!
+for _ in $(seq 1 40); do grep -q "$OMARK" "$TMP/82out" 2>/dev/null && break; sleep 0.1; done
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+# Non-vacuous: the worker ran (its marker printed) yet mandor never forwarded.
+if grep -q "$OMARK" "$TMP/82out" 2>/dev/null && ! grep -qi "forwarding incidents to photon" "$TMP/82out" 2>/dev/null; then
+  ok "env config: an empty PHOTON_OTLP_HTTP_ENDPOINT stays offline (no activation)"
+else bad "empty env offline" \
+  "ran=[$(grep -c "$OMARK" "$TMP/82out" 2>/dev/null)] forwarded=[$(grep -c 'forwarding incidents' "$TMP/82out" 2>/dev/null)]"; fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"
