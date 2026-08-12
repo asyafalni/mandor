@@ -3,14 +3,15 @@
 # OTLP (no collector), and a shared volume persists crash history across
 # container restarts. mandor stays offline until `photon` is set. To also report
 # the host + GPU (superseding a standalone node agent), mount /proc, /sys,
-# /etc/machine-id (and /dev/nvidia* for GPU) into `app` and set [gpu] enabled.
+# /etc/machine-id (and /dev/nvidia* for GPU) into `app` — GPU metrics are
+# auto-detected (no toggle: on when a device is present, off otherwise).
 services:
   app:
     build: .            # image ENTRYPOINT: ["/mandor", "--config=/mandor.toml"]
     volumes:
       - mandor-state:/var/lib/mandor
     environment:
-      - PHOTON_TOKEN=${PHOTON_TOKEN}   # relay sends Authorization: Bearer …
+      - PHOTON_OTLP_TOKEN=${PHOTON_OTLP_TOKEN}   # relay sends Authorization: Bearer …
       - MANDOR_RELEASE=app@1.4.2       # groups incidents by deploy
 
   photon:
@@ -24,6 +25,6 @@ volumes:
 #   photon       = "photon:4318"
 #   workers      = ["./api --port 3000", "./worker"]
 #   # service_prefix = "tenant-a-"     # tag service.name per origin (multi-tenant photon)
-#   # [gpu]         enabled = true     # opt-in NVIDIA/AMD/Intel GPU metrics
+#   # GPU metrics auto-detect (NVIDIA/AMD/Intel) when a device + /dev/nvidia* is present
 #   # a curated warn/error digest ships to /v1/logs by default when photon= is set
 #   # [worker.api]  stream  = true     # opt-in FULL per-line streaming for one worker

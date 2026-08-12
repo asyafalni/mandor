@@ -272,12 +272,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
-    // Deploy-varying keys resolve CLI > ENV > TOML > default (state_dir just below
-    // follows the same shape). ENV overrides a TOML value; the photon value is
-    // scheme-stripped so PHOTON_OTLP_HTTP_ENDPOINT (a full URL) or a bare host:port
-    // both work. cfg.photon has no CLI flag, so it is null here unless already set.
+    const state_dir = cfg.state_dir orelse
+        (spawner.findEnv(environ, "MANDOR_STATE_DIR") orelse
+            (file_cfg.state_dir orelse cli.default_state_dir));
+
+    if (cfg.mode == .report) {
+        if (cfg.cost) return runCostReport(state_dir, cfg.json);
+        if (cfg.incidents) return runIncidentList(state_dir, cfg.report_filter, cfg.since_ms, cfg.incident_index);
+        return runReport(state_dir, cfg.json, cfg.report_filter);
+    }
+
+    // Deploy-varying keys resolve ENV > TOML > default (there is no CLI flag for
+    // either). Done here — AFTER the read-only report modes return — so a
+    // report never networks off an env var and its service_prefix length check
+    // can't exit a pure read command. ENV overrides TOML; the photon value is
+    // scheme-stripped so PHOTON_OTLP_HTTP_ENDPOINT (a URL) or a bare host:port
+    // both work. An empty env var is ignored (does not override TOML, does not
+    // activate telemetry) — see env.presentEnv. validate + supervise both run it.
     cfg.photon = env.resolvePhoton(
-        cfg.photon,
         spawner.findEnv(environ, "PHOTON_OTLP_HTTP_ENDPOINT"),
         file_cfg.photon,
     );
@@ -288,16 +300,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (cfg.service_prefix.len > cli.max_service_prefix) {
         logmod.print("[mandor] service_prefix too long (max {d})\n", .{cli.max_service_prefix});
         return 2;
-    }
-
-    const state_dir = cfg.state_dir orelse
-        (spawner.findEnv(environ, "MANDOR_STATE_DIR") orelse
-            (file_cfg.state_dir orelse cli.default_state_dir));
-
-    if (cfg.mode == .report) {
-        if (cfg.cost) return runCostReport(state_dir, cfg.json);
-        if (cfg.incidents) return runIncidentList(state_dir, cfg.report_filter, cfg.since_ms, cfg.incident_index);
-        return runReport(state_dir, cfg.json, cfg.report_filter);
     }
 
     const supervisor = @import("supervisor.zig");

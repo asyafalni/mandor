@@ -16,9 +16,10 @@
   no account, no LLM.**
 - **Premium (separate sidecar binary, later):** ships incident bundles to a
   relay → AI root-cause analysis → optional repo access → auto-fix PR.
-- **mandor OPTIONALLY speaks OTLP.** Off by default: with no `photon=` key the
+- **mandor OPTIONALLY speaks OTLP.** Off by default: with no `photon` configured
+  (neither the `photon=` TOML key nor the `PHOTON_OTLP_HTTP_ENDPOINT` env var) the
   binary opens no socket, spawns no child, and phones nowhere — the
-  offline-by-default guarantee is unchanged. When `photon = "ip:port"` IS set,
+  offline-by-default guarantee is unchanged. When `photon` IS set (either source),
   mandor ships incidents, per-process/supervisor metrics, and process-lifecycle
   events to photon as OTLP. All network I/O lives in a single long-lived
   `mandor relay --daemon` child (it owns the socket, watches the spool, drains a
@@ -48,7 +49,7 @@ mandor (PID 1, this repo)
     ├── relay      the `mandor relay --daemon` child: owns the socket, OTLP
     │              encoders, watches the spool, drains the pipe, retries incidents
     ├── hostmetrics node /proc + statfs sampling (daemon-side, node-monitor mode)
-    └── gpu         NVIDIA (nvidia-smi shell-out) + AMD/Intel (DRM sysfs), opt-in
+    └── gpu         NVIDIA (nvidia-smi shell-out) + AMD/Intel (DRM sysfs), auto-detected
 ```
 
 ### Incident bundle schema (stable contract — sidecar + AI depend on it)
@@ -190,18 +191,21 @@ sampling, `gpu.zig`, `resolve.zig` DNS) is inert unless `photon=` is set.
 
 - Free binary: never requires an account, never embeds an API key, never calls
   an LLM. Its excellence is the funnel for premium.
-- **Offline by default, opt-in telemetry.** With no `photon=` key mandor opens
-  no socket and spawns no relay child — the offline guarantee is absolute. When
-  `photon=` IS set it speaks OTLP to photon, but *only* through the long-lived
-  `mandor relay --daemon` child: the supervision path itself must never touch a
-  socket, and telemetry must never stall or slow supervision (non-blocking pipe,
-  drop-under-backpressure — incidents are the one durable tier). Any new
+- **Offline by default, opt-in telemetry.** With no `photon` configured from any
+  source — neither the `photon=` TOML key nor the `PHOTON_OTLP_HTTP_ENDPOINT`
+  environment variable — mandor opens no socket and spawns no relay child; the
+  offline guarantee is absolute. When `photon` IS configured (either source; an
+  empty env value does not count) it speaks OTLP to photon, but *only* through the
+  long-lived `mandor relay --daemon` child: the supervision path itself must never
+  touch a socket, and telemetry must never stall or slow supervision (non-blocking
+  pipe, drop-under-backpressure — incidents are the one durable tier). Any new
   telemetry follows this shape.
 - **Curate by default.** mandor ships log *content* two curated ways — inside
   incident bundles, and as the default-on warn/error **digest** (deduped by
   signature, low-rate, flood-proof). Full per-line streaming is strictly opt-in
-  and **per worker** (`[worker.NAME] stream`), as is GPU sampling (`[gpu] enabled`).
-  Traces are never shipped.
+  and **per worker** (`[worker.NAME] stream`). GPU sampling is **auto-detected**
+  (the daemon probes once at startup — on when a device is present, off with a
+  one-time log otherwise; no toggle). Traces are never shipped.
 - Premium (AI-fix) logic lives in the sidecar + relay only. The spool dir JSON
   is the tier boundary the sidecar watches; photon consumes the same contracts
   over OTLP.

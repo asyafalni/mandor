@@ -70,8 +70,22 @@ in
 .B mandor report --incidents
 so you can tell whether the last fix held.
 .TP
-.B PHOTON_TOKEN
+.B PHOTON_OTLP_HTTP_ENDPOINT
+photon's OTLP/HTTP ingest endpoint (a URL or bare host:port; the scheme is
+stripped). Setting it forwards telemetry to photon \(em equivalent to, and
+overriding, the
+.B photon
+config key.
+.TP
+.B PHOTON_OTLP_TOKEN
 Bearer token for photon OTLP forwarding.
+.TP
+.B MANDOR_SERVICE_PREFIX
+Origin/tenant tag prepended to
+.B service.name
+on every OTLP emission (overrides the
+.B service_prefix
+config key).
 .SH FILES
 .TP
 .I <state-dir>/state.json
