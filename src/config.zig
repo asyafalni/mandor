@@ -81,13 +81,15 @@ pub const FileConfig = struct {
     prestop_pairs: [16]cli.HealthSpec = undefined,
     prestop_pairs_n: u8 = 0,
     commands: []const []const u8 = &.{},
-    /// `[secret.NAME]` sections. `name`/`env`/`fmt`/`n` and the resolved worker
-    /// indices are filled here and copied into cli.Config verbatim.
+    /// `[secret.NAME]` sections. `name`/`env`/`fmt`/`n` are filled here and
+    /// copied into cli.Config verbatim; `workers`/`workers_len` stay as the
+    /// parsed (unresolved) ref count until `resolveSecretGrants` runs post-merge.
     secrets: [cli.max_secrets]cli.SecretDef = undefined,
     secrets_n: usize = 0,
-    /// Per-secret worker-name refs (slices into `text`), collected during
-    /// parse and resolved to indices in `resolveSecrets` at the end. Transient:
-    /// never copied into cli.Config, so `secrets[*].workers` holds indices only.
+    /// Per-secret worker-name refs (slices into `text`), collected during parse
+    /// and resolved to indices by `resolveSecretGrants`, called by the caller
+    /// after the final worker set (CLI or TOML) is known. Transient: never
+    /// copied into cli.Config, so `secrets[*].workers` holds indices only.
     secret_refs: [cli.max_secrets][cli.max_secret_workers][]const u8 = undefined,
 };
 
@@ -302,7 +304,7 @@ pub fn parse(
     }
     if (target != .none) return error.Syntax;
     cfg.commands = cmd_storage[0..ncmd];
-    try resolveSecrets(cfg);
+    try checkSecretEnvs(cfg);
 }
 
 /// Keys valid inside a `[worker.NAME]` section.
@@ -515,38 +517,48 @@ fn deriveEnv(idx: usize, name: []const u8) ParseError![]const u8 {
     return env_store[idx][0..w];
 }
 
-/// End-of-parse pass: resolve each secret's worker-name refs to indices, reject
-/// an empty grant or an unknown worker, and reject two secrets sharing an env
-/// var. Every failure is a hard error — a mis-grant must stop startup, never be
-/// applied silently (deny-by-default is only safe if the grant is exact).
-fn resolveSecrets(cfg: *FileConfig) ParseError!void {
-    if (cfg.secrets_n == 0) return;
-
-    // Worker display names, derived once through the SAME names.finalize the
-    // spawner uses, so a grant keys on the same pre-override name that
-    // start_after and the other name refs resolve against.
-    var name_bufs: [cli.max_workers][names.cap]u8 = undefined;
-    var derived: [cli.max_workers][]const u8 = undefined;
-    for (cfg.commands, 0..) |cmd, i| derived[i] = deriveOne(cmd, name_bufs[i][0..], derived[0..i]);
-    const resolved = derived[0..cfg.commands.len];
-
-    var si: usize = 0;
-    while (si < cfg.secrets_n) : (si += 1) {
-        const sec = &cfg.secrets[si];
-        if (sec.workers_len == 0) return error.BadValue; // empty workers
-        var k: usize = 0;
-        while (k < sec.workers_len) : (k += 1) {
-            sec.workers[k] = matchWorker(resolved, cfg.secret_refs[si][k]) orelse
-                return error.BadValue; // unknown worker in `workers`
-        }
-    }
-    // Env collisions: derived or overridden, two secrets must not share an env.
+/// Parse-time secret check that needs NO worker set: two secrets must not resolve
+/// to the same env var name (both would write CONFD_X — a clobber). Worker-name
+/// resolution is deferred to `resolveSecretGrants` (run after the CLI/TOML worker
+/// set is final), so an unknown or absent worker is NOT an error here.
+fn checkSecretEnvs(cfg: *FileConfig) ParseError!void {
     var a: usize = 0;
     while (a < cfg.secrets_n) : (a += 1) {
         var b: usize = a + 1;
         while (b < cfg.secrets_n) : (b += 1) {
             if (std.mem.eql(u8, cfg.secrets[a].env, cfg.secrets[b].env)) return error.BadValue;
         }
+    }
+}
+
+/// Resolve each secret's worker-name refs to indices in `commands` — the FINAL,
+/// post-merge worker set (CLI `--` args, or TOML `workers=`). Keeps only the
+/// workers PRESENT in the set: an absent listed worker is skipped; a grant with
+/// no present workers (or an empty list) resolves to zero recipients (inert) —
+/// never an error. Deny-by-default: only present, listed workers receive a
+/// secret. `refs[si][k]` is the k-th worker name of secret si (parsed, unresolved);
+/// `secrets[si].workers_len` on entry is the parsed ref count, on exit the present
+/// count. Pure — no alloc beyond the fixed name buffers, no error, no panic.
+pub fn resolveSecretGrants(
+    secrets: []cli.SecretDef,
+    refs: []const [cli.max_secret_workers][]const u8,
+    commands: []const []const u8,
+) void {
+    if (secrets.len == 0) return;
+    var name_bufs: [cli.max_workers][names.cap]u8 = undefined;
+    var derived: [cli.max_workers][]const u8 = undefined;
+    for (commands, 0..) |cmd, i| derived[i] = deriveOne(cmd, name_bufs[i][0..], derived[0..i]);
+    const resolved = derived[0..commands.len];
+    for (secrets, 0..) |*sec, si| {
+        var present: usize = 0;
+        var k: usize = 0;
+        while (k < sec.workers_len) : (k += 1) {
+            if (matchWorker(resolved, refs[si][k])) |idx| {
+                sec.workers[present] = idx;
+                present += 1;
+            } // absent → skip (deny-by-default; inert if none remain)
+        }
+        sec.workers_len = present; // present count (0 = inert)
     }
 }
 
@@ -885,7 +897,8 @@ test "secret section: defaults and worker index resolution" {
         \\[secret.integration]
         \\workers = ["gateway", "proxy"]
     ;
-    const cfg = try parseTest(text, &storage);
+    var cfg = try parseTest(text, &storage);
+    resolveSecretGrants(cfg.secrets[0..cfg.secrets_n], cfg.secret_refs[0..cfg.secrets_n], cfg.commands);
     try t.expectEqual(@as(usize, 1), cfg.secrets_n);
     const s = cfg.secrets[0];
     try t.expectEqualStrings("integration", s.name);
@@ -941,7 +954,8 @@ test "secret section: multiline workers array resolves" {
         \\  "proxy",
         \\]
     ;
-    const cfg = try parseTest(text, &storage);
+    var cfg = try parseTest(text, &storage);
+    resolveSecretGrants(cfg.secrets[0..cfg.secrets_n], cfg.secret_refs[0..cfg.secrets_n], cfg.commands);
     try t.expectEqual(@as(usize, 2), cfg.secrets[0].workers_len);
     try t.expectEqual(@as(u8, 0), cfg.secrets[0].workers[0]);
     try t.expectEqual(@as(u8, 1), cfg.secrets[0].workers[1]);
@@ -958,7 +972,8 @@ test "secret section: two secrets are independent" {
         \\[secret.cron-token]
         \\workers = ["cron"]
     ;
-    const cfg = try parseTest(text, &storage);
+    var cfg = try parseTest(text, &storage);
+    resolveSecretGrants(cfg.secrets[0..cfg.secrets_n], cfg.secret_refs[0..cfg.secrets_n], cfg.commands);
     try t.expectEqual(@as(usize, 2), cfg.secrets_n);
     try t.expectEqualStrings("CONFD_INTEGRATION", cfg.secrets[0].env);
     try t.expectEqualStrings("CONFD_CRON_TOKEN", cfg.secrets[1].env);
@@ -968,10 +983,6 @@ test "secret section: two secrets are independent" {
 test "secret section: every rejection is a hard error" {
     var storage: [cli.max_workers][]const u8 = undefined;
     const W = "workers = [\"gateway\"]\n";
-    // unknown worker in `workers`
-    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"nope\"]", &storage));
-    // empty `workers`
-    try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = []", &storage));
     // bytes == 0 and bytes > 4096
     try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"gateway\"]\nbytes = 0", &storage));
     try t.expectError(error.BadValue, parseTest(W ++ "[secret.s]\nworkers = [\"gateway\"]\nbytes = 4097", &storage));
@@ -1117,4 +1128,51 @@ test "secret section: bare (non-derived) collision between two default envs" {
         \\env = "CONFD_FOO_BAR"
     ;
     try t.expectError(error.BadValue, parseTest(text, &storage));
+}
+
+test "resolveSecretGrants: grant to the present subset, skip absent" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // Parse succeeds even though `pmtiles.sh` is not in this TOML's workers.
+    const text =
+        \\workers = ["gateway.sh", "proxy.sh"]
+        \\
+        \\[secret.integration-lock]
+        \\workers = ["gateway.sh", "pmtiles.sh"]
+    ;
+    var fc = try parseTest(text, &storage);
+    // The active set spawns gateway.sh + proxy.sh (no pmtiles.sh).
+    const cmds = [_][]const u8{ "gateway.sh", "proxy.sh" };
+    resolveSecretGrants(fc.secrets[0..fc.secrets_n], fc.secret_refs[0..fc.secrets_n], &cmds);
+    // Only the present worker (gateway.sh = index 0) is granted; pmtiles.sh skipped.
+    try t.expectEqual(@as(usize, 1), fc.secrets[0].workers_len);
+    try t.expectEqual(@as(u8, 0), fc.secrets[0].workers[0]);
+}
+
+test "resolveSecretGrants: all-absent (and empty) grants are inert, not errors" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const text =
+        \\workers = ["gateway.sh"]
+        \\
+        \\[secret.s]
+        \\workers = ["nope.sh"]
+    ;
+    var fc = try parseTest(text, &storage); // parse must NOT error on the absent ref
+    const cmds = [_][]const u8{"gateway.sh"};
+    resolveSecretGrants(fc.secrets[0..fc.secrets_n], fc.secret_refs[0..fc.secrets_n], &cmds);
+    try t.expectEqual(@as(usize, 0), fc.secrets[0].workers_len); // inert (no recipients)
+}
+
+test "resolveSecretGrants resolves against CLI-only workers (no TOML workers=)" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // No `workers =` key at all — the set comes from the CLI at runtime.
+    const text =
+        \\[secret.integration-lock]
+        \\workers = ["gateway.sh", "proxy.sh"]
+    ;
+    var fc = try parseTest(text, &storage); // must parse (Gap 2 fixed)
+    const cmds = [_][]const u8{ "gateway.sh", "proxy.sh", "pmtiles.sh" };
+    resolveSecretGrants(fc.secrets[0..fc.secrets_n], fc.secret_refs[0..fc.secrets_n], &cmds);
+    try t.expectEqual(@as(usize, 2), fc.secrets[0].workers_len);
+    try t.expectEqual(@as(u8, 0), fc.secrets[0].workers[0]); // gateway.sh
+    try t.expectEqual(@as(u8, 1), fc.secrets[0].workers[1]); // proxy.sh
 }
