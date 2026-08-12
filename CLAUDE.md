@@ -94,15 +94,20 @@ forever). New work follows the same discipline — compile early, size-gate, shi
 4. **v0.4 — polish.** ✅ cgroup v2 OOM detection, optional Prometheus text
    endpoint (hand-rolled, one route), mandor.toml config (CLI-only must
    always work — zero-config is a feature).
-5. **Telemetry milestones (post-1.0, all SHIPPED through v1.11.0).** ✅ OPT-IN
+5. **Telemetry milestones (post-1.0, all SHIPPED).** ✅ OPT-IN
    OTLP telemetry via the `mandor relay --daemon` child (incidents, per-process
-   + supervisor metrics, node/host metrics, opt-in GPU metrics, lifecycle
+   + supervisor metrics, node/host metrics, auto-detected GPU metrics, lifecycle
    events); ✅ log-signal v2 (v1.11.0) — a curated warn/error **digest**
    (default-on when `photon=`, dedup-by-signature, flood-proof, `[logs] digest`),
    **per-worker** full streaming (`[worker.NAME] stream`, replacing the old global
    toggle) with automatic backpressure shedding, and `service_prefix` for
    multi-tenant photon; ✅ app-shared secret store (`[secret.NAME]`).
    Offline-by-default is unchanged — none of this activates without `photon=`.
+   Since then: ✅ v1.12.0 — the four deploy-varying keys read from ENV
+   (`PHOTON_OTLP_HTTP_ENDPOINT`, `PHOTON_OTLP_TOKEN`, `MANDOR_SERVICE_PREFIX`,
+   `MANDOR_STATE_DIR`; ENV overrides TOML) and GPU became auto-detected; ✅
+   v1.13.0 — the TOML is a name-keyed behavior overlay over the CLI-chosen worker
+   set (orphan sections tolerated, secrets degrade to the present subset).
 6. **v1.x — premium sidecar** (separate repo/binary, possibly Rust for rustls):
    watches spool dir, POSTs to relay, license check. NOT in this binary.
 

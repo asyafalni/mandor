@@ -186,7 +186,7 @@ instruments zero PCs with it off), which is why the harness is in-repo.
 ## Ground rules
 
 - **Size is a feature.** The stripped ReleaseSafe binary must stay under
-  500 KB (CI gates it, per-commit); it currently sits near ~348 KB (the opt-in
+  500 KB (CI gates it, per-commit); it currently sits near ~359 KB (the opt-in
   telemetry / node + GPU metrics subsystem is most of the growth since 1.6). A
   new dependency or a large `std` pull-in needs a very good story.
 - **PID 1 must not die.** No panics on the supervision path; every syscall

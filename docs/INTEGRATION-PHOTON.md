@@ -240,11 +240,12 @@ parser doing the answer walk and name decompression. `search` domains from
 suffix will not be found.
 
 Delivery is bounded and any 2xx counts as accepted. Every blocking socket call
-times out after 10s: the relay is spawned fire-and-forget and never waited on,
-so a collector that accepts the connection and then stalls would otherwise
-strand one process per incident — and incidents fire per restart, so a crash
-loop would strand one per crash. A timeout says so explicitly rather than
-reporting a rejection. `202 Accepted` is treated as success, not failure.
+inside the relay daemon times out after 10s: the daemon is the single
+long-lived owner of the socket, so a collector that accepts the connection and
+then stalls would otherwise hang it indefinitely — stalling delivery for every
+incident, metric, and lifecycle event queued behind it. A timeout says so
+explicitly rather than reporting a rejection. `202 Accepted` is treated as
+success, not failure.
 
 **Point `photon =` at the OTLP ingest port (e.g. `:4318`), not photon's web
 UI.** photon's UI serves a single-page app whose catch-all answers `200 OK` with
@@ -305,11 +306,11 @@ OTLP receiver answers with an `ExportLogsServiceResponse` protobuf (an empty
 >    to 2s for in-flight forwards and says so if any are still running.
 
 **Historical note (2026-07-18 → 2026-07-22):** the original recon framed this
-as a photon-side gap and specced an afternoon of Rust to add OTLP/JSON ingest
-([docs/photon-contrib/otlp-json-ingest-spec.md](photon-contrib/otlp-json-ingest-spec.md)).
-That spec is still valid and still worth doing — the OTLP spec does require
-servers to accept JSON — but it is no longer a prerequisite for this
-integration, and mandor no longer waits on it.
+as a photon-side gap and specced an afternoon of Rust to add OTLP/JSON ingest to
+photon. That approach was dropped: in v1.6.0 the relay switched to sending OTLP
+**protobuf** (`application/x-protobuf`), which photon already decodes — so mandor
+became the spec-compliant side and photon needs no change to ingest it. (The
+recon lives in git history if the JSON path is ever wanted for its own sake.)
 
 **Proposed OTLP mapping** (for the shim / photon-side importer):
 

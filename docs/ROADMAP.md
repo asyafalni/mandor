@@ -407,6 +407,8 @@ with no `photon=` key none of it activates. Full contract in
 | 51 ✅ | Absorb photon-agent: fine-grained node + GPU metrics | ● ● ● ● | v1.9.0 — per-core CPU, per-mount fs, per-interface net, swap, disk.io, uptime, load 1/5/15m, cpu temp; GPU via `nvidia-smi` (NVIDIA) + DRM sysfs (AMD/Intel), opt-in `[gpu]`. Node sampling moved into the daemon. One mandor with host `/proc`,`/sys` mounted supersedes a standalone node agent |
 | 52 ✅ | Opt-in full log streaming (`[logs] stream`) | ● ● ○ ○ | v1.10.0 — every worker line → OTLP `/v1/logs`, ephemeral/best-effort (dropped under backpressure, `[logs] max_rate` cap), never spooled. Default off: mandor curates (log content otherwise travels only inside incident bundles) unless explicitly asked |
 | 53 ✅ | Log signal v2 — curated digest + per-worker streaming + multi-tenancy | ● ● ● ○ | v1.11.0 — three tiers of log → photon. **Tier 2 curated warn/error digest** (default-on when `photon=`): warn/error lines deduped by signature into a bounded table, shipped as OTLP `/v1/logs` (one record per signature, `mandor.count`/`first_ts`/`last_ts`) every `digest_interval` + threshold early-flush + at shutdown — flood-proof, surfaces log trouble with no crash. Streaming (#52) is now **per worker** (`[worker.NAME] stream`, replacing the global toggle) with automatic backpressure shedding. `service_prefix` tags `service.name` per origin for multi-tenant photon. Relay warns on a 2xx-HTML reply (web-UI port mistaken for OTLP ingest) |
+| 54 ✅ | ENV config for deploy-varying keys + GPU auto-detect | ● ● ● ○ | v1.12.0/1.12.1 — the four deploy-varying keys read from the environment (`PHOTON_OTLP_HTTP_ENDPOINT`, `PHOTON_OTLP_TOKEN` [renamed from `PHOTON_TOKEN`], `MANDOR_SERVICE_PREFIX`, `MANDOR_STATE_DIR`); **ENV overrides TOML** (CLI > ENV > TOML > default), so an ENV-native deploy configures mandor with `-e` and no generated TOML. GPU became **auto-detected** — `[gpu] enabled` removed; the daemon probes once (DRM sysfs first, `nvidia-smi` only if on PATH, so a GPU-less image forks nothing) and stops checking when absent |
+| 55 ✅ | TOML as a name-keyed behavior overlay over the CLI worker set | ● ● ● ○ | v1.13.0 — the active worker set is the CLI `--` args (else TOML `workers=`); `[worker.NAME]` sections and `[secret.*]` grants are matched to it **by name**. An orphan section/grant for a worker not spawned this run is a tolerated warning (never an error, never spawns anything), so one static superset TOML validates and runs against any CLI subset. Secrets degrade to the present listed subset (inert if none, no hard error); the CLI-workers+secrets refusal is removed. Worker command line stays CLI-only |
 
 ## Backlog status
 
@@ -420,9 +422,14 @@ v0.20). The original feature backlog is empty.
 rounds: opt-in OTLP self-sufficiency, node + GPU host metrics (absorbing the
 role of a standalone node agent), an app-shared secret store, per-worker log
 streaming, and the log-signal-v2 curated warn/error digest with `service_prefix`
-multi-tenancy — all shipped through v1.11.0, all gated by `photon=` (with it
-unset nothing opens a socket). That closes the observability story; no feature
-backlog remains beyond the non-feature work noted at the end.
+multi-tenancy — the telemetry cluster, all gated by `photon=` (with it unset
+nothing opens a socket). Two deploy-ergonomics releases followed on the same
+arc: **v1.12.0** made the four deploy-varying keys ENV-settable (ENV overrides
+TOML) and GPU metrics auto-detected, and **v1.13.0** made the TOML a name-keyed
+behavior overlay over the CLI-chosen worker set (orphan sections tolerated,
+secrets degrade gracefully) so one static superset config serves every deploy.
+That closes the observability story; no feature backlog remains beyond the
+non-feature work noted at the end.
 
 **v1.0 fuzz-hardening: done (v1.0.0).** `src/fuzz.zig` mutation-fuzzes the
 whole untrusted-input surface — the six trace parsers, the worker ELF header,

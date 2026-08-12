@@ -9,7 +9,7 @@
 
 [![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.16.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Static binary](https://img.shields.io/badge/binary-static%2C%20~358KB-success)
+![Static binary](https://img.shields.io/badge/binary-static%2C%20~359KB-success)
 ![No dependencies](https://img.shields.io/badge/dependencies-zero-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
@@ -42,7 +42,7 @@ $ mandor --max-restarts=3 -- "./api --port 8080" "./worker" "./cron-loop"
 | Release correlation ("did the fix hold?") | ✅ | ❌ | ❌ |
 | OTLP telemetry to an observability backend | ✅ opt-in | ❌ | ❌ |
 | Node + GPU host metrics (node-exporter style) | ✅ opt-in | ❌ | ❌ |
-| Size | **~358 KB** | ~50 KB | MBs + runtime |
+| Size | **~359 KB** | ~50 KB | MBs + runtime |
 | Network access | **off by default** (opt-in OTLP) | never | varies |
 
 The `mandor` binary is **offline by default** and self-contained: no accounts,
@@ -96,6 +96,9 @@ mandor --max-restarts=3 -- "./api" "./worker"
 mandor report            # live worker status
 mandor report --incidents  # crash history with diagnosis verdicts
 mandor report --cost     # per-worker resource cost + right-sizing suggestions
+
+# check a config against the workers this run would spawn, without running
+mandor validate --config=mandor.toml -- "./api" "./worker"
 ```
 
 ### Flags
@@ -197,6 +200,15 @@ bearer token, `MANDOR_SERVICE_PREFIX` for `service_prefix`) — see
 
 Global settings sit at the top; anything specific to one worker goes in a
 `[worker.NAME]` section, where `NAME` is the basename of its command.
+
+The TOML is a **behavior overlay, not the worker list.** The active worker set
+is whatever the CLI `--` args spawn (or, if the CLI gives none, the TOML
+`workers=`); every `[worker.NAME]` section and `[secret.*]` grant is matched to
+that set **by name**. A section for a worker not spawned this run is ignored (a
+one-line warning), never an error, and never itself spawns anything — so one
+static `mandor.toml` can describe a *superset* of every worker your deploys
+might run, and each container start picks its subset (with per-deploy params) on
+the CLI. `mandor validate -- <cmds>` validates against exactly those workers.
 
 ```toml
 max_restarts = 3
@@ -460,6 +472,27 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 
 GPU metrics are auto-detected (no `[gpu] enabled` toggle) — `[gpu]` now holds
 only the sample `interval`.
+
+### App-shared secrets (`[secret.NAME]`)
+
+A `[secret.NAME]` section mints a per-session random secret at boot and hands it
+only to the workers you list, over an inherited pipe fd — the env var
+(`CONFD_<NAME>`, or an `env=` override) holds the **fd number**, never the value,
+so the secret never touches argv, `/proc`, or disk.
+
+```toml
+[secret.integration]
+workers = ["gateway", "proxy"]   # both receive the SAME per-session value
+format  = "b64url"
+bytes   = 32
+```
+
+Like every overlay, a grant resolves against the active worker set: a listed
+worker not spawned this run is skipped, and a grant with no present recipient
+(including an explicit `workers = []`) is **inert, not an error**. Deny-by-default
+holds — a worker only ever receives a secret it is explicitly listed for — and
+the only hard error is two secrets resolving to the same env var name. Full
+details in [docs/CONFIG.md](docs/CONFIG.md).
 
 ## Contributing
 
