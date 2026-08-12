@@ -1575,3 +1575,16 @@ test "validate tolerates an orphan [worker.NAME] section" {
     cfg.name_pairs_n = 2;
     try testing.expectEqual(@as(u8, 0), validate(&cfg)); // orphan → warn, exit 0
 }
+
+test "validate still fails on a real error (self-dependency)" {
+    // Removing the orphan hard-fail must NOT swallow genuine errors: a
+    // start_after pair naming its own worker is a bad pair (return 2), so
+    // validate must report non-zero — a superset TOML is tolerant, not blind.
+    var cfg = cli.Config{};
+    var cmds = [_][]const u8{"api.sh"};
+    cfg.commands = &cmds;
+    cfg.start_after = undefined;
+    cfg.start_after[0] = .{ .worker = "api.sh", .cmd = "api.sh" }; // depends on itself
+    cfg.start_after_n = 1;
+    try testing.expect(validate(&cfg) != 0);
+}

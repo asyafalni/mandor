@@ -1150,16 +1150,24 @@ test "resolveSecretGrants: grant to the present subset, skip absent" {
 
 test "resolveSecretGrants: all-absent (and empty) grants are inert, not errors" {
     var storage: [cli.max_workers][]const u8 = undefined;
+    // `s_absent` names a worker that isn't present; `s_empty` is an explicit
+    // `workers = []` — both must parse (no BadValue) and resolve to zero
+    // recipients, exercising both halves of the test's name.
     const text =
         \\workers = ["gateway.sh"]
         \\
-        \\[secret.s]
+        \\[secret.s-absent]
         \\workers = ["nope.sh"]
+        \\
+        \\[secret.s-empty]
+        \\workers = []
     ;
-    var fc = try parseTest(text, &storage); // parse must NOT error on the absent ref
+    var fc = try parseTest(text, &storage); // parse must NOT error on either grant
+    try t.expectEqual(@as(usize, 2), fc.secrets_n);
     const cmds = [_][]const u8{"gateway.sh"};
     resolveSecretGrants(fc.secrets[0..fc.secrets_n], fc.secret_refs[0..fc.secrets_n], &cmds);
-    try t.expectEqual(@as(usize, 0), fc.secrets[0].workers_len); // inert (no recipients)
+    try t.expectEqual(@as(usize, 0), fc.secrets[0].workers_len); // absent ref → inert
+    try t.expectEqual(@as(usize, 0), fc.secrets[1].workers_len); // workers = [] → inert
 }
 
 test "resolveSecretGrants resolves against CLI-only workers (no TOML workers=)" {
