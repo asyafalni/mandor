@@ -238,17 +238,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.name_pairs_n = file_cfg.name_pairs_n;
             cfg.secrets = file_cfg.secrets;
             cfg.secrets_n = file_cfg.secrets_n;
-            // [secret.*] grants are resolved (in config.parse) against the
-            // config file's own worker list. CLI-supplied workers override that
-            // list, which would leave the resolved grant indices pointing at
-            // the wrong process — a silent mis-grant in a deny-by-default
-            // feature. Refuse the mix: secrets are TOML-only, so define the
-            // workers there too.
-            if (cfg.secrets_n > 0 and cfg.commands.len > 0) {
-                logmod.print("[mandor] [secret.*] requires workers defined in the config file, not on the CLI\n", .{});
-                return 2;
-            }
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
+            // Resolve [secret.*] grants against the FINAL worker set (CLI args, or
+            // TOML workers=). By name, post-merge — so a grant naming a CLI-only
+            // worker resolves correctly (no stale indices) and an absent worker is
+            // just skipped. This runs for both `run` and `validate`.
+            config.resolveSecretGrants(cfg.secrets[0..cfg.secrets_n], file_cfg.secret_refs[0..cfg.secrets_n], cfg.commands);
         }
         if (cfg.env_file) |path| {
             const ef_text = readSmallFile(path, &envfile_buf) orelse {

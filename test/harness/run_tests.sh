@@ -1452,6 +1452,50 @@ if grep -q "$OMARK" "$TMP/82out" 2>/dev/null && ! grep -qi "forwarding incidents
 else bad "empty env offline" \
   "ran=[$(grep -c "$OMARK" "$TMP/82out" 2>/dev/null)] forwarded=[$(grep -c 'forwarding incidents' "$TMP/82out" 2>/dev/null)]"; fi
 
+# 83. TOML behavior-overlay over the CLI worker set (v1.13). A STATIC superset TOML
+# declares [worker.*] name/stream + a [secret.*] grant for workers a AND b, plus an
+# orphan [worker."b"] for a worker NOT spawned this run. The CLI spawns only `a`.
+# mandor must: validate 0, apply a's overlay, grant the secret to a (present) and
+# NOT b (absent), and treat the orphan [worker."b"] as a warning, not a failure.
+cat > "$TMP/overlay.toml" <<'TOML'
+[worker."a.sh"]
+name = "svc-a"
+stream = true
+
+[worker."b.sh"]
+name = "svc-b"
+
+[secret.lock]
+workers = ["a.sh", "b.sh"]
+bytes = 16
+format = "b64url"
+TOML
+# a.sh is spawned DIRECTLY (argv0 basename = "a.sh") so its derived worker name
+# matches the [worker."a.sh"] / [secret.lock] keys — an interpreter prefix like
+# `sh a.sh` would name the worker "sh" and match nothing. It prints its granted
+# secret env (CONFD_LOCK) so we can prove it received it.
+cat > "$TMP/a.sh" <<'SH'
+#!/bin/sh
+echo "A_SECRET=[${CONFD_LOCK:-MISSING}]"
+sleep 30
+SH
+chmod +x "$TMP/a.sh"
+# validate against a CLI subset (only a.sh) — must pass despite the orphan b.sh section.
+if "$MANDOR" validate --config="$TMP/overlay.toml" -- "$TMP/a.sh" >/dev/null 2>&1; then
+  vok=1
+else vok=""; fi
+"$MANDOR" --config="$TMP/overlay.toml" --state-dir="$TMP/ov_state" -- "$TMP/a.sh" >"$TMP/83out" 2>&1 &
+mpid=$!
+for _ in $(seq 1 60); do grep -q 'A_SECRET=' "$TMP/83out" 2>/dev/null && break; sleep 0.1; done
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+# a.sh got a non-empty secret; validate passed; the orphan b.sh section didn't fail the run.
+if [ -n "$vok" ] \
+   && grep -q 'A_SECRET=\[..*\]' "$TMP/83out" 2>/dev/null \
+   && ! grep -q 'A_SECRET=\[MISSING\]' "$TMP/83out" 2>/dev/null; then
+  ok "overlay: static superset TOML applies to the CLI subset; secret reaches the present worker only; orphan section ignored"
+else bad "toml overlay" \
+  "validate_ok=[$vok] secret_line=[$(grep -o 'A_SECRET=\[[^]]*\]' "$TMP/83out" 2>/dev/null | head -1)]"; fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

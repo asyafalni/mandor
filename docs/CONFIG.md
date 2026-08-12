@@ -207,11 +207,38 @@ same binary still supervises its workers.
 ## Per-worker keys — `[worker.NAME]` sections
 
 Anything specific to one worker lives in a `[worker.NAME]` section, where
-`NAME` is the worker's derived name (see above). Unknown sections and unknown
-keys inside a section are hard errors — configs are small, so a typo should
-stop startup rather than be silently ignored. A name containing a dot can be
+`NAME` is the worker's derived name (see above). An unknown *key* inside a
+section is a hard error, and a bad *value* stops startup — configs are small, so
+those typos should fail loudly rather than be silently ignored. A section whose
+`NAME` matches no worker in the active set is **not** an error, though — it is a
+name-keyed overlay for a worker that simply wasn't spawned this run (a one-line
+warning, see "Workers: CLI vs config" below). A name containing a dot can be
 quoted so it reads naturally: `[worker."start.sh"]`. Use the `name` key inside a
 section to override that derived name everywhere it surfaces.
+
+### Workers: CLI vs config
+
+**The active worker set is whatever the CLI spawns** — the `--` command lines —
+or, when the CLI gives none, the TOML `workers = [...]` (the CLI set wins when
+both are present). Everything else in the TOML — every `[worker.NAME]` section
+and every `[secret.*]` grant — is a **name-keyed overlay** applied to whichever
+of those workers actually launched:
+
+- **spawned worker ∩ has a section** → the section's `name` / `stream` / etc. apply.
+- **section for a worker not spawned this run** → ignored (a one-line warning), never an error. *The TOML never spawns anything.*
+- **spawned worker with no section** → runs on defaults (basename as name, no stream).
+
+The command line is **CLI-only** — there is no `command`/`args` TOML key. This
+lets one *static, never-rewritten* `mandor.toml` describe a **superset** of
+every worker a deployment might run, while each container start selects its
+subset (with per-deploy params) on the CLI:
+
+```bash
+mandor --config=/etc/mandor.toml -- ./gateway ./proxy [./pmtiles] [./visionaire-hub]
+```
+
+`mandor validate --config=X -- <cmds>` validates the overlay against exactly
+`<cmds>`, so the same static TOML validates cleanly against any CLI subset.
 
 ```toml
 workers = ["./migrate", "./api --port 8080", "./worker", "./metrics-shipper"]
@@ -264,8 +291,14 @@ mandor can mint a per-session secret at boot and hand it only to the workers you
 name, over a private inherited pipe fd — never in any process's environment
 value, argv, or on disk. This replaces the "generate a value and drop it on a
 shared file" pattern. `[secret.*]` is **TOML-only** (the everyday CLI stays at
-four flags), and it requires workers **defined in the config file** — a secret
-grants to workers by name, so those workers must exist in `workers = [...]`.
+four flags). A grant is name-keyed like every other overlay (see "Workers: CLI
+vs config"): it resolves against the **active worker set** — the CLI `--` args,
+else `workers = [...]` — and delivers to the *present* listed subset. A listed
+worker that wasn't spawned this run is simply not granted; a grant with no
+present recipient is **inert** (minted for nobody, a one-line warning), never an
+error. So a static superset TOML can grant to workers that only some deployments
+launch. Deny-by-default holds exactly: a worker only ever receives a secret it
+is explicitly listed for.
 
 ```toml
 workers = ["./gateway", "./proxy", "./cron"]
@@ -282,7 +315,7 @@ env     = "APP_OTP_FD"           # blend in with your own config vars
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `workers` | string list | — (**required**) | Which workers receive this secret. Every name must be a defined worker; an empty list is an error |
+| `workers` | string list | — (**required**) | Which workers receive this secret, by name. Names not in the active worker set are skipped; if none are present (including an empty list) the secret is inert, not an error |
 | `bytes` | int | `32` | Length knob. Range **1–4096**; out of range is an error. Entropy bytes for every format **except `b10`, where it is the digit count** |
 | `format` | string | `"hex"` | One of `hex` \| `b10` \| `b32` \| `b64` \| `b64url` \| `raw`. Unknown is an error |
 | `env` | string | `CONFD_<NAME>` | The env var mandor sets to this secret's **fd number** (never the value). `<NAME>` uppercased with `-`→`_` (`db-signing` → `CONFD_DB_SIGNING`). Override to blend with your app's own env. Validated `^[A-Z_][A-Z0-9_]*$`; two secrets resolving to the same env var is an error |
@@ -357,9 +390,12 @@ give-up/essential/oneshot worker's code when those trigger, honoring
   RSS+CPU, GB-hours, core-seconds, duty %) with right-sizing suggestions.
   Profiling is automatic and zero-config; the profile persists in
   `<state-dir>/cost.json` and accumulates across worker restarts.
-- `mandor validate [--config=PATH]` — apply the full config to the worker
-  table without spawning anything; exit 0 = sound, non-zero on bad values,
-  cycles, or unknown worker references (typo detection).
+- `mandor validate [--config=PATH] [-- <cmds>]` — apply the full config to the
+  active worker set (the `-- <cmds>`, else the TOML `workers=`) without spawning
+  anything; exit 0 = sound, non-zero on bad values, dependency cycles, or an
+  env-var collision. A `[worker.NAME]`/`[secret.*]` reference to a worker not in
+  the set is a tolerated warning, not a failure — so a superset TOML validates
+  against any CLI subset.
 - Durations everywhere: `500ms`, `30s`, `2m`, `12h` (integers only).
 
 ## Conventions read from the environment

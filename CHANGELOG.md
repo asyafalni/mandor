@@ -3,6 +3,28 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.13.0] - 2026-08-12
+
+### Changed
+- **The TOML is now a name-keyed *behavior overlay* over the CLI-chosen worker
+  set.** The active workers are the CLI `--` args (or, when the CLI gives none,
+  the TOML `workers=` as before). `[worker.NAME]` sections and `[secret.*]`
+  grants are matched by name against that set: a section for a worker not
+  spawned this run is ignored (a one-line warning), never an error, and never
+  itself a reason to spawn anything. So one **static, never-rewritten** TOML can
+  describe a *superset* of possible workers and each container start picks its
+  subset on the CLI — no per-boot config templating.
+- **`[secret.*]` grants resolve against the active worker set** (including
+  `mandor validate --config=X -- <cmds>`, which now validates against exactly
+  `<cmds>`) and deliver to the *present* listed subset. An absent listed worker
+  is simply not granted; a grant with no present recipient — including an
+  explicit `workers = []` — is inert, not an error. Deny-by-default is
+  preserved: a worker only ever receives a secret it is listed for. Two secrets
+  resolving to the same env var is still a hard error.
+- Removed the old refusal that `[secret.*]` required workers defined in the
+  config file rather than on the CLI. **Non-breaking** — purely loosening; the
+  worker command line stays CLI-only (there is no `command`/`args` TOML key).
+
 ## [1.12.1] - 2026-08-12
 
 ### Changed
