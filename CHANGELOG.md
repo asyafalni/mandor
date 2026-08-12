@@ -3,6 +3,17 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.12.1] - 2026-08-12
+
+### Changed
+- **A GPU-less container no longer forks `nvidia-smi` at daemon startup.** The
+  one-time GPU auto-detect probe now reads DRM sysfs first (pure file reads) and
+  only forks `nvidia-smi` when the binary actually resolves on `PATH` — so a
+  scratch/distroless image with no GPU pays zero subprocess spawns. NVIDIA hosts
+  detect exactly as before. Adds an end-to-end harness regression for the v1.12.0
+  ENV config (env activation, URL scheme-stripping, `MANDOR_SERVICE_PREFIX`, and
+  the empty-env-stays-offline guard).
+
 ## [1.12.0] - 2026-08-10
 
 ENV config for mandor's four deploy-varying settings, and GPU metrics become
