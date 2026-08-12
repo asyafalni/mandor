@@ -1773,13 +1773,16 @@ pub fn runDaemon(
     var gpu_samples: [gpu.max_gpus]gpu.GpuSample = undefined;
 
     // GPU auto-detect (one-time, spec: no re-probe — a GPU appearing later needs
-    // a restart). Probe both sources once; present if either returns a card. On
-    // a GPU-less host say so once, then never sample (no periodic nvidia-smi
-    // fork).
+    // a restart). DRM sysfs first (pure file reads, no subprocess); only fork
+    // nvidia-smi if the binary is actually on PATH, so a GPU-less scratch/distroless
+    // image pays ZERO forks. Present if either source returns a card; on a GPU-less
+    // host say so once, then never sample.
     const gpu_present = blk: {
+        const drm = gpu.sampleDrm(&gpu_samples, 0);
+        if (drm.len > 0) break :blk true;
+        if (!spawner.onPath("nvidia-smi", gpu_path_env)) break :blk false;
         const nv = gpu.sample(gpu_path_env, environ.ptr, &gpu_samples);
-        const drm = gpu.sampleDrm(&gpu_samples, @intCast(nv.len));
-        break :blk (nv.len + drm.len) > 0;
+        break :blk nv.len > 0;
     };
     if (!gpu_present) err("no GPU detected; GPU metrics off");
     var next_gpu_sample_ms: u64 = if (gpu_present) monoMs() +| gpu_interval_ms else 0;

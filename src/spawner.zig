@@ -419,6 +419,26 @@ pub fn findPath(environ: [:null]const ?[*:0]const u8) []const u8 {
     return findEnv(environ, "PATH") orelse default_path;
 }
 
+/// Is `name` an executable resolvable on `path_env`? A pure PATH walk with an
+/// `faccessat(X_OK)` probe — no fork/exec — so a caller can skip spawning a
+/// subprocess that isn't installed (e.g. `nvidia-smi` on a GPU-less image). A
+/// name containing '/' is treated as a path and checked directly. Mirrors the
+/// resolution `resolveExe`/`execArgv` do at exec time. Cold path only.
+pub fn onPath(name: []const u8, path_env: []const u8) bool {
+    var cand: [4200]u8 = undefined;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        const p = std.fmt.bufPrintZ(&cand, "{s}", .{name}) catch return false;
+        return posix.errno(linux.faccessat(linux.AT.FDCWD, p.ptr, 1, 0)) == .SUCCESS; // X_OK
+    }
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0 or dir.len + 1 + name.len + 1 > cand.len) continue;
+        const path = std.fmt.bufPrintZ(&cand, "{s}/{s}", .{ dir, name }) catch continue;
+        if (posix.errno(linux.faccessat(linux.AT.FDCWD, path.ptr, 1, 0)) == .SUCCESS) return true; // X_OK
+    }
+    return false;
+}
+
 pub const SpawnError = error{ForkFailed};
 
 pub fn spawn(
@@ -851,6 +871,19 @@ test "name override rejects empty and all-invalid" {
 test "findPath falls back to default" {
     const empty_env = [_:null]?[*:0]const u8{};
     try std.testing.expectEqualStrings(default_path, findPath(&empty_env));
+}
+
+test "onPath resolves an executable on PATH without forking" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    // `sh` is present on every POSIX image the tests run on (/bin or /usr/bin).
+    try std.testing.expect(onPath("sh", "/usr/bin:/bin:/usr/local/bin"));
+    // A bogus name resolves nowhere.
+    try std.testing.expect(!onPath("mandor-no-such-binary-9z7q", "/usr/bin:/bin"));
+    // An empty PATH finds nothing (the GPU-less scratch case — no nvidia-smi, no fork).
+    try std.testing.expect(!onPath("nvidia-smi", ""));
+    // A name with '/' is checked as a path directly.
+    try std.testing.expect(onPath("/bin/sh", ""));
+    try std.testing.expect(!onPath("/bin/definitely-not-here-x", ""));
 }
 
 test "fmtFdEnv formats env=fd, null-terminated" {
