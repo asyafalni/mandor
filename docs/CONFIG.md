@@ -260,7 +260,7 @@ essential = false   # a sidecar: its death should not take the app down
 
 | Key | Type | Meaning |
 |---|---|---|
-| `health` | string | Liveness probe command (exit 0 = healthy; also `--health=NAME=CMD` on CLI, repeatable) |
+| `health` | string | Liveness probe command (exit 0 = healthy) |
 | `start_after` | string | Start this worker once the named one is up (ready, or alive 1s); dead dependencies unblock |
 | `oneshot` | bool | Init task: runs first, gates all regular workers; failure aborts startup with its code. Never retried, and `essential` is rejected on it |
 | `essential` | bool | **Default `true`.** A failure that exhausts retries stops the fleet and propagates its code. Set `false` for a sidecar whose death should not end the run |

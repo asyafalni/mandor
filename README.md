@@ -450,7 +450,7 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `digest_threshold` | `[logs]` | — | |
 | `max_rate` | `[logs]` | — | |
 | `stream` | `[worker.NAME]` | — | |
-| `health` | `[worker.NAME]` | also `--health=NAME=CMD`, repeatable | |
+| `health` | `[worker.NAME]` | — | |
 | `start_after` | `[worker.NAME]` | — | |
 | `oneshot` | `[worker.NAME]` | — | |
 | `essential` | `[worker.NAME]` | — | |
