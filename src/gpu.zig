@@ -135,7 +135,8 @@ pub fn parseNvidiaSmi(csv: []const u8, out: *[max_gpus]GpuSample) []const GpuSam
 // STABILITY (the motto): every read is fail-closed (unreadable file -> "" -> the
 // field is 0, or the whole card is skipped); every parse saturates; the set is
 // bounded to max_gpus; no subprocess, no alloc, no unreachable/panic. Runs ONLY
-// in the relay daemon (off PID 1), under the SAME `[gpu] enabled` toggle.
+// in the relay daemon (off PID 1); GPU is auto-detected, sampled every
+// `gpu_interval`.
 
 /// PURE per-card core: given the (already-file-read) CONTENTS of one card's
 /// sysfs files, produce a GpuSample — or `null` to SKIP the card. The skip rule

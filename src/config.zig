@@ -27,8 +27,8 @@ pub const FileConfig = struct {
     health_start_period_ms: ?u64 = null,
     on_incident: ?[]const u8 = null,
     photon: ?[]const u8 = null,
-    /// `[gpu]` section: null = key absent (caller keeps the cli.Config default).
-    /// GPU sampling itself is auto-detected by the daemon (no `enabled` key).
+    /// `gpu_interval` global key: null = absent (caller keeps the cli.Config
+    /// default). GPU sampling is auto-detected by the daemon (no enable toggle).
     gpu_interval_ms: ?u64 = null,
     /// `[logs]` section: null = key absent (caller keeps the cli.Config default).
     logs_max_rate: ?u32 = null,
@@ -128,7 +128,7 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
     };
 }
 
-pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuEnabledRemoved };
+pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuSectionRemoved };
 
 /// Parse TOML-subset text. String values are slices into `text`; worker
 /// commands land in `cmd_storage`.
@@ -148,7 +148,6 @@ pub fn parse(
     var array_secret: ?usize = null; // secret owning an open workers array, if any
     var cur_worker: ?[]const u8 = null; // active [worker.NAME] section
     var cur_secret: ?usize = null; // active [secret.NAME] section (index)
-    var cur_gpu = false; // active [gpu] section
     var cur_logs = false; // active [logs] section
 
     var it = std.mem.splitScalar(u8, text, '\n');
@@ -180,25 +179,16 @@ pub fn parse(
                 .worker => |nm| {
                     cur_worker = nm;
                     cur_secret = null;
-                    cur_gpu = false;
                     cur_logs = false;
                 },
                 .secret => |nm| {
                     cur_worker = null;
-                    cur_gpu = false;
                     cur_logs = false;
                     cur_secret = try beginSecret(cfg, nm);
-                },
-                .gpu => {
-                    cur_worker = null;
-                    cur_secret = null;
-                    cur_gpu = true;
-                    cur_logs = false;
                 },
                 .logs => {
                     cur_worker = null;
                     cur_secret = null;
-                    cur_gpu = false;
                     cur_logs = true;
                 },
             }
@@ -216,11 +206,6 @@ pub fn parse(
 
         if (cur_secret) |si| {
             try secretSetting(cfg, si, &target, &array_secret, key, value);
-            continue;
-        }
-
-        if (cur_gpu) {
-            try gpuSetting(cfg, key, value);
             continue;
         }
 
@@ -273,6 +258,10 @@ pub fn parse(
             cfg.psi_mem_pct = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
         } else if (std.mem.eql(u8, key, "psi_cpu_pct")) {
             cfg.psi_cpu_pct = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
+        } else if (std.mem.eql(u8, key, "gpu_interval")) {
+            // GPU sampling cadence (daemon-side; GPU itself is auto-detected).
+            const s = parseString(value) orelse return error.BadValue;
+            cfg.gpu_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "env_file")) {
             cfg.env_file = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "restart_dependents")) {
@@ -324,35 +313,20 @@ fn workerKey(key: []const u8) ?ArrayTarget {
     return null;
 }
 
-const Section = union(enum) { worker: []const u8, secret: []const u8, gpu, logs };
+const Section = union(enum) { worker: []const u8, secret: []const u8, logs };
 
-/// `[worker.NAME]` / `[secret.NAME]` / `[gpu]` / `[logs]` -> the section kind
-/// (+ NAME for the first two). Any other header is a hard error: configs are
-/// small, so a typo should stop startup rather than be silently ignored.
+/// `[worker.NAME]` / `[secret.NAME]` / `[logs]` -> the section kind (+ NAME for
+/// the first two). `[gpu]` was flattened to the global `gpu_interval` key in
+/// v1.14 and now gives a migration error. Any other header is a hard error:
+/// configs are small, so a typo should stop startup rather than be ignored.
 fn sectionHeader(line: []const u8) ParseError!Section {
     if (line[line.len - 1] != ']') return error.Syntax;
     const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
-    if (std.mem.eql(u8, inner, "gpu")) return .gpu;
+    if (std.mem.eql(u8, inner, "gpu")) return error.GpuSectionRemoved;
     if (std.mem.eql(u8, inner, "logs")) return .logs;
     if (sectionName(inner, "worker.")) |nm| return .{ .worker = nm };
     if (sectionName(inner, "secret.")) |nm| return .{ .secret = nm };
     return error.Syntax;
-}
-
-/// Apply one `key = value` inside `[gpu]`. `interval` is a quoted duration
-/// string ("15s"). `enabled` was removed in v1.12 — GPU sampling is now
-/// auto-detected by the daemon (on when a device is present). Unknown key ->
-/// hard Syntax error.
-fn gpuSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!void {
-    if (std.mem.eql(u8, key, "interval")) {
-        const s = parseString(value) orelse return error.BadValue;
-        cfg.gpu_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
-    } else if (std.mem.eql(u8, key, "enabled")) {
-        // Removed in v1.12: GPU is auto-detected (on when a device is present).
-        return error.GpuEnabledRemoved;
-    } else {
-        return error.Syntax; // unknown key inside a [gpu] section
-    }
 }
 
 /// Apply one `key = value` inside `[logs]`. `max_rate` is a bare non-negative
@@ -367,9 +341,9 @@ fn logsSetting(cfg: *FileConfig, key: []const u8, value: []const u8) ParseError!
         // typo cannot silently disable the cap.
         cfg.logs_max_rate = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
     } else if (std.mem.eql(u8, key, "digest")) {
-        // Bare bool, parsed the same way `[gpu] enabled` / `restart_dependents`
-        // are: anything but true/false is a hard BadValue (a typo can't silently
-        // flip the Tier-2 digest).
+        // Bare bool, parsed the same way `restart_dependents` is: anything but
+        // true/false is a hard BadValue (a typo can't silently flip the Tier-2
+        // digest).
         cfg.logs_digest = if (std.mem.eql(u8, value, "true"))
             true
         else if (std.mem.eql(u8, value, "false"))
@@ -1005,36 +979,29 @@ test "secret section: every rejection is a hard error" {
     ));
 }
 
-test "gpu section: interval" {
+test "gpu_interval: global key parses" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    const text =
-        \\[gpu]
-        \\interval = "10s"
-    ;
-    const cfg = try parseTest(text, &storage);
+    const cfg = try parseTest("gpu_interval = \"10s\"", &storage);
     try t.expectEqual(@as(?u64, 10_000), cfg.gpu_interval_ms);
 }
 
-test "gpu section: absent keys stay null; bad values and unknown key rejected" {
+test "gpu_interval: absent stays null; bad value rejected" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    // No [gpu] section at all -> field stays null (caller keeps cli default).
+    // Absent -> field stays null (caller keeps the cli.Config default of 15s).
     const none = try parseTest("workers = [\"./a\"]", &storage);
     try t.expectEqual(@as(?u64, null), none.gpu_interval_ms);
-    const off = try parseTest("[gpu]\ninterval = \"5s\"", &storage);
-    try t.expectEqual(@as(?u64, 5_000), off.gpu_interval_ms);
-    // Bad duration, unknown key.
-    try t.expectError(error.BadValue, parseTest("[gpu]\ninterval = \"soon\"", &storage));
-    try t.expectError(error.Syntax, parseTest("[gpu]\nbogus = \"x\"", &storage));
+    const set = try parseTest("gpu_interval = \"5s\"", &storage);
+    try t.expectEqual(@as(?u64, 5_000), set.gpu_interval_ms);
+    try t.expectError(error.BadValue, parseTest("gpu_interval = \"soon\"", &storage));
 }
 
-test "gpu section: enabled key removed gives a migration error" {
+test "the old [gpu] section gives a migration error" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    // `[gpu] enabled` was removed in v1.12 (GPU auto-detected). It must give a
-    // dedicated migration error, not a bare Syntax error.
-    try t.expectError(error.GpuEnabledRemoved, parseTest("[gpu]\nenabled = true", &storage));
-    // `[gpu] interval` still parses.
-    const cfg = try parseTest("[gpu]\ninterval = \"20s\"", &storage);
-    try t.expectEqual(@as(?u64, 20_000), cfg.gpu_interval_ms);
+    // `[gpu] interval` / `[gpu] enabled` were flattened to the global
+    // `gpu_interval` key in v1.14 — the section itself must give a dedicated
+    // migration error, not a bare Syntax error.
+    try t.expectError(error.GpuSectionRemoved, parseTest("[gpu]\ninterval = \"20s\"", &storage));
+    try t.expectError(error.GpuSectionRemoved, parseTest("[gpu]\nenabled = true", &storage));
 }
 
 test "worker section: stream collects the worker name; others stay non-streaming" {

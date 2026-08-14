@@ -171,9 +171,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     error.LogsStreamRemoved => "'[logs] stream' was removed — streaming is now " ++
                         "per worker: set stream = true inside a [worker.NAME] section. The " ++
                         "curated warn/error digest ships by default; [logs] keeps max_rate/digest*",
-                    error.GpuEnabledRemoved => "'[gpu] enabled' was removed — GPU metrics are " ++
-                        "now auto-detected (on when a device is present, off otherwise); " ++
-                        "[gpu] keeps only 'interval'",
+                    error.GpuSectionRemoved => "the '[gpu]' section was removed — set the global " ++
+                        "'gpu_interval' key instead (GPU metrics are auto-detected: on when a " ++
+                        "device is present, off otherwise; there is no enable toggle)",
                     error.Syntax => "syntax",
                     error.BadValue => "bad value",
                     error.TooManyWorkers => "too many workers (max 64)",
@@ -195,7 +195,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
-            if (file_cfg.gpu_interval_ms) |v| cfg.gpu.interval_ms = v;
+            if (file_cfg.gpu_interval_ms) |v| cfg.gpu_interval_ms = v;
             if (file_cfg.logs_max_rate) |v| cfg.logs.max_rate = v;
             if (file_cfg.logs_digest) |v| cfg.logs.digest = v;
             if (file_cfg.logs_digest_interval_ms) |v| cfg.logs.digest_interval_ms = v;

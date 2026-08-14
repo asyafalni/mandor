@@ -74,9 +74,9 @@ never touches one. That child ships three things to photon:
   Host identity comes from `/proc/sys/kernel/hostname` and
   `/etc/machine-id` (falling back to `boot_id`, then the literal `unknown`).
 - **GPU metrics** (auto-detected) → OTLP metrics (`/v1/metrics`). The relay
-  daemon probes for a GPU once at startup (no `[gpu] enabled` toggle — see
+  daemon probes for a GPU once at startup (no enable toggle — see
   "GPU metrics" below) and, if one is present, shells out to `nvidia-smi`
-  every `[gpu] interval` (default 15 s) and emits per-GPU
+  every `gpu_interval` (default 15 s) and emits per-GPU
   `system.gpu.utilization`, `system.gpu.memory.usage`,
   `system.gpu.memory.utilization`, `system.gpu.temperature`, `system.gpu.power`
   (attrs `gpu=<i>`, `gpu.name=<n>`), same host identity as the node metrics.
@@ -99,19 +99,20 @@ keeping to the four-CLI-flag / minimal-key rule. `PHOTON_OTLP_TOKEN` (env, kept
 off the process cmdline; the bearer var's name changed in v1.12) sets the
 bearer token when photon requires auth.
 
-### GPU metrics (the `[gpu]` section)
+### GPU metrics (the `gpu_interval` key)
 
 Auto-detected, not a toggle: the relay daemon probes for a GPU once at
 startup (no re-probe — a GPU appearing later needs a restart) and samples it
 only if present, off the supervision path. mandor is a static binary, so it
 collects GPU metrics by shelling out to `nvidia-smi` rather than linking
-NVML. `[gpu] enabled` was **removed in v1.12** — GPU sampling is on
-automatically when a device is found, and silent (logged once) when it
-isn't. `[gpu]` now has one key:
+NVML. GPU sampling is on automatically when a device is found, and silent
+(logged once) when it isn't — there is no enable/disable toggle. The one
+tunable is the sample cadence, a **global** key (the old `[gpu]` section was
+flattened to it in v1.14; an old `[gpu]` section now gives a migration error):
 
-| Key | Type | Default | Meaning |
+| Key (global) | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `interval` | duration | `15s` | GPU sample cadence |
+| `gpu_interval` | duration | `15s` | GPU sample cadence (the 15 s default suits most cases) |
 
 ### The three-tier log → photon model
 

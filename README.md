@@ -341,9 +341,9 @@ What it ships when `photon` is set:
   per-core CPU, per-mount filesystem, per-interface network, memory, swap, load
   (1/5/15m), disk I/O, uptime, CPU temperature. Every worker and the node share
   one `host.name`, so photon shows each process against the node it runs on.
-- **GPU metrics** (auto-detected — no `[gpu] enabled` toggle; the relay daemon
-  probes once at startup) → NVIDIA via `nvidia-smi`, AMD/Intel via DRM sysfs.
-  Fail-closed when no GPU is present.
+- **GPU metrics** (auto-detected — no enable toggle; the relay daemon probes
+  once at startup, cadence via the global `gpu_interval`) → NVIDIA via
+  `nvidia-smi`, AMD/Intel via DRM sysfs. Fail-closed when no GPU is present.
 - **Process-lifecycle events** → OTLP logs (started / exited / restarting /
   unhealthy).
 - **Curated warn/error digest** (on by default when `photon=` is set) → OTLP logs.
@@ -444,7 +444,7 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `env_file` | global | — | |
 | `psi_mem_pct` | global | — | |
 | `psi_cpu_pct` | global | — | |
-| `interval` | `[gpu]` | — | |
+| `gpu_interval` | global | — | |
 | `digest` | `[logs]` | — | |
 | `digest_interval` | `[logs]` | — | |
 | `digest_threshold` | `[logs]` | — | |
@@ -470,8 +470,9 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `format` | `[secret.NAME]` | — | |
 | `env` | `[secret.NAME]` | — | |
 
-GPU metrics are auto-detected (no `[gpu] enabled` toggle) — `[gpu]` now holds
-only the sample `interval`.
+GPU metrics are auto-detected (no enable toggle). The only tunable is the
+global `gpu_interval` key (default `15s`); the old `[gpu]` section was flattened
+to it in v1.14.
 
 ### App-shared secrets (`[secret.NAME]`)
 

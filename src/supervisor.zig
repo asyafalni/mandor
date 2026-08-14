@@ -353,7 +353,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // path never does), watches the spool for incidents, and drains the
         // telemetry pipe for metrics/lifecycle events. Best-effort — if the
         // spawn fails, telemetry is simply off and supervision is unaffected.
-        telemetry.spawnDaemon(endpoint, state_dir, cfg.gpu.interval_ms, cfg.service_prefix, envp, path_env);
+        telemetry.spawnDaemon(endpoint, state_dir, cfg.gpu_interval_ms, cfg.service_prefix, envp, path_env);
         logmod.print("[mandor] forwarding incidents to photon at {s}\n", .{endpoint});
         // Opt-in log streaming is now per-worker (`ctx.w.stream`, set in
         // applyConfig). Only ARM the shared rate cap when photon is configured

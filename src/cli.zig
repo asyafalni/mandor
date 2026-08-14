@@ -34,14 +34,6 @@ pub const SecretDef = struct {
 
 pub const Mode = enum { supervise, report, validate };
 
-/// `[gpu]` section (TOML-only). GPU sampling is auto-detected by the relay
-/// daemon (on when a device is present, off otherwise) — no `enabled` key.
-/// When present, the daemon shells out to `nvidia-smi` (and reads DRM sysfs)
-/// on `interval_ms`.
-pub const GpuConfig = struct {
-    interval_ms: u64 = 15_000,
-};
-
 /// `[logs]` section (TOML-only). Carries the GLOBAL streaming rate cap (Tier 3)
 /// and the Tier-2 curated warn/error digest knobs. Log streaming is selected PER
 /// WORKER (`[worker.NAME] stream = true`); the digest is on by default (when
@@ -163,8 +155,9 @@ pub const Config = struct {
     /// resolved to indices, defaults/overrides applied, validated.
     secrets: [max_secrets]SecretDef = undefined,
     secrets_n: usize = 0,
-    /// `[gpu]` NVIDIA GPU sampling (TOML-only): off by default, daemon-side.
-    gpu: GpuConfig = .{},
+    /// GPU sampling cadence (`gpu_interval` TOML key; daemon-side). GPU is
+    /// auto-detected — this only tunes the interval. Default 15s.
+    gpu_interval_ms: u64 = 15_000,
     /// `[logs]` global streaming rate cap + Tier-2 digest knobs (TOML-only).
     /// Per-worker streaming opt-in lives in `stream`/`stream_n` above; this holds
     /// `max_rate` and the `digest`/`digest_interval_ms`/`digest_threshold` knobs.

@@ -3,6 +3,19 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.14.0] - 2026-08-13
+
+### Changed
+- **The `[gpu]` section is now the global `gpu_interval` key.** GPU sampling has
+  been auto-detected since v1.12 (no enable toggle), leaving `[gpu]` with a
+  single `interval` key — a section for one setting. That key is now the global
+  `gpu_interval` duration (default `15s`, which suits most cases; unset keeps the
+  default). GPU stays auto-detected — on when a device is present, off (logged
+  once) otherwise, no re-probe. An old `[gpu]` section now gives a dedicated
+  migration error pointing at `gpu_interval`, rather than a bare syntax error.
+  Pure config-surface simplification; non-breaking except for configs that set
+  `[gpu] interval` (rename to the global `gpu_interval`).
+
 ## [1.13.0] - 2026-08-12
 
 ### Changed

@@ -91,7 +91,7 @@ one node:
   needs a restart).
 
 Config specifics live in [CONFIG.md](CONFIG.md); the whole telemetry surface is
-`photon=` plus the small `[gpu]` / `[logs]` sections.
+`photon=` plus the global `gpu_interval` key and the small `[logs]` section.
 
 **The Prometheus `--metrics=PORT` endpoint (127.0.0.1) is a separate, local pull
 option**, unrelated to the photon push path above. photon ingests by push only —
