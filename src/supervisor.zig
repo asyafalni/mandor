@@ -648,7 +648,11 @@ fn applyLifetime(w: *spawner.Worker, v: []const u8) bool {
     return true;
 }
 fn applyHealthInterval(w: *spawner.Worker, v: []const u8) bool {
-    w.health_interval_ms = cli.parseDuration(v) orelse return false;
+    const ms = cli.parseDuration(v) orelse return false;
+    // 0 would make next_health_ms never advance past `now`, busy-spinning PID 1
+    // and fork-storming probes every tick (cf. the [logs] digest_interval guard).
+    if (ms == 0) return false;
+    w.health_interval_ms = ms;
     return true;
 }
 fn applyHealthStart(w: *spawner.Worker, v: []const u8) bool {
@@ -1583,6 +1587,18 @@ test "validate tolerates an orphan [worker.NAME] section" {
     @memcpy(cfg.name_pairs[0..2], &name_pairs);
     cfg.name_pairs_n = 2;
     try testing.expectEqual(@as(u8, 0), validate(&cfg)); // orphan → warn, exit 0
+}
+
+test "validate rejects health_interval = 0 (would busy-spin the probe scheduler)" {
+    // A 0 probe cadence makes next_health_ms never advance — PID 1 would spin at
+    // 100% and fork a probe every tick. applyHealthInterval must reject it.
+    var cfg = cli.Config{};
+    var cmds = [_][]const u8{"api.sh"};
+    cfg.commands = &cmds;
+    cfg.health_interval_pairs = undefined;
+    cfg.health_interval_pairs[0] = .{ .worker = "api.sh", .cmd = "0s" };
+    cfg.health_interval_pairs_n = 1;
+    try testing.expect(validate(&cfg) != 0);
 }
 
 test "validate still fails on a real error (self-dependency)" {
