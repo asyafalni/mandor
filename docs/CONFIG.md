@@ -22,14 +22,11 @@ names stay safe in the Prometheus exposition format.
 | `backoff_max = "30s"` | — | `30s` | Exponential backoff cap (initial 200ms, ×2, reset after 10s stable uptime) |
 | `max_restarts = 3` | `--max-restarts=` | `0` | Retries for a **failed** worker. `0` = none (a failure ends the run), `-1` = forever. Clean exits are never retried |
 | `stop_grace = "10s"` | — | `10s` | TERM→KILL escalation window on shutdown |
-| `expected_exit = "143,129"` | — | none | Exit codes treated exactly like 0. Overridable per worker |
 | `state_dir = "/path"` | `--state-dir=` / `MANDOR_STATE_DIR` | `/var/lib/mandor` | State file + incident spool + history |
 | `metrics_port = 9464` | `--metrics=` | off | Prometheus text endpoint on 127.0.0.1 |
 | `photon = "127.0.0.1:4318"` | — / `PHOTON_OTLP_HTTP_ENDPOINT` | off | Ship incidents + metrics + lifecycle events to photon as OTLP; fully offline without it. `PHOTON_OTLP_HTTP_ENDPOINT` overrides the TOML value — a full URL or a bare `host:port`, mandor strips the scheme either way. Auth via `PHOTON_OTLP_TOKEN` env. See "photon telemetry" below |
 | `service_prefix = "tenant-a-"` | — / `MANDOR_SERVICE_PREFIX` | `""` | Origin/tenant tag prepended to `service.name` on **every** OTLP emission (metrics, incidents, lifecycle, streamed logs, the digest), so several mandor origins can share one multi-tenant photon without `service.name` colliding. Telemetry-only — the bare worker name is unchanged in the log `[name]` prefix, `report`, and Prometheus labels; `host.id` still distinguishes hosts. Default `""` = unchanged; inert without `photon=` |
 | `on_incident = "CMD"` | — | off | Exec CMD after each bundle write, bundle path appended |
-| `health_interval = "30s"` | — | `30s` | Probe cadence |
-| `health_start_period = "10s"` | — | `10s` | Probe failures ignored this long after spawn (until first success) |
 | `ready_fd = 5` | — | off | s6-style readiness: workers write a newline to this fd |
 | `restart_dependents = true` | — | `false` | OTP `rest_for_one`: a dependency's restart recycles its dependents |
 | `env_file = ".env"` | — | off | KEY=VAL file loaded into every worker's environment |
@@ -273,18 +270,24 @@ essential = false   # a sidecar: its death should not take the app down
 | `nice` | int | Scheduling niceness |
 | `max_rss_mb` | int | Recycle (graceful planned restart) beyond this RSS |
 | `max_lifetime` | duration string | Periodic recycle |
-| `expected_exit` | string | Exit codes that mean success **for this worker only** — e.g. `"3"` for a job that reports "nothing to do". Replaces the global set |
+| `expected_exit` | string | Exit codes that mean success for this worker — e.g. `"3"` for a job that reports "nothing to do". Default: only `0`. Per-worker only (v1.14) |
+| `health_interval` | duration string | Cadence of this worker's health probe. Default `30s`. Per-worker only (v1.14) |
+| `health_start_period` | duration string | Grace after (re)spawn during which probe failures don't count, until the first success (the k8s startupProbe lesson). Default `10s`. Per-worker only (v1.14) |
 | `pre_stop` | string | Drain command on graceful shutdown; TERM follows its completion |
 | `name` | string | Override the display/telemetry name (log prefix, `report`, Prometheus label, incident `service.name`). The section is still keyed by the derived basename; the override replaces it everywhere. Empty, too long (>28 bytes), or all-invalid overrides are rejected; collisions dedup (`-2`) like basenames |
 
 `oneshot` defaults to `false`; `essential` defaults to **`true`**, so the
 value you write is the one that differs from the default.
 
-**Why `expected_exit` is per-worker but `max_restarts` is not.** `expected_exit`
-*describes the worker* — "exit 3 means success for this program" is a property
-of the binary. `max_restarts` is a *policy decision* — "how hard should the
-supervisor try" is a property of the deployment. Descriptions belong to the
-worker; policy belongs to the fleet.
+**Why these are per-worker but `max_restarts` is not.** `expected_exit`,
+`health_interval`, and `health_start_period` all *describe the worker* — "exit 3
+means success for this program", "this binary takes 45s to warm up" are
+properties of the binary. `max_restarts` (and `backoff_max`) are *policy
+decisions* — "how hard should the supervisor try" is a property of the
+deployment. Descriptions belong to the worker; policy belongs to the fleet.
+(v1.14 moved the three descriptive keys from global to per-worker only; a
+top-level `expected_exit` / `health_interval` / `health_start_period` now gives
+a migration error pointing you into a `[worker.NAME]` section.)
 
 ## App-shared secrets — `[secret.NAME]` sections
 

@@ -97,6 +97,8 @@ fn applyConfig(
         .{ .pairs = cfg.max_rss_pairs[0..cfg.max_rss_pairs_n], .label = "max_rss_mb", .apply = applyMaxRss },
         .{ .pairs = cfg.lifetime_pairs[0..cfg.lifetime_pairs_n], .label = "max_lifetime", .apply = applyLifetime },
         .{ .pairs = cfg.expected_pairs[0..cfg.expected_pairs_n], .label = "expected_exit", .apply = applyExpected },
+        .{ .pairs = cfg.health_interval_pairs[0..cfg.health_interval_pairs_n], .label = "health_interval", .apply = applyHealthInterval },
+        .{ .pairs = cfg.health_start_pairs[0..cfg.health_start_pairs_n], .label = "health_start_period", .apply = applyHealthStart },
         .{ .pairs = cfg.prestop_pairs[0..cfg.prestop_pairs_n], .label = "pre_stop", .apply = applyPreStop },
         .{ .pairs = cfg.health[0..cfg.health_n], .label = "health", .apply = applyHealth },
     };
@@ -445,7 +447,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
 
         // Before computing the poll timeout so first probes schedule
         // immediately after a (re)spawn.
-        if (!sd.active) runHealth(cfg, workers, state_dir, envp, path_env);
+        if (!sd.active) runHealth(workers, state_dir, envp, path_env);
 
         var wake_at: u64 = next_sample_ms;
         // The digest flush is time-driven and applies during shutdown too: a
@@ -645,6 +647,14 @@ fn applyLifetime(w: *spawner.Worker, v: []const u8) bool {
     w.max_lifetime_ms = cli.parseDuration(v) orelse return false;
     return true;
 }
+fn applyHealthInterval(w: *spawner.Worker, v: []const u8) bool {
+    w.health_interval_ms = cli.parseDuration(v) orelse return false;
+    return true;
+}
+fn applyHealthStart(w: *spawner.Worker, v: []const u8) bool {
+    w.health_start_period_ms = cli.parseDuration(v) orelse return false;
+    return true;
+}
 fn applyExpected(w: *spawner.Worker, v: []const u8) bool {
     var set = [1]bool{true} ++ [1]bool{false} ** 255;
     if (!cli.parseExpectedExit(v, &set)) return false; // reject junk at startup
@@ -684,7 +694,6 @@ const health_fail_threshold: u8 = 3;
 /// Drive health probes: consume results, time out hung probes, start due
 /// ones, and declare workers unhealthy at the failure threshold.
 fn runHealth(
-    cfg: *const cli.Config,
     workers: []spawner.Worker,
     state_dir: []const u8,
     envp: [*:null]const ?[*:0]const u8,
@@ -699,7 +708,7 @@ fn runHealth(
                 w.health_fails = 0;
                 w.health_ever_ok = true;
             } else if (!w.health_ever_ok and
-                now -| w.last_start_ms < cfg.health_start_period_ms)
+                now -| w.last_start_ms < w.health_start_period_ms)
             {
                 // start-period grace: slow booters aren't failures yet
             } else {
@@ -727,13 +736,13 @@ fn runHealth(
         if (w.pid == 0) continue;
         if (w.health_pid == 0 and w.next_health_ms == 0) {
             // freshly (re)spawned: first probe one interval from now
-            w.next_health_ms = now + cfg.health_interval_ms;
+            w.next_health_ms = now + w.health_interval_ms;
         }
         if (w.health_pid != 0 and now -| w.health_started_ms > health_timeout_ms) {
             posix.kill(w.health_pid, .KILL) catch {}; // reaped as a failure
         }
         if (w.health_pid == 0 and w.next_health_ms != 0 and now >= w.next_health_ms) {
-            w.next_health_ms = now + cfg.health_interval_ms;
+            w.next_health_ms = now + w.health_interval_ms;
             _ = spawner.spawnCheck(w, envp, path_env, now);
         }
     }
@@ -782,11 +791,11 @@ fn retriesLeft(max_restarts: i32, fail_streak: u32) bool {
     return fail_streak <= @as(u32, @intCast(max_restarts));
 }
 
-/// Does `code` count as success for this worker? A per-worker `expected_exit`
-/// replaces the global set; parsing here keeps it off the hot path and out of
-/// per-worker storage.
-fn expectedFor(w: *const spawner.Worker, cfg: *const cli.Config, code: u8) bool {
-    if (!w.expected_set) return cfg.expected_exit[code];
+/// Does `code` count as success for this worker? `expected_exit` is per-worker
+/// (v1.14); with none set, only exit 0 is clean. Parsing stays off the hot path
+/// (resolved once into `expected_bits` at startup).
+fn expectedFor(w: *const spawner.Worker, code: u8) bool {
+    if (!w.expected_set) return code == 0;
     return w.expected_bits[code >> 3] & (@as(u8, 1) << @intCast(code & 7)) != 0;
 }
 
@@ -1068,7 +1077,7 @@ fn handleDeaths(
     for (workers) |*w| {
         if (w.pid != 0 or w.done or w.next_restart_ms != 0) continue;
         var clean = switch (w.status) {
-            .exited => |code| expectedFor(w, cfg, code),
+            .exited => |code| expectedFor(w, code),
             .signaled => false,
             else => continue, // not_started/running: nothing new here
         };

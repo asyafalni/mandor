@@ -18,13 +18,10 @@ pub const FileConfig = struct {
     service_prefix: ?[]const u8 = null, // slice into the file buffer
     metrics_port: ?u16 = null,
     stop_grace_ms: ?u64 = null,
-    expected_exit: ?[256]bool = null,
     ready_fd: ?u8 = null,
     health: [cli.max_health]cli.HealthSpec = undefined,
     health_n: u8 = 0,
-    health_interval_ms: ?u64 = null,
     max_restarts: ?i32 = null,
-    health_start_period_ms: ?u64 = null,
     on_incident: ?[]const u8 = null,
     photon: ?[]const u8 = null,
     /// `gpu_interval` global key: null = absent (caller keeps the cli.Config
@@ -68,6 +65,11 @@ pub const FileConfig = struct {
     /// Per-worker `expected_exit` overrides ("name" -> "143,129").
     expected_pairs: [16]cli.HealthSpec = undefined,
     expected_pairs_n: u8 = 0,
+    /// Per-worker `health_interval` / `health_start_period` ("name" -> "10s").
+    health_interval_pairs: [16]cli.HealthSpec = undefined,
+    health_interval_pairs_n: u8 = 0,
+    health_start_pairs: [16]cli.HealthSpec = undefined,
+    health_start_pairs_n: u8 = 0,
     /// Per-worker display/telemetry `name` overrides ("start.sh" -> "api").
     /// Keyed by the DERIVED basename (the section name); the value replaces it.
     name_pairs: [16]cli.HealthSpec = undefined,
@@ -105,7 +107,7 @@ var env_store: [cli.max_secrets][64]u8 = undefined;
 /// resolves to exactly the worker `start_after` and the other name refs see.
 const worker_max_args = 64; // mirrors spawner.max_args
 
-const ArrayTarget = enum { none, workers, health, start_after, env, cwd, user, cap_drop, oom, nice, max_rss, lifetime, expected, pre_stop, name, secret_workers };
+const ArrayTarget = enum { none, workers, health, health_interval, health_start, start_after, env, cwd, user, cap_drop, oom, nice, max_rss, lifetime, expected, pre_stop, name, secret_workers };
 
 /// Per-worker settings all land in `worker -> value` pair arrays; map the
 /// section key to its slot.
@@ -122,13 +124,15 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
         .max_rss => .{ .arr = &cfg.max_rss_pairs, .n = &cfg.max_rss_pairs_n },
         .lifetime => .{ .arr = &cfg.lifetime_pairs, .n = &cfg.lifetime_pairs_n },
         .expected => .{ .arr = &cfg.expected_pairs, .n = &cfg.expected_pairs_n },
+        .health_interval => .{ .arr = &cfg.health_interval_pairs, .n = &cfg.health_interval_pairs_n },
+        .health_start => .{ .arr = &cfg.health_start_pairs, .n = &cfg.health_start_pairs_n },
         .pre_stop => .{ .arr = &cfg.prestop_pairs, .n = &cfg.prestop_pairs_n },
         .name => .{ .arr = &cfg.name_pairs, .n = &cfg.name_pairs_n },
         else => null,
     };
 }
 
-pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuSectionRemoved };
+pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuSectionRemoved, PerWorkerOnly };
 
 /// Parse TOML-subset text. String values are slices into `text`; worker
 /// commands land in `cmd_storage`.
@@ -233,11 +237,6 @@ pub fn parse(
         } else if (std.mem.eql(u8, key, "stop_grace")) {
             const s = parseString(value) orelse return error.BadValue;
             cfg.stop_grace_ms = cli.parseDuration(s) orelse return error.BadValue;
-        } else if (std.mem.eql(u8, key, "expected_exit")) {
-            const s = parseString(value) orelse return error.BadValue;
-            var set = [1]bool{true} ++ [1]bool{false} ** 255;
-            if (!cli.parseExpectedExit(s, &set)) return error.BadValue;
-            cfg.expected_exit = set;
         } else if (std.mem.eql(u8, key, "metrics_port")) {
             cfg.metrics_port = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
         } else if (std.mem.eql(u8, key, "ready_fd")) {
@@ -247,9 +246,6 @@ pub fn parse(
         } else if (std.mem.eql(u8, key, "max_restarts")) {
             cfg.max_restarts = std.fmt.parseInt(i32, value, 10) catch return error.BadValue;
             if (cfg.max_restarts.? < -1) return error.BadValue;
-        } else if (std.mem.eql(u8, key, "health_start_period")) {
-            const s = parseString(value) orelse return error.BadValue;
-            cfg.health_start_period_ms = cli.parseDuration(s) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "on_incident")) {
             cfg.on_incident = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "photon")) {
@@ -271,9 +267,13 @@ pub fn parse(
                 false
             else
                 return error.BadValue;
-        } else if (std.mem.eql(u8, key, "health_interval")) {
-            const s = parseString(value) orelse return error.BadValue;
-            cfg.health_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
+        } else if (std.mem.eql(u8, key, "expected_exit") or
+            std.mem.eql(u8, key, "health_interval") or
+            std.mem.eql(u8, key, "health_start_period"))
+        {
+            // v1.14: these describe a specific binary, not the fleet — they are
+            // now per-worker only (set them inside a [worker.NAME] section).
+            return error.PerWorkerOnly;
         } else if (std.mem.eql(u8, key, "workers")) {
             if (value.len == 0 or value[0] != '[') return error.BadValue;
             var rest = std.mem.trim(u8, value[1..], " \t");
@@ -299,12 +299,13 @@ pub fn parse(
 /// Keys valid inside a `[worker.NAME]` section.
 fn workerKey(key: []const u8) ?ArrayTarget {
     const map = .{
-        .{ "health", ArrayTarget.health },          .{ "start_after", ArrayTarget.start_after },
-        .{ "env", ArrayTarget.env },                .{ "cwd", ArrayTarget.cwd },
-        .{ "user", ArrayTarget.user },              .{ "cap_drop", ArrayTarget.cap_drop },
-        .{ "oom_score_adj", ArrayTarget.oom },      .{ "nice", ArrayTarget.nice },
-        .{ "max_rss_mb", ArrayTarget.max_rss },     .{ "max_lifetime", ArrayTarget.lifetime },
-        .{ "expected_exit", ArrayTarget.expected }, .{ "pre_stop", ArrayTarget.pre_stop },
+        .{ "health", ArrayTarget.health },                   .{ "start_after", ArrayTarget.start_after },
+        .{ "env", ArrayTarget.env },                         .{ "cwd", ArrayTarget.cwd },
+        .{ "user", ArrayTarget.user },                       .{ "cap_drop", ArrayTarget.cap_drop },
+        .{ "oom_score_adj", ArrayTarget.oom },               .{ "nice", ArrayTarget.nice },
+        .{ "max_rss_mb", ArrayTarget.max_rss },              .{ "max_lifetime", ArrayTarget.lifetime },
+        .{ "expected_exit", ArrayTarget.expected },          .{ "pre_stop", ArrayTarget.pre_stop },
+        .{ "health_interval", ArrayTarget.health_interval }, .{ "health_start_period", ArrayTarget.health_start },
         .{ "name", ArrayTarget.name },
     };
     inline for (map) |entry| {
@@ -708,21 +709,35 @@ test "service_prefix parses and rejects an over-long value" {
     try t.expectError(error.BadValue, parseTest(over, &storage));
 }
 
-test "health, ready_fd and health_interval keys" {
+test "health, ready_fd and per-worker health timing keys" {
     var storage: [cli.max_workers][]const u8 = undefined;
     const text =
         \\ready_fd = 5
-        \\health_interval = "10s"
         \\
         \\[worker.api]
         \\health = "/bin/check --fast"
+        \\health_interval = "10s"
+        \\health_start_period = "45s"
     ;
     const cfg = try parseTest(text, &storage);
     try t.expectEqual(@as(?u8, 5), cfg.ready_fd);
-    try t.expectEqual(@as(u64, 10_000), cfg.health_interval_ms.?);
     try t.expectEqual(@as(u8, 1), cfg.health_n);
     try t.expectEqualStrings("api", cfg.health[0].worker);
     try t.expectEqualStrings("/bin/check --fast", cfg.health[0].cmd);
+    // Per-worker probe timing (v1.14) is collected as name->value pairs.
+    try t.expectEqual(@as(u8, 1), cfg.health_interval_pairs_n);
+    try t.expectEqualStrings("api", cfg.health_interval_pairs[0].worker);
+    try t.expectEqualStrings("10s", cfg.health_interval_pairs[0].cmd);
+    try t.expectEqual(@as(u8, 1), cfg.health_start_pairs_n);
+    try t.expectEqualStrings("45s", cfg.health_start_pairs[0].cmd);
+}
+
+test "expected_exit / health_interval / health_start_period are per-worker only" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    // At the top level (global) each now gives a dedicated migration error.
+    try t.expectError(error.PerWorkerOnly, parseTest("expected_exit = \"143\"", &storage));
+    try t.expectError(error.PerWorkerOnly, parseTest("health_interval = \"10s\"", &storage));
+    try t.expectError(error.PerWorkerOnly, parseTest("health_start_period = \"5s\"", &storage));
 }
 
 test "worker section: env, cwd, oneshot" {
@@ -816,12 +831,18 @@ test "bad sections and stray per-worker keys are rejected" {
     try t.expectError(error.Syntax, parseTest("[worker.api]\nbogus = \"x\"", &storage));
 }
 
-test "stop_grace and expected_exit keys" {
+test "stop_grace key" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    const cfg = try parseTest("stop_grace = \"5s\"\nexpected_exit = \"143\"", &storage);
+    const cfg = try parseTest("stop_grace = \"5s\"", &storage);
     try t.expectEqual(@as(u64, 5_000), cfg.stop_grace_ms.?);
-    try t.expect(cfg.expected_exit.?[143]);
-    try t.expect(cfg.expected_exit.?[0]);
+}
+
+test "per-worker expected_exit resolves to a pair" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    const cfg = try parseTest("[worker.job]\nexpected_exit = \"143\"", &storage);
+    try t.expectEqual(@as(u8, 1), cfg.expected_pairs_n);
+    try t.expectEqualStrings("job", cfg.expected_pairs[0].worker);
+    try t.expectEqualStrings("143", cfg.expected_pairs[0].cmd);
 }
 
 test "multiline workers array" {

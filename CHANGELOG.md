@@ -6,6 +6,17 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
 ## [1.14.0] - 2026-08-13
 
 ### Changed
+- **`expected_exit`, `health_interval`, and `health_start_period` are now
+  per-worker only.** These three keys *describe a specific binary* — "exit 3
+  means success for this program", "this one takes 45s to warm up" — so they
+  belong in a `[worker.NAME]` section, not as a fleet-wide global. The global
+  forms are removed; each now sets a per-worker value (defaults unchanged: exit
+  `0` only, `30s` probe interval, `10s` start-period). This also removes a
+  footgun — a global `expected_exit` applied to *every* worker, so one job's
+  "exit 3 = success" could silently mask an unrelated worker's exit-3 crash. A
+  top-level `expected_exit` / `health_interval` / `health_start_period` now gives
+  a migration error pointing into a `[worker.NAME]` section. Breaking only for
+  configs that set these globally (move them under the relevant worker).
 - **The `[gpu]` section is now the global `gpu_interval` key.** GPU sampling has
   been auto-detected since v1.12 (no enable toggle), leaving `[gpu]` with a
   single `interval` key — a section for one setting. That key is now the global

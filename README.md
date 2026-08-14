@@ -430,15 +430,12 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `backoff_max` | global | — | |
 | `max_restarts` | global | `--max-restarts=` | |
 | `stop_grace` | global | — | |
-| `expected_exit` | global | — | |
 | `state_dir` | global | `--state-dir=` | `MANDOR_STATE_DIR` |
 | `metrics_port` | global | `--metrics=` | |
 | `photon` | global | — | `PHOTON_OTLP_HTTP_ENDPOINT` |
 | (relay bearer token) | — | — | `PHOTON_OTLP_TOKEN` |
 | `service_prefix` | global | — | `MANDOR_SERVICE_PREFIX` |
 | `on_incident` | global | — | |
-| `health_interval` | global | — | |
-| `health_start_period` | global | — | |
 | `ready_fd` | global | — | |
 | `restart_dependents` | global | — | |
 | `env_file` | global | — | |
@@ -463,6 +460,8 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `max_rss_mb` | `[worker.NAME]` | — | |
 | `max_lifetime` | `[worker.NAME]` | — | |
 | `expected_exit` | `[worker.NAME]` | — | |
+| `health_interval` | `[worker.NAME]` | — | |
+| `health_start_period` | `[worker.NAME]` | — | |
 | `pre_stop` | `[worker.NAME]` | — | |
 | `name` | `[worker.NAME]` | — | |
 | `workers` | `[secret.NAME]` | — | |

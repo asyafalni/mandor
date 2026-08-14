@@ -76,9 +76,6 @@ pub const Config = struct {
     state_dir: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
     metrics_port: ?u16 = null,
-    /// Exit codes treated exactly like exit 0 (restart policy, incidents,
-    /// worst-code propagation). Index = code; 0 is always clean.
-    expected_exit: [256]bool = [1]bool{true} ++ [1]bool{false} ** 255,
     /// Grace period between forwarding TERM/INT and escalating to SIGKILL.
     stop_grace_ms: u64 = 10_000,
     /// s6-style readiness: workers write a newline to this fd when ready.
@@ -86,7 +83,6 @@ pub const Config = struct {
     /// Health checks: worker-name -> probe command (exit 0 = healthy).
     health: [max_health]HealthSpec = undefined,
     health_n: u8 = 0,
-    health_interval_ms: u64 = 30_000,
     /// "dependent=dependency" ordering pairs (TOML-only; no CLI flag).
     start_after: [max_workers]HealthSpec = undefined,
     start_after_n: u8 = 0,
@@ -96,9 +92,6 @@ pub const Config = struct {
     /// Clean exits are never retried — a worker that exits 0 has finished.
     max_restarts: i32 = 0,
     max_restarts_set: bool = false,
-    /// Probe failures within this window after spawn (and before the first
-    /// success) don't count — the k8s startupProbe lesson.
-    health_start_period_ms: u64 = 10_000,
     /// Command exec'd after each incident bundle write, bundle path appended.
     on_incident: ?[]const u8 = null,
     /// photon OTLP endpoint ("ip:port"); when set, incidents auto-forward.
@@ -137,6 +130,11 @@ pub const Config = struct {
     /// Per-worker `expected_exit` overrides ("name" -> "143,129").
     expected_pairs: [16]HealthSpec = undefined,
     expected_pairs_n: u8 = 0,
+    /// Per-worker `health_interval` / `health_start_period` ("name" -> "10s").
+    health_interval_pairs: [16]HealthSpec = undefined,
+    health_interval_pairs_n: u8 = 0,
+    health_start_pairs: [16]HealthSpec = undefined,
+    health_start_pairs_n: u8 = 0,
     /// Per-worker display/telemetry `name` overrides (derived basename -> name).
     name_pairs: [16]HealthSpec = undefined,
     name_pairs_n: u8 = 0,

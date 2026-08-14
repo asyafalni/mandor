@@ -174,6 +174,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     error.GpuSectionRemoved => "the '[gpu]' section was removed — set the global " ++
                         "'gpu_interval' key instead (GPU metrics are auto-detected: on when a " ++
                         "device is present, off otherwise; there is no enable toggle)",
+                    error.PerWorkerOnly => "'expected_exit' / 'health_interval' / " ++
+                        "'health_start_period' are now per-worker only — move them into a " ++
+                        "[worker.NAME] section (they describe a specific binary, not the fleet)",
                     error.Syntax => "syntax",
                     error.BadValue => "bad value",
                     error.TooManyWorkers => "too many workers (max 64)",
@@ -183,9 +186,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (file_cfg.backoff_max_ms) |b| cfg.backoff_max_ms = b;
             if (cfg.metrics_port == null) cfg.metrics_port = file_cfg.metrics_port;
             if (file_cfg.stop_grace_ms) |g| cfg.stop_grace_ms = g;
-            if (file_cfg.expected_exit) |set| cfg.expected_exit = set;
             if (cfg.ready_fd == null) cfg.ready_fd = file_cfg.ready_fd;
-            if (file_cfg.health_interval_ms) |ms| cfg.health_interval_ms = ms;
             cfg.health = file_cfg.health;
             cfg.health_n = file_cfg.health_n;
             cfg.start_after = file_cfg.start_after;
@@ -193,7 +194,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (!cfg.max_restarts_set) {
                 if (file_cfg.max_restarts) |m| cfg.max_restarts = m;
             }
-            if (file_cfg.health_start_period_ms) |ms| cfg.health_start_period_ms = ms;
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
             if (file_cfg.gpu_interval_ms) |v| cfg.gpu_interval_ms = v;
             if (file_cfg.logs_max_rate) |v| cfg.logs.max_rate = v;
@@ -234,6 +234,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.lifetime_pairs_n = file_cfg.lifetime_pairs_n;
             cfg.expected_pairs = file_cfg.expected_pairs;
             cfg.expected_pairs_n = file_cfg.expected_pairs_n;
+            cfg.health_interval_pairs = file_cfg.health_interval_pairs;
+            cfg.health_interval_pairs_n = file_cfg.health_interval_pairs_n;
+            cfg.health_start_pairs = file_cfg.health_start_pairs;
+            cfg.health_start_pairs_n = file_cfg.health_start_pairs_n;
             cfg.name_pairs = file_cfg.name_pairs;
             cfg.name_pairs_n = file_cfg.name_pairs_n;
             cfg.secrets = file_cfg.secrets;

@@ -36,6 +36,10 @@ pub const Grant = struct {
     raw: bool,
 };
 
+/// Default per-worker health-probe timing (v1.14; overridable per `[worker.NAME]`).
+pub const default_health_interval_ms: u64 = 30_000;
+pub const default_health_start_period_ms: u64 = 10_000;
+
 pub const Worker = struct {
     name: [name_cap]u8 = undefined,
     name_len: u8 = 0,
@@ -69,6 +73,11 @@ pub const Worker = struct {
     health_done: bool = false, // set by reaper when a probe was collected
     health_ok: bool = false,
     health_ever_ok: bool = false, // start-period grace ends at first success
+    // Per-worker probe timing (v1.14; `[worker.NAME] health_interval` /
+    // `health_start_period`). Default when unset; a binary's readiness cadence
+    // and warm-up time are properties of that binary, not the fleet.
+    health_interval_ms: u64 = default_health_interval_ms,
+    health_start_period_ms: u64 = default_health_start_period_ms,
 
     // Per-worker extras (v0.8): env additions, working dir, oneshot marker.
     extra_env_buf: [1024]u8 = undefined,
@@ -185,6 +194,8 @@ fn resetWorker(w: *Worker) void {
     w.ready = false;
     w.ready_r = -1;
     w.has_health = false;
+    w.health_interval_ms = default_health_interval_ms;
+    w.health_start_period_ms = default_health_start_period_ms;
     w.health_pid = 0;
     w.health_started_ms = 0;
     w.next_health_ms = 0;
