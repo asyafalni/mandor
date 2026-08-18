@@ -93,6 +93,12 @@ pub const FileConfig = struct {
     /// after the final worker set (CLI or TOML) is known. Transient: never
     /// copied into cli.Config, so `secrets[*].workers` holds indices only.
     secret_refs: [cli.max_secrets][cli.max_secret_workers][]const u8 = undefined,
+    /// `[require.NAME]` fail-closed boot gates.
+    require: [cli.max_require]cli.ReqDef = undefined,
+    require_n: u8 = 0,
+    /// `[prober.NAME]` periodic report/incident monitors.
+    probers: [cli.max_probers]cli.ProbeDef = undefined,
+    probers_n: u8 = 0,
 };
 
 /// Backing store for derived `CONFD_<NAME>` env names (used only when a secret
@@ -153,6 +159,8 @@ pub fn parse(
     var cur_worker: ?[]const u8 = null; // active [worker.NAME] section
     var cur_secret: ?usize = null; // active [secret.NAME] section (index)
     var cur_logs = false; // active [logs] section
+    var cur_require: ?usize = null; // active [require.NAME] section (index)
+    var cur_prober: ?usize = null; // active [prober.NAME] section (index)
 
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw_line| {
@@ -184,16 +192,36 @@ pub fn parse(
                     cur_worker = nm;
                     cur_secret = null;
                     cur_logs = false;
+                    cur_require = null;
+                    cur_prober = null;
                 },
                 .secret => |nm| {
                     cur_worker = null;
                     cur_logs = false;
+                    cur_require = null;
+                    cur_prober = null;
                     cur_secret = try beginSecret(cfg, nm);
                 },
                 .logs => {
                     cur_worker = null;
                     cur_secret = null;
+                    cur_require = null;
+                    cur_prober = null;
                     cur_logs = true;
+                },
+                .require => |nm| {
+                    cur_worker = null;
+                    cur_secret = null;
+                    cur_logs = false;
+                    cur_prober = null;
+                    cur_require = try beginRequire(cfg, nm);
+                },
+                .prober => |nm| {
+                    cur_worker = null;
+                    cur_secret = null;
+                    cur_logs = false;
+                    cur_require = null;
+                    cur_prober = try beginProber(cfg, nm);
                 },
             }
             continue;
@@ -210,6 +238,16 @@ pub fn parse(
 
         if (cur_secret) |si| {
             try secretSetting(cfg, si, &target, &array_secret, key, value);
+            continue;
+        }
+
+        if (cur_require) |ri| {
+            try requireSetting(cfg, ri, key, value);
+            continue;
+        }
+
+        if (cur_prober) |pi| {
+            try proberSetting(cfg, pi, key, value);
             continue;
         }
 
@@ -294,6 +332,16 @@ pub fn parse(
     if (target != .none) return error.Syntax;
     cfg.commands = cmd_storage[0..ncmd];
     try checkSecretEnvs(cfg);
+    // `check` is mandatory for every [require.*] / [prober.*]; a [prober.*]
+    // additionally requires `interval` (also catches a section with no keys
+    // at all, since both fields default to zero-length/zero).
+    for (cfg.require[0..cfg.require_n]) |r| {
+        if (r.cmd.len == 0) return error.BadValue;
+    }
+    for (cfg.probers[0..cfg.probers_n]) |p| {
+        if (p.cmd.len == 0) return error.BadValue;
+        if (p.interval_ms == 0) return error.BadValue;
+    }
 }
 
 /// Keys valid inside a `[worker.NAME]` section.
@@ -314,12 +362,13 @@ fn workerKey(key: []const u8) ?ArrayTarget {
     return null;
 }
 
-const Section = union(enum) { worker: []const u8, secret: []const u8, logs };
+const Section = union(enum) { worker: []const u8, secret: []const u8, logs, require: []const u8, prober: []const u8 };
 
-/// `[worker.NAME]` / `[secret.NAME]` / `[logs]` -> the section kind (+ NAME for
-/// the first two). `[gpu]` was flattened to the global `gpu_interval` key in
-/// v1.14 and now gives a migration error. Any other header is a hard error:
-/// configs are small, so a typo should stop startup rather than be ignored.
+/// `[worker.NAME]` / `[secret.NAME]` / `[logs]` / `[require.NAME]` /
+/// `[prober.NAME]` -> the section kind (+ NAME where applicable). `[gpu]` was
+/// flattened to the global `gpu_interval` key in v1.14 and now gives a
+/// migration error. Any other header is a hard error: configs are small, so a
+/// typo should stop startup rather than be ignored.
 fn sectionHeader(line: []const u8) ParseError!Section {
     if (line[line.len - 1] != ']') return error.Syntax;
     const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
@@ -327,6 +376,8 @@ fn sectionHeader(line: []const u8) ParseError!Section {
     if (std.mem.eql(u8, inner, "logs")) return .logs;
     if (sectionName(inner, "worker.")) |nm| return .{ .worker = nm };
     if (sectionName(inner, "secret.")) |nm| return .{ .secret = nm };
+    if (sectionName(inner, "require.")) |nm| return .{ .require = nm };
+    if (sectionName(inner, "prober.")) |nm| return .{ .prober = nm };
     return error.Syntax;
 }
 
@@ -406,6 +457,74 @@ fn beginSecret(cfg: *FileConfig, name: []const u8) ParseError!usize {
     };
     cfg.secrets_n += 1;
     return idx;
+}
+
+/// Start a `[require.NAME]` section: seed a defaulted entry (60s timeout, no
+/// `check` yet — enforced present at parse end) and return its index.
+fn beginRequire(cfg: *FileConfig, name: []const u8) ParseError!usize {
+    if (cfg.require_n == cfg.require.len) return error.BadValue; // too many requires
+    const idx = cfg.require_n;
+    cfg.require[idx] = .{ .name = name, .cmd = "" };
+    cfg.require_n += 1;
+    return idx;
+}
+
+/// Start a `[prober.NAME]` section: seed a defaulted entry (no `check`/
+/// `interval` yet — both enforced present at parse end) and return its index.
+fn beginProber(cfg: *FileConfig, name: []const u8) ParseError!usize {
+    if (cfg.probers_n == cfg.probers.len) return error.BadValue; // too many probers
+    const idx = cfg.probers_n;
+    cfg.probers[idx] = .{ .name = name, .cmd = "", .interval_ms = 0 };
+    cfg.probers_n += 1;
+    return idx;
+}
+
+/// Apply one `key = value` inside `[require.NAME]`.
+fn requireSetting(cfg: *FileConfig, ri: usize, key: []const u8, value: []const u8) ParseError!void {
+    if (std.mem.eql(u8, key, "check")) {
+        cfg.require[ri].cmd = parseString(value) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "timeout")) {
+        const s = parseString(value) orelse return error.BadValue;
+        const ms = cli.parseDuration(s) orelse return error.BadValue;
+        if (ms == 0) return error.BadValue; // a 0 timeout can never pass
+        cfg.require[ri].timeout_ms = ms;
+    } else {
+        return error.Syntax; // unknown key inside a [require.*] section
+    }
+}
+
+/// Apply one `key = value` inside `[prober.NAME]`.
+fn proberSetting(cfg: *FileConfig, pi: usize, key: []const u8, value: []const u8) ParseError!void {
+    if (std.mem.eql(u8, key, "check")) {
+        cfg.probers[pi].cmd = parseString(value) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "interval")) {
+        const s = parseString(value) orelse return error.BadValue;
+        const ms = cli.parseDuration(s) orelse return error.BadValue;
+        // 0 would fire the check every poll tick, busy-spinning PID 1.
+        if (ms == 0) return error.BadValue;
+        cfg.probers[pi].interval_ms = ms;
+    } else if (std.mem.eql(u8, key, "timeout")) {
+        const s = parseString(value) orelse return error.BadValue;
+        const ms = cli.parseDuration(s) orelse return error.BadValue;
+        if (ms == 0) return error.BadValue; // a 0 timeout can never pass
+        cfg.probers[pi].timeout_ms = ms;
+    } else if (std.mem.eql(u8, key, "on_fail")) {
+        const s = parseString(value) orelse return error.BadValue;
+        if (std.mem.eql(u8, s, "report")) {
+            cfg.probers[pi].on_fail = .report;
+        } else if (std.mem.eql(u8, s, "incident")) {
+            cfg.probers[pi].on_fail = .incident;
+        } else {
+            return error.BadValue;
+        }
+    } else if (std.mem.eql(u8, key, "fail_threshold")) {
+        const s = parseString(value) orelse return error.BadValue;
+        const n = std.fmt.parseInt(u8, s, 10) catch return error.BadValue;
+        if (n < 1) return error.BadValue;
+        cfg.probers[pi].fail_threshold = n;
+    } else {
+        return error.Syntax; // unknown key inside a [prober.*] section
+    }
 }
 
 /// Apply one `key = value` inside `[secret.NAME]`.
@@ -1156,6 +1275,41 @@ test "resolveSecretGrants: all-absent (and empty) grants are inert, not errors" 
     resolveSecretGrants(fc.secrets[0..fc.secrets_n], fc.secret_refs[0..fc.secrets_n], &cmds);
     try t.expectEqual(@as(usize, 0), fc.secrets[0].workers_len); // absent ref → inert
     try t.expectEqual(@as(usize, 0), fc.secrets[1].workers_len); // workers = [] → inert
+}
+
+test "require section parses check + timeout default" {
+    var s: [cli.max_workers][]const u8 = undefined;
+    const cfg = try parseTest("[require.gpu]\ncheck = \"/gpu.sh --min 525\"", &s);
+    try t.expectEqual(@as(u8, 1), cfg.require_n);
+    try t.expectEqualStrings("gpu", cfg.require[0].name);
+    try t.expectEqualStrings("/gpu.sh --min 525", cfg.require[0].cmd);
+    try t.expectEqual(@as(u64, 60_000), cfg.require[0].timeout_ms);
+}
+test "require: missing check and timeout=0 are errors" {
+    var s: [cli.max_workers][]const u8 = undefined;
+    try t.expectError(error.BadValue, parseTest("[require.gpu]\ntimeout = \"30s\"", &s));
+    try t.expectError(error.BadValue, parseTest("[require.gpu]\ncheck=\"x\"\ntimeout=\"0s\"", &s));
+    try t.expectError(error.Syntax, parseTest("[require.gpu]\ncheck=\"x\"\nbogus=\"1\"", &s));
+}
+test "prober section parses with defaults and overrides" {
+    var s: [cli.max_workers][]const u8 = undefined;
+    const cfg = try parseTest("[prober.pipe]\ncheck=\"/m.sh\"\ninterval=\"2m\"", &s);
+    try t.expectEqual(@as(u8, 1), cfg.probers_n);
+    try t.expectEqualStrings("pipe", cfg.probers[0].name);
+    try t.expectEqual(@as(u64, 120_000), cfg.probers[0].interval_ms);
+    try t.expectEqual(@as(u64, 10_000), cfg.probers[0].timeout_ms);
+    try t.expectEqual(cli.ProbeDef.OnFail.report, cfg.probers[0].on_fail);
+    try t.expectEqual(@as(u8, 1), cfg.probers[0].fail_threshold);
+    const c2 = try parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"incident\"\nfail_threshold=\"3\"", &s);
+    try t.expectEqual(cli.ProbeDef.OnFail.incident, c2.probers[0].on_fail);
+    try t.expectEqual(@as(u8, 3), c2.probers[0].fail_threshold);
+}
+test "prober: missing interval/check, bad on_fail, threshold=0 are errors" {
+    var s: [cli.max_workers][]const u8 = undefined;
+    try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"", &s)); // no interval
+    try t.expectError(error.BadValue, parseTest("[prober.p]\ninterval=\"5s\"", &s)); // no check
+    try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"nope\"", &s));
+    try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\nfail_threshold=\"0\"", &s));
 }
 
 test "resolveSecretGrants resolves against CLI-only workers (no TOML workers=)" {
