@@ -4,9 +4,20 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const cli = @import("cli.zig");
 const spawner = @import("spawner.zig");
 
-pub const ReapSummary = struct { reaped_workers: u8 = 0 };
+/// One `[prober.NAME]` check pid reaped this pass: `idx` indexes the
+/// supervisor's own `cfg.probers[]` / `prober_state[]` (never a worker
+/// index — probers and workers are separate index spaces entirely).
+pub const ProberReap = struct { idx: u8, ok: bool };
+
+pub const ReapSummary = struct {
+    reaped_workers: u8 = 0,
+    /// Prober checks reaped this pass — bounded, fixed capacity, no alloc.
+    prober_reaped: [cli.max_probers]ProberReap = undefined,
+    prober_reaped_n: u8 = 0,
+};
 
 /// Drain every exited child without blocking. Dead workers get their status
 /// classified (exit code, or 128+signal) and pid cleared.
@@ -15,7 +26,14 @@ pub const ReapSummary = struct { reaped_workers: u8 = 0 };
 /// already sent TERM, and killing it here would cut short grandchildren
 /// still running their own handlers inside stop-grace. They are reached
 /// via `Worker.pgid` if stop-grace expires.
-pub fn drain(workers: []spawner.Worker, sweep_kill: bool) ReapSummary {
+///
+/// `prober_pids[i]` is the pid `[prober.NAME]` slot `i` is currently
+/// running (0 = none) — the supervisor's `prober_state[pi].pid` mirrored
+/// into a plain slice so this module never needs to know the supervisor's
+/// `ProberState` type. A pid is checked against this slice ONLY after it
+/// has failed to match every worker/health/prestop pid above, so a prober
+/// pid can never be mistaken for (or shadow) a worker pid, and vice versa.
+pub fn drain(workers: []spawner.Worker, sweep_kill: bool, prober_pids: []const i32) ReapSummary {
     var summary: ReapSummary = .{};
     while (true) {
         var st: u32 = 0;
@@ -27,6 +45,7 @@ pub fn drain(workers: []spawner.Worker, sweep_kill: bool) ReapSummary {
         }
         const pid: i32 = @intCast(rc);
         if (pid == 0) return summary; // children exist, none exited
+        var matched = false;
         for (workers) |*w| {
             if (w.pid == pid and sweep_kill) {
                 // Leader is dead and we are still supervising: sweep any
@@ -41,11 +60,13 @@ pub fn drain(workers: []spawner.Worker, sweep_kill: bool) ReapSummary {
                 w.health_pid = 0;
                 w.health_done = true;
                 w.health_ok = linux.W.IFEXITED(st) and linux.W.EXITSTATUS(st) == 0;
+                matched = true;
                 break;
             }
             if (w.prestop_pid == pid) {
                 w.prestop_pid = 0;
                 w.prestop_done = true;
+                matched = true;
                 break;
             }
             if (w.pid != pid) continue;
@@ -64,8 +85,27 @@ pub fn drain(workers: []spawner.Worker, sweep_kill: bool) ReapSummary {
                 w.final_code = 255;
             }
             summary.reaped_workers += 1;
+            matched = true;
             break;
         }
+        if (matched) continue;
+        // Not a worker/health/prestop pid at all — check the probers. A
+        // never-configured or already-idle slot has pid 0, which this reaped
+        // `pid` (always > 0) can never equal, so no accidental match.
+        for (prober_pids, 0..) |ppid, pi| {
+            if (ppid != pid) continue;
+            if (summary.prober_reaped_n < summary.prober_reaped.len) {
+                summary.prober_reaped[summary.prober_reaped_n] = .{
+                    .idx = @intCast(pi),
+                    .ok = linux.W.IFEXITED(st) and linux.W.EXITSTATUS(st) == 0,
+                };
+                summary.prober_reaped_n += 1;
+            }
+            break;
+        }
+        // Neither a worker/health/prestop pid nor a known prober pid: an
+        // inherited orphan (mandor is PID 1) — reaped and discarded silently,
+        // same as before this change.
     }
 }
 
@@ -95,7 +135,7 @@ test "spawn, reap, classify exit and signal deaths" {
     var reaped: u8 = 0;
     var tries: u32 = 0;
     while (reaped < 2 and tries < 5000) : (tries += 1) {
-        reaped += drain(workers[0..2], true).reaped_workers;
+        reaped += drain(workers[0..2], true, &.{}).reaped_workers;
         if (reaped < 2) sleepMs(1);
     }
     try std.testing.expectEqual(@as(u8, 2), reaped);

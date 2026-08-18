@@ -340,6 +340,48 @@ pub fn spawnCheck(
     return true;
 }
 
+/// `[prober.NAME]` periodic check: fork/exec an arbitrary command string,
+/// NON-BLOCKING — mirrors `spawnCheck` exactly (stdio to /dev/null, dies
+/// with the supervisor via PDEATHSIG + a getppid guard, signal mask reset)
+/// but tokenizes `cmd` fresh each call instead of reading `w.health_argv`,
+/// since a prober has no `Worker` to hang state off. The caller (the
+/// poll-loop's `runProbers`) owns the returned pid and its own bounded
+/// timeout — this function never waits. Returns 0 on any tokenize/fork
+/// failure (fail-closed: the caller sees "no probe running" and retries
+/// next interval, never blocks, never panics).
+pub fn spawnCheckArgv(
+    cmd: []const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) i32 {
+    var buf: [4096]u8 = undefined;
+    var toks: [max_args][]const u8 = undefined;
+    const toked = cli.tokenize(cmd, &buf, &toks) catch return 0;
+    if (toked.len == 0) return 0;
+    var argv: [max_args + 1]?[*:0]const u8 = undefined;
+    for (toked, 0..) |t, i| argv[i] = @ptrCast(t.ptr);
+    argv[toked.len] = null;
+
+    const supervisor_pid = linux.getpid();
+    const rc = linux.fork();
+    if (posix.errno(rc) != .SUCCESS) return 0;
+    if (rc == 0) {
+        // Probes die with the supervisor — hard, they hold no state.
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        if (linux.getppid() != supervisor_pid) linux.exit(1);
+        const empty = posix.sigemptyset();
+        posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+        const null_rc = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        if (posix.errno(null_rc) == .SUCCESS) {
+            const null_fd: i32 = @intCast(null_rc);
+            _ = linux.dup2(null_fd, 1);
+            _ = linux.dup2(null_fd, 2);
+        }
+        execArgv(@ptrCast(&argv), envp, path_env);
+    }
+    return @intCast(rc);
+}
+
 /// Monotonic milliseconds — local to spawner so `runCheck`'s bounded wait
 /// needs no dependency on the supervisor's own `nowMs`.
 fn monoMs() u64 {
