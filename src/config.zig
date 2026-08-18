@@ -518,8 +518,8 @@ fn proberSetting(cfg: *FileConfig, pi: usize, key: []const u8, value: []const u8
             return error.BadValue;
         }
     } else if (std.mem.eql(u8, key, "fail_threshold")) {
-        const s = parseString(value) orelse return error.BadValue;
-        const n = std.fmt.parseInt(u8, s, 10) catch return error.BadValue;
+        // A bare integer, like every other int key (metrics_port, psi_*, …) — no quotes.
+        const n = std.fmt.parseInt(u8, value, 10) catch return error.BadValue;
         if (n < 1) return error.BadValue;
         cfg.probers[pi].fail_threshold = n;
     } else {
@@ -1300,7 +1300,7 @@ test "prober section parses with defaults and overrides" {
     try t.expectEqual(@as(u64, 10_000), cfg.probers[0].timeout_ms);
     try t.expectEqual(cli.ProbeDef.OnFail.report, cfg.probers[0].on_fail);
     try t.expectEqual(@as(u8, 1), cfg.probers[0].fail_threshold);
-    const c2 = try parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"incident\"\nfail_threshold=\"3\"", &s);
+    const c2 = try parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"incident\"\nfail_threshold=3", &s);
     try t.expectEqual(cli.ProbeDef.OnFail.incident, c2.probers[0].on_fail);
     try t.expectEqual(@as(u8, 3), c2.probers[0].fail_threshold);
 }
@@ -1309,7 +1309,7 @@ test "prober: missing interval/check, bad on_fail, threshold=0 are errors" {
     try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"", &s)); // no interval
     try t.expectError(error.BadValue, parseTest("[prober.p]\ninterval=\"5s\"", &s)); // no check
     try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"nope\"", &s));
-    try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\nfail_threshold=\"0\"", &s));
+    try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\nfail_threshold=0", &s));
 }
 
 test "resolveSecretGrants resolves against CLI-only workers (no TOML workers=)" {
