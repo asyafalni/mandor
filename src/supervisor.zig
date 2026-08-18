@@ -274,6 +274,9 @@ fn printPlan(cfg: *const cli.Config, workers: []const spawner.Worker, dep_of: []
     for (cfg.require[0..cfg.require_n]) |r| {
         logmod.print("[mandor]   requirement '{s}': {s}\n", .{ r.name, r.cmd });
     }
+    for (cfg.probers[0..cfg.probers_n]) |p| {
+        logmod.print("[mandor]   prober '{s}' every {d}ms — on_fail={s} (never restarts)\n", .{ p.name, p.interval_ms, @tagName(p.on_fail) });
+    }
 }
 
 fn planLine(w: *const spawner.Worker, note: []const u8) void {
@@ -360,7 +363,6 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
     var oneshot_count: usize = 0;
     if (applyConfig(cfg, workers, &dep_of, &oneshot_count)) |code| return code;
-    if (initSecrets(cfg, workers)) |code| return code;
     printPlan(cfg, workers, &dep_of);
 
     const path_env = spawner.findPath(environ);
@@ -369,6 +371,10 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     // or oneshot spawns. Bounded + blocking is fine here — boot has no fleet
     // to protect yet, and this is the only place in `run()` that blocks.
     if (!runRequires(cfg, envp, path_env)) return 1;
+
+    // Mint app-shared secrets only AFTER the gate passes — a rejected boot must
+    // never CSPRNG/mlock a fleet that will never start.
+    if (initSecrets(cfg, workers)) |code| return code;
 
     tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
     tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
@@ -901,7 +907,11 @@ fn fireProberOnFail(def: *const cli.ProbeDef, ps: *ProberState, state_dir: []con
     logmod.print("[mandor] prober '{s}' failing, on_fail={s}\n", .{ def.name, @tagName(def.on_fail) });
     telemetry.emitLog(def.name, 1, 1, telemetry.nowNs(), "prober check failed"); // iostream=stderr, severity=warn
     if (def.on_fail != .incident) return;
-    if (now -| ps.last_incident_ms < detector.dedup_cooldown_ms) return;
+    // `last_incident_ms == 0` means "never spooled" — the cooldown must not gate
+    // the FIRST incident. Without the sentinel, a host whose CLOCK_MONOTONIC (=
+    // uptime) is under the cooldown (fresh VM/CI runner) would drop it, since
+    // `now -| 0 < cooldown`. Mirror detector.StallState's `fired_at_ms != 0` guard.
+    if (ps.last_incident_ms != 0 and now -| ps.last_incident_ms < detector.dedup_cooldown_ms) return;
     ps.last_incident_ms = now;
     var verdict_buf: [96]u8 = undefined;
     const verdict = std.fmt.bufPrint(&verdict_buf, "prober:{s} failing", .{def.name}) catch "prober failing";
@@ -1900,7 +1910,10 @@ test "prober on_fail=incident spools exactly once per cooldown window; on_fail=r
     prober_state[1] = .{};
 
     const before = incident.total;
-    const now: u64 = 5_000_000;
+    // Deliberately BELOW detector.dedup_cooldown_ms (600_000): CLOCK_MONOTONIC is
+    // host uptime, so a fresh host starts here. The FIRST incident must still fire
+    // (the last_incident_ms==0 sentinel) — a plain `now -| 0 < cooldown` would drop it.
+    const now: u64 = 90_000;
 
     // Prober 0 (report): crossing the threshold fires but never spools.
     collectProber(&cfg, state_dir, 0, false, now);

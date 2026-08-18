@@ -480,9 +480,23 @@ fn beginProber(cfg: *FileConfig, name: []const u8) ParseError!usize {
 }
 
 /// Apply one `key = value` inside `[require.NAME]`.
+/// A `[require]`/`[prober]` `check` is tokenized at spawn time, not here, so a
+/// malformed command (e.g. an unbalanced quote) would otherwise slip past
+/// `validate`: a bad prober check silently never runs, a bad require aborts only
+/// at boot. Reject it at parse time instead. Buffers are stack-local (parse is
+/// not the hot path) and `cli.tokenize` is pure.
+fn checkTokenizes(cmd: []const u8) bool {
+    var tokbuf: [4096]u8 = undefined;
+    var toks: [worker_max_args][]const u8 = undefined;
+    const argv = cli.tokenize(cmd, &tokbuf, &toks) catch return false;
+    return argv.len > 0;
+}
+
 fn requireSetting(cfg: *FileConfig, ri: usize, key: []const u8, value: []const u8) ParseError!void {
     if (std.mem.eql(u8, key, "check")) {
-        cfg.require[ri].cmd = parseString(value) orelse return error.BadValue;
+        const s = parseString(value) orelse return error.BadValue;
+        if (!checkTokenizes(s)) return error.BadValue;
+        cfg.require[ri].cmd = s;
     } else if (std.mem.eql(u8, key, "timeout")) {
         const s = parseString(value) orelse return error.BadValue;
         const ms = cli.parseDuration(s) orelse return error.BadValue;
@@ -496,7 +510,9 @@ fn requireSetting(cfg: *FileConfig, ri: usize, key: []const u8, value: []const u
 /// Apply one `key = value` inside `[prober.NAME]`.
 fn proberSetting(cfg: *FileConfig, pi: usize, key: []const u8, value: []const u8) ParseError!void {
     if (std.mem.eql(u8, key, "check")) {
-        cfg.probers[pi].cmd = parseString(value) orelse return error.BadValue;
+        const s = parseString(value) orelse return error.BadValue;
+        if (!checkTokenizes(s)) return error.BadValue;
+        cfg.probers[pi].cmd = s;
     } else if (std.mem.eql(u8, key, "interval")) {
         const s = parseString(value) orelse return error.BadValue;
         const ms = cli.parseDuration(s) orelse return error.BadValue;
@@ -1310,6 +1326,10 @@ test "prober: missing interval/check, bad on_fail, threshold=0 are errors" {
     try t.expectError(error.BadValue, parseTest("[prober.p]\ninterval=\"5s\"", &s)); // no check
     try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"nope\"", &s));
     try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\nfail_threshold=0", &s));
+    // A malformed check (unbalanced quote) is rejected at parse, not left to
+    // silently never tokenize at runtime.
+    try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"sh -c 'oops\"\ninterval=\"5s\"", &s));
+    try t.expectError(error.BadValue, parseTest("[require.g]\ncheck=\"sh -c 'oops\"", &s));
 }
 
 test "resolveSecretGrants resolves against CLI-only workers (no TOML workers=)" {
