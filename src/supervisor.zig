@@ -267,10 +267,37 @@ fn printPlan(cfg: *const cli.Config, workers: []const spawner.Worker, dep_of: []
         }
         if (w.has_health) planLine(w, "health probe — 3 failures stop the worker");
     }
+    // `[require.*]` boot gates: reported here (both `run` and `validate` call
+    // printPlan), never executed — validate must stay side-effect free, and
+    // `run` executes them separately via `runRequires` before any spawn.
+    for (cfg.require[0..cfg.require_n]) |r| {
+        logmod.print("[mandor]   requirement '{s}': {s}\n", .{ r.name, r.cmd });
+    }
 }
 
 fn planLine(w: *const spawner.Worker, note: []const u8) void {
     logmod.print("[mandor]   {s}: {s}\n", .{ w.nameSlice(), note });
+}
+
+/// Run every `[require.*]` boot gate, in declaration order, strictly BEFORE
+/// any worker or oneshot spawns — called only from `run` (never `validate`,
+/// which reports requires without executing them; see `printPlan`). Each
+/// check is a bounded, blocking `spawner.runCheck`; the first non-zero exit,
+/// timeout, or exec failure aborts boot fail-closed. All passing returns true.
+fn runRequires(
+    cfg: *const cli.Config,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) bool {
+    for (cfg.require[0..cfg.require_n]) |r| {
+        logmod.print("[mandor] checking requirement '{s}'\n", .{r.name});
+        const code = spawner.runCheck(r.cmd, r.timeout_ms, envp, path_env);
+        if (code != 0) {
+            logmod.print("[mandor] requirement '{s}' not met (exit {d})\n", .{ r.name, code });
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Mint every configured secret once, into the mlock'd registry, and stamp a
@@ -335,10 +362,15 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     if (initSecrets(cfg, workers)) |code| return code;
     printPlan(cfg, workers, &dep_of);
 
-    tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
-    tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
     const path_env = spawner.findPath(environ);
     const envp: [*:null]const ?[*:0]const u8 = environ.ptr;
+    // Fail-closed boot gate: every `[require.*]` must pass BEFORE any worker
+    // or oneshot spawns. Bounded + blocking is fine here — boot has no fleet
+    // to protect yet, and this is the only place in `run()` that blocks.
+    if (!runRequires(cfg, envp, path_env)) return 1;
+
+    tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
+    tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
 
     const sigs = signals.Signals.init() catch {
         logmod.print("[mandor] cannot create signalfd\n", .{});
@@ -1612,4 +1644,14 @@ test "validate still fails on a real error (self-dependency)" {
     cfg.start_after[0] = .{ .worker = "api.sh", .cmd = "api.sh" }; // depends on itself
     cfg.start_after_n = 1;
     try testing.expect(validate(&cfg) != 0);
+}
+
+test "validate reports requires without executing them" {
+    var cfg = cli.Config{};
+    var cmds = [_][]const u8{"api.sh"};
+    cfg.commands = &cmds;
+    cfg.require = undefined;
+    cfg.require[0] = .{ .name = "gpu", .cmd = "/bin/false" }; // would fail if executed
+    cfg.require_n = 1;
+    try testing.expectEqual(@as(u8, 0), validate(&cfg)); // parses/reports, never runs /bin/false
 }

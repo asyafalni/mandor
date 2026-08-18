@@ -340,6 +340,83 @@ pub fn spawnCheck(
     return true;
 }
 
+/// Monotonic milliseconds — local to spawner so `runCheck`'s bounded wait
+/// needs no dependency on the supervisor's own `nowMs`.
+fn monoMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+fn sleepMs(ms: u64) void {
+    var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(ms * std.time.ns_per_ms) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+/// `[require.NAME]` boot-gate check: fork/exec `cmd` (tokenized the same way
+/// as a worker command) and BLOCK until it exits or `timeout_ms` elapses.
+/// Boot has no fleet to protect yet — unlike every other spawn path in this
+/// file, a bounded blocking wait here is fine because it runs once, strictly
+/// before any worker exists. Fail-closed: a tokenize/fork/exec problem, or a
+/// timeout (SIGKILL + reap), returns 255; otherwise the child's real exit
+/// code. No allocation, no panic — every syscall errno is handled.
+pub fn runCheck(
+    cmd: []const u8,
+    timeout_ms: u64,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) u8 {
+    var buf: [4096]u8 = undefined;
+    var toks: [max_args][]const u8 = undefined;
+    const toked = cli.tokenize(cmd, &buf, &toks) catch return 255;
+    if (toked.len == 0) return 255;
+    var argv: [max_args + 1]?[*:0]const u8 = undefined;
+    for (toked, 0..) |t, i| argv[i] = @ptrCast(t.ptr);
+    argv[toked.len] = null;
+
+    const supervisor_pid = linux.getpid();
+    const rc = linux.fork();
+    if (posix.errno(rc) != .SUCCESS) return 255;
+    if (rc == 0) {
+        // Dies with the supervisor — it holds no state worth draining.
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        if (linux.getppid() != supervisor_pid) linux.exit(1);
+        const empty = posix.sigemptyset();
+        posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+        execArgv(@ptrCast(&argv), envp, path_env);
+    }
+    const pid: i32 = @intCast(rc);
+    const deadline = monoMs() +| timeout_ms;
+
+    while (true) {
+        var st: u32 = 0;
+        const wrc = linux.waitpid(pid, &st, linux.W.NOHANG);
+        switch (posix.errno(wrc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return 255, // fail-closed: treat as not met
+        }
+        if (wrc == pid) {
+            if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
+            return 255; // signaled or other abnormal exit: fail-closed
+        }
+        if (monoMs() >= deadline) {
+            posix.kill(pid, .KILL) catch {};
+            // Bounded reap: SIGKILL lands almost immediately, but never spin
+            // forever waiting for it.
+            var tries: u32 = 0;
+            while (tries < 2000) : (tries += 1) {
+                var st2: u32 = 0;
+                const wrc2 = linux.waitpid(pid, &st2, linux.W.NOHANG);
+                if (posix.errno(wrc2) != .SUCCESS or wrc2 == pid) break;
+                sleepMs(1);
+            }
+            return 255;
+        }
+        sleepMs(5);
+    }
+}
+
 pub const InitError = error{BadCommand};
 
 /// Tokenize each command into its worker's fixed buffers and derive log names.
