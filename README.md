@@ -468,10 +468,24 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `bytes` | `[secret.NAME]` | — | |
 | `format` | `[secret.NAME]` | — | |
 | `env` | `[secret.NAME]` | — | |
+| `check` | `[require.NAME]` | — | |
+| `timeout` | `[require.NAME]` | — | |
+| `check` | `[prober.NAME]` | — | |
+| `interval` | `[prober.NAME]` | — | |
+| `on_fail` | `[prober.NAME]` | — | |
+| `timeout` | `[prober.NAME]` | — | |
+| `fail_threshold` | `[prober.NAME]` | — | |
 
 GPU metrics are auto-detected (no enable toggle). The only tunable is the
 global `gpu_interval` key (default `15s`); the old `[gpu]` section was flattened
 to it in v1.14.
+
+**Declarative checks (v1.15).** `[require.NAME]` runs a command **before any
+worker** and aborts boot fail-closed on non-zero (a GPU/driver precondition,
+where the `check` calls `nvidia-smi`/etc. — mandor runs no vendor code).
+`[prober.NAME]` runs a command **on a timer** and *reports* (log/photon) or
+raises an incident on failure — it never restarts a worker (`health` remains the
+sole restart authority). See [docs/CONFIG.md](docs/CONFIG.md).
 
 ### App-shared secrets (`[secret.NAME]`)
 

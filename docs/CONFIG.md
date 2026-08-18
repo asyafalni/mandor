@@ -376,6 +376,63 @@ Reading via the fd does **not** put the value in your environ; if you then
 `export` it, it re-enters *your* process's environ — avoid that unless you
 deliberately ship the value onward.
 
+## Boot preconditions — `[require.NAME]` sections
+
+A `[require.NAME]` runs a command **before any worker (or oneshot) spawns**; a
+non-zero exit **aborts the boot** — mandor logs `requirement '<name>' not met`
+and exits non-zero, so the container runtime's restart policy decides what
+happens (mandor never reboots the host). All requires must pass, in order.
+
+The `check` is an **opaque command** — it's where a GPU/driver/hardware
+requirement lives (`nvidia-smi`, `rocm-smi`, `xpu-smi`, …); mandor runs no
+vendor code and does no version parsing itself. Any wait/retry (e.g. "wait 30s
+for the driver") belongs inside the check script.
+
+```toml
+[require.gpu-driver]
+check   = "/opt/checks/gpu-require.sh --driver-min 525"   # your script calls nvidia-smi etc.
+timeout = "60s"                                           # optional; default 60s
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `check` | string | — (**required**) | Command to run; exit 0 = requirement met |
+| `timeout` | duration | `60s` | A check that runs longer is SIGKILLed and counts as a failure |
+
+`mandor validate` reports the requires but never executes them (validate never
+spawns). Fail-closed: a tokenize/exec error or timeout is a failure.
+
+## Status probers — `[prober.NAME]` sections
+
+A `[prober.NAME]` runs a command **on a timer** once the fleet is up and
+**reports** the result. mandor owns the interval, so the check stays a simple
+"check once, exit" command instead of a hand-written `while true; sleep` loop.
+
+A prober **never restarts, kills, or gates a worker** — `health` is the sole
+restart authority. If a check should trigger a restart, put it in the worker's
+`health` command instead. Use a prober for monitoring that should *report*, not
+act (e.g. a pipeline/license status check).
+
+```toml
+[prober.pipeline-status]
+check    = "/opt/checks/pipeline-status.sh"   # simple check-once script
+interval = "2m"                               # required
+on_fail  = "report"                           # "report" (default) | "incident"
+timeout  = "10s"                              # optional; default 10s
+# fail_threshold = 1                          # optional; consecutive fails before on_fail
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `check` | string | — (**required**) | Command to run on the timer; exit 0 = healthy |
+| `interval` | duration | — (**required**) | How often to run the check (must be > 0) |
+| `on_fail` | string | `report` | `report` → an OTLP log to photon + a local warn line; `incident` → that plus a spooled incident bundle (cooldown-guarded) |
+| `timeout` | duration | `10s` | A check running longer is SIGKILLed and counts as a failure |
+| `fail_threshold` | int ≥ 1 | `1` | Consecutive failures before `on_fail` fires |
+
+Like all telemetry, a prober's `report`/`incident` output ships to photon only
+when `photon=` is set; the local log line prints regardless.
+
 ## Signals & exit codes
 
 TERM/INT: graceful shutdown (forwarded to process groups, `pre_stop` hooks
