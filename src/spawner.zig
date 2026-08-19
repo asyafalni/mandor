@@ -721,7 +721,11 @@ pub fn spawn(
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &ts);
     w.spawned_at_epoch = ts.sec;
-    resolveExe(w, path_env);
+    // Cache across restarts: argv[0] and PATH can't change for a worker's
+    // lifetime, so resolve the exe once (like build_id below). Skipping the
+    // faccessat-per-PATH-dir scan on every restart matters most in a crash/
+    // backoff storm — exactly when we least want extra syscalls.
+    if (w.exe_len == 0) resolveExe(w, path_env);
     if (w.exe_len > 0 and w.build_id_len == 0) {
         if (elf.readBuildId(w.exe_buf[0..w.exe_len], &w.build_id_buf)) |id|
             w.build_id_len = @intCast(id.len);
@@ -729,7 +733,8 @@ pub fn spawn(
 }
 
 /// Parent-side mirror of the child's exec resolution, so incident bundles
-/// can map the command to a real file path. Runs once per spawn — cold path.
+/// can map the command to a real file path. Runs once per worker (the caller
+/// caches on `exe_len == 0`), never per restart — cold path.
 fn resolveExe(w: *Worker, path_env: []const u8) void {
     const argv0 = std.mem.span(w.argv[0].?);
     if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
