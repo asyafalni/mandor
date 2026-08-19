@@ -33,6 +33,9 @@ var workers_buf: [cli.max_workers]spawner.Worker = undefined;
 
 // Supervisor self-metric sampling window (only touched when telemetry is on).
 var self_stats: sampler.Window = .{};
+// Own pid, cached on first self-metric tick — it never changes, so there is no
+// need to re-issue getpid() (a real syscall, not vDSO) every sample.
+var self_pid: i32 = 0;
 
 // App-shared secret registry (v1.8). Each `[secret.NAME]` value is generated
 // ONCE at boot into `secret_store` (mlock'd, never swapped), held for the life
@@ -1205,7 +1208,8 @@ fn runSamplerTick(
     // mandor's own footprint. Guarded so the extra /proc/self read only happens
     // when a daemon is actually consuming it.
     if (telemetry.enabled()) {
-        sampler.sample(&self_stats, linux.getpid(), now, psi);
+        if (self_pid == 0) self_pid = linux.getpid();
+        sampler.sample(&self_stats, self_pid, now, psi);
         const ss = self_stats.at(self_stats.len - 1);
         telemetry.emitMetric(.{
             .name = "mandor",

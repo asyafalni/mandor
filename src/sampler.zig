@@ -144,8 +144,10 @@ fn countFds(pid: i32, path_buf: *[64]u8) u16 {
         while (off < n) {
             const ent: *const linux.dirent64 = @ptrCast(@alignCast(&buf[off]));
             const name: [*:0]const u8 = @ptrCast(&ent.name);
-            const s = std.mem.span(name);
-            if (!std.mem.eql(u8, s, ".") and !std.mem.eql(u8, s, "..")) count += 1;
+            // /proc/<pid>/fd holds only ".", ".." and decimal fd names; nothing
+            // but the two dot entries starts with '.', so a single first-byte
+            // test replaces a strlen + two eql per dirent.
+            if (name[0] != '.') count += 1;
             off += ent.reclen;
         }
     }
