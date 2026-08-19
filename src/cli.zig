@@ -7,6 +7,12 @@ pub const max_workers = 64;
 pub const max_health = 8;
 pub const default_state_dir = "/var/lib/mandor";
 
+/// `[require.NAME]` fail-closed boot gates and `[prober.NAME]` periodic
+/// monitors (TOML-only). Both are opaque operator commands — mandor parses
+/// none of it and runs no vendor/GPU code in the core.
+pub const max_require = 8;
+pub const max_probers = 8;
+
 /// Max length of the `service_prefix` origin tag. Must not exceed the daemon's
 /// fixed BSS copy buffer (relay.service_prefix_cap); config rejects anything
 /// longer so the prefix is never silently truncated.
@@ -30,6 +36,29 @@ pub const SecretDef = struct {
     n: usize = 32, // entropy bytes, or digit count for b10
     workers: [max_secret_workers]u8 = undefined, // resolved worker indices
     workers_len: usize = 0,
+};
+
+/// One `[require.NAME]` fail-closed boot gate: run `cmd` before any worker
+/// spawns and abort boot if it exits non-zero, times out, or fails to exec.
+/// A bounded, blocking check — boot has no fleet to protect yet.
+pub const ReqDef = struct {
+    name: []const u8,
+    cmd: []const u8,
+    timeout_ms: u64 = 60_000,
+};
+
+/// One `[prober.NAME]` periodic monitor: run `cmd` on a timer from the poll
+/// loop and react on failure via `on_fail`. Never restarts, kills, or gates
+/// any worker — `health` remains the sole restart authority.
+pub const ProbeDef = struct {
+    pub const OnFail = enum { report, incident };
+
+    name: []const u8,
+    cmd: []const u8,
+    interval_ms: u64,
+    timeout_ms: u64 = 10_000,
+    on_fail: OnFail = .report,
+    fail_threshold: u8 = 1,
 };
 
 pub const Mode = enum { supervise, report, validate };
@@ -160,6 +189,12 @@ pub const Config = struct {
     /// Per-worker streaming opt-in lives in `stream`/`stream_n` above; this holds
     /// `max_rate` and the `digest`/`digest_interval_ms`/`digest_threshold` knobs.
     logs: LogsConfig = .{},
+    /// `[require.NAME]` fail-closed boot gates (TOML-only).
+    require: [max_require]ReqDef = undefined,
+    require_n: u8 = 0,
+    /// `[prober.NAME]` periodic report/incident monitors (TOML-only).
+    probers: [max_probers]ProbeDef = undefined,
+    probers_n: u8 = 0,
 };
 
 /// "143,129" -> set the listed codes (on top of the always-clean 0).

@@ -222,6 +222,12 @@ sampling, `gpu.zig`, `resolve.zig` DNS) is inert unless `photon=` is set.
   command line stays CLI-only (no `command`/`args` key). Secrets resolve against
   the active set and degrade to the present subset (inert if none); deny-by-default
   is preserved — a worker only receives a secret it is listed for.
+- **Declarative checks run operator commands, never vendor code (v1.15).**
+  `[require.NAME]` is a fail-closed boot gate (runs a command before any worker;
+  non-zero aborts boot) and `[prober.NAME]` is a periodic report/incident monitor
+  (mandor owns the timer). The `check` is opaque — a GPU/driver requirement calls
+  `nvidia-smi`/etc. from the script; mandor parses no hardware/versions. A prober
+  **never restarts a worker** — `health` is the sole restart authority.
 - Premium (AI-fix) logic lives in the sidecar + relay only. The spool dir JSON
   is the tier boundary the sidecar watches; photon consumes the same contracts
   over OTLP.

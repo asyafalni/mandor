@@ -242,6 +242,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cfg.name_pairs_n = file_cfg.name_pairs_n;
             cfg.secrets = file_cfg.secrets;
             cfg.secrets_n = file_cfg.secrets_n;
+            cfg.require = file_cfg.require;
+            cfg.require_n = file_cfg.require_n;
+            cfg.probers = file_cfg.probers;
+            cfg.probers_n = file_cfg.probers_n;
             if (cfg.commands.len == 0) cfg.commands = file_cfg.commands;
             // Resolve [secret.*] grants against the FINAL worker set (CLI args, or
             // TOML workers=). By name, post-merge — so a grant naming a CLI-only

@@ -3,6 +3,26 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.15.0] - 2026-08-14
+
+### Added
+- **`[require.NAME]` — fail-closed boot preconditions.** Run a command before any
+  worker (or oneshot) spawns; a non-zero exit, timeout, or exec failure aborts
+  the boot (mandor exits non-zero, the runtime recovers). The `check` is an
+  opaque operator command — it's where a GPU/driver/hardware requirement lives
+  (`nvidia-smi`/`rocm-smi`/`xpu-smi`/…); mandor runs no vendor code and parses no
+  versions. Keys: `check` (required), `timeout` (default 60s). `mandor validate`
+  reports requires without executing them.
+- **`[prober.NAME]` — periodic status monitors.** Run a command on a timer once
+  the fleet is up and *report* the result — mandor owns the interval, so the
+  check stays a simple "check once, exit" command. On `fail_threshold` (default
+  1) consecutive failures, `on_fail` fires: `report` (an OTLP log to photon + a
+  local warn line) or `incident` (that plus a cooldown-guarded incident bundle).
+  Keys: `check`/`interval` (required), `on_fail` (default `report`), `timeout`
+  (default 10s), `fail_threshold`. A prober **never restarts, kills, or gates a
+  worker** — `health` remains the sole restart authority — and its output is
+  inert without `photon=`.
+
 ## [1.14.0] - 2026-08-13
 
 ### Changed

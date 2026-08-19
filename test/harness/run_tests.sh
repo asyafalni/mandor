@@ -206,8 +206,9 @@ unset MANDOR_STATE_DIR
 # 16. --expected-exit: listed code behaves like success (exit 0, no incident)
 export MANDOR_STATE_DIR="$TMP/state16"
 cat > "$TMP/ee.toml" <<'TOML'
-expected_exit = "7"
 workers = ["sh -c 'exit 7'"]
+[worker.sh]
+expected_exit = "7"
 TOML
 timeout 10 "$MANDOR" --config="$TMP/ee.toml" >"$TMP/16" 2>&1
 c=$?
@@ -251,11 +252,11 @@ else bad "readiness fd" "$(head -4 "$TMP/18")"; fi
 # 19. health checks: failing probe -> unhealthy incident with worker alive
 export MANDOR_STATE_DIR="$TMP/state19"
 cat > "$TMP/hp.toml" <<'TOML'
-health_interval = "1s"
-health_start_period = "0s"
 workers = ["sleep 30"]
 [worker.sleep]
 health = "/bin/false"
+health_interval = "1s"
+health_start_period = "0s"
 TOML
 "$MANDOR" --config="$TMP/hp.toml" >"$TMP/19" 2>&1 &
 mpid=$!
@@ -340,11 +341,11 @@ unset MANDOR_STATE_DIR HOOK_OUT
 
 # 24. health start-period: early failures don't count
 cat > "$TMP/hs.toml" <<'TOML'
-health_interval = "1s"
-health_start_period = "1m"
 workers = ["sleep 30"]
 [worker.sleep]
 health = "/bin/false"
+health_interval = "1s"
+health_start_period = "1m"
 TOML
 "$MANDOR" --config="$TMP/hs.toml" >"$TMP/24" 2>&1 &
 mpid=$!
@@ -548,8 +549,8 @@ else bad "restart_dependents" "$(grep -E 'restarting|spawned sleep' "$TMP/38" | 
 m="$TMP/drained"
 cat > "$TMP/ps.toml" <<TOML
 workers = ["bash -c 'trap exit TERM; while true; do sleep 1; done'"]
-expected_exit = "143"
 [worker.bash]
+expected_exit = "143"
 pre_stop = "sh -c 'sleep 0.3; touch $m'"
 TOML
 "$MANDOR" --config="$TMP/ps.toml" >"$TMP/39" 2>&1 &
@@ -692,11 +693,11 @@ unset MANDOR_STATE_DIR
 # worker into a successful run — mandor detected the hang and reported success.
 cat > "$TMP/hk.toml" <<'TOML'
 workers = ["sh -c 'trap \"exit 143\" TERM; while true; do sleep 0.2; done'"]
+[worker.sh]
+health = "/bin/false"
 expected_exit = "143"
 health_interval = "1s"
 health_start_period = "1s"
-[worker.sh]
-health = "/bin/false"
 TOML
 timeout 20 "$MANDOR" --config="$TMP/hk.toml" >"$TMP/55" 2>&1
 c=$?
@@ -1495,6 +1496,64 @@ if [ -n "$vok" ] \
   ok "overlay: static superset TOML applies to the CLI subset; secret reaches the present worker only; orphan section ignored"
 else bad "toml overlay" \
   "validate_ok=[$vok] secret_line=[$(grep -o 'A_SECRET=\[[^]]*\]' "$TMP/83out" 2>/dev/null | head -1)]"; fi
+
+# 84. [require.*] fail-closed boot gate (v1.15). A failing require must abort boot
+# BEFORE the worker starts: mandor exits non-zero, logs "requirement 'blocker'
+# not met", and the worker's marker never appears.
+cat > "$TMP/req_fail.toml" <<TOML
+[require.blocker]
+check = "sh -c 'exit 1'"
+TOML
+cat > "$TMP/w84.sh" <<'SH'
+#!/bin/sh
+echo "W84_STARTED"
+sleep 30
+SH
+chmod +x "$TMP/w84.sh"
+"$MANDOR" --config="$TMP/req_fail.toml" --state-dir="$TMP/s84" -- "$TMP/w84.sh" >"$TMP/84out" 2>&1
+rc84=$?
+if [ "$rc84" -ne 0 ] \
+   && grep -q "requirement 'blocker' not met" "$TMP/84out" 2>/dev/null \
+   && ! grep -q "W84_STARTED" "$TMP/84out" 2>/dev/null; then
+  ok "require: a failing [require.*] aborts boot before any worker spawns"
+else bad "require fail-closed" "rc=[$rc84] log=[$(head -3 "$TMP/84out" 2>/dev/null | tr '\n' '|')]"; fi
+
+# 85. A passing require lets the worker start.
+cat > "$TMP/req_ok.toml" <<TOML
+[require.ready]
+check = "sh -c 'exit 0'"
+TOML
+"$MANDOR" --config="$TMP/req_ok.toml" --state-dir="$TMP/s85" -- "$TMP/w84.sh" >"$TMP/85out" 2>&1 &
+mpid=$!
+for _ in $(seq 1 40); do grep -q "W84_STARTED" "$TMP/85out" 2>/dev/null && break; sleep 0.1; done
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+if grep -q "W84_STARTED" "$TMP/85out" 2>/dev/null; then
+  ok "require: a passing [require.*] lets the worker start"
+else bad "require pass" "log=[$(head -4 "$TMP/85out" 2>/dev/null | tr '\n' '|')]"; fi
+
+# 86. [prober.*] reports on failure but NEVER restarts the worker. A failing
+# prober fires every second; the long-lived worker must print its start marker
+# exactly ONCE (no restart) while mandor logs the prober failing.
+cat > "$TMP/prober.toml" <<TOML
+[prober.p]
+check = "sh -c 'exit 1'"
+interval = "1s"
+fail_threshold = 1
+TOML
+cat > "$TMP/w86.sh" <<'SH'
+#!/bin/sh
+echo "W86_STARTED $$"
+sleep 30
+SH
+chmod +x "$TMP/w86.sh"
+"$MANDOR" --config="$TMP/prober.toml" --state-dir="$TMP/s86" -- "$TMP/w86.sh" >"$TMP/86out" 2>&1 &
+mpid=$!
+sleep 5
+kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+starts86=$(grep -c "W86_STARTED" "$TMP/86out" 2>/dev/null)
+if [ "$starts86" = "1" ] && grep -q "prober 'p'" "$TMP/86out" 2>/dev/null; then
+  ok "prober: reports a failing check without ever restarting the worker"
+else bad "prober no-restart" "starts=[$starts86] probed=[$(grep -c "prober 'p'" "$TMP/86out" 2>/dev/null)]"; fi
 
 echo
 if [ $fail -ne 0 ]; then

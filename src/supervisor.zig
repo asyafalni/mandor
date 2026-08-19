@@ -18,6 +18,7 @@ const ring = @import("ring.zig");
 const sampler = @import("sampler.zig");
 const report = @import("report.zig");
 const incident = @import("incident.zig");
+const spool = @import("spool.zig");
 const cgroup = @import("cgroup.zig");
 const metrics = @import("metrics.zig");
 const cost = @import("cost.zig");
@@ -267,10 +268,40 @@ fn printPlan(cfg: *const cli.Config, workers: []const spawner.Worker, dep_of: []
         }
         if (w.has_health) planLine(w, "health probe — 3 failures stop the worker");
     }
+    // `[require.*]` boot gates: reported here (both `run` and `validate` call
+    // printPlan), never executed — validate must stay side-effect free, and
+    // `run` executes them separately via `runRequires` before any spawn.
+    for (cfg.require[0..cfg.require_n]) |r| {
+        logmod.print("[mandor]   requirement '{s}': {s}\n", .{ r.name, r.cmd });
+    }
+    for (cfg.probers[0..cfg.probers_n]) |p| {
+        logmod.print("[mandor]   prober '{s}' every {d}ms — on_fail={s} (never restarts)\n", .{ p.name, p.interval_ms, @tagName(p.on_fail) });
+    }
 }
 
 fn planLine(w: *const spawner.Worker, note: []const u8) void {
     logmod.print("[mandor]   {s}: {s}\n", .{ w.nameSlice(), note });
+}
+
+/// Run every `[require.*]` boot gate, in declaration order, strictly BEFORE
+/// any worker or oneshot spawns — called only from `run` (never `validate`,
+/// which reports requires without executing them; see `printPlan`). Each
+/// check is a bounded, blocking `spawner.runCheck`; the first non-zero exit,
+/// timeout, or exec failure aborts boot fail-closed. All passing returns true.
+fn runRequires(
+    cfg: *const cli.Config,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) bool {
+    for (cfg.require[0..cfg.require_n]) |r| {
+        logmod.print("[mandor] checking requirement '{s}'\n", .{r.name});
+        const code = spawner.runCheck(r.cmd, r.timeout_ms, envp, path_env);
+        if (code != 0) {
+            logmod.print("[mandor] requirement '{s}' not met (exit {d})\n", .{ r.name, code });
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Mint every configured secret once, into the mlock'd registry, and stamp a
@@ -332,13 +363,21 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
     var oneshot_count: usize = 0;
     if (applyConfig(cfg, workers, &dep_of, &oneshot_count)) |code| return code;
-    if (initSecrets(cfg, workers)) |code| return code;
     printPlan(cfg, workers, &dep_of);
+
+    const path_env = spawner.findPath(environ);
+    const envp: [*:null]const ?[*:0]const u8 = environ.ptr;
+    // Fail-closed boot gate: every `[require.*]` must pass BEFORE any worker
+    // or oneshot spawns. Bounded + blocking is fine here — boot has no fleet
+    // to protect yet, and this is the only place in `run()` that blocks.
+    if (!runRequires(cfg, envp, path_env)) return 1;
+
+    // Mint app-shared secrets only AFTER the gate passes — a rejected boot must
+    // never CSPRNG/mlock a fleet that will never start.
+    if (initSecrets(cfg, workers)) |code| return code;
 
     tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
     tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
-    const path_env = spawner.findPath(environ);
-    const envp: [*:null]const ?[*:0]const u8 = environ.ptr;
 
     const sigs = signals.Signals.init() catch {
         logmod.print("[mandor] cannot create signalfd\n", .{});
@@ -374,6 +413,10 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
 
     var sd: Shutdown = .{};
     const run_start_ms = nowMs();
+    // Probers only run after boot (requires runRequires passed and workers
+    // spawned, both already true by this point in run()); schedule every
+    // configured prober's first run one interval from now.
+    initProbers(cfg, run_start_ms);
     var next_sample_ms: u64 = run_start_ms + sampler.interval_ms;
     var next_digest_ms: u64 = run_start_ms +| digest_interval_ms;
     var sample_tick: u32 = 0;
@@ -448,6 +491,10 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // Before computing the poll timeout so first probes schedule
         // immediately after a (re)spawn.
         if (!sd.active) runHealth(workers, state_dir, envp, path_env);
+        // [prober.NAME] periodic checks: same non-blocking, poll-loop-driven
+        // shape as health, but never touches a worker (see the module note
+        // above runProbers).
+        if (!sd.active) runProbers(cfg, nowMs(), envp, path_env);
 
         var wake_at: u64 = next_sample_ms;
         // The digest flush is time-driven and applies during shutdown too: a
@@ -465,6 +512,17 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
                     if (to < wake_at) wake_at = to;
                 } else if (w.next_health_ms != 0 and w.next_health_ms < wake_at) {
                     wake_at = w.next_health_ms;
+                }
+            }
+            // Fold running-prober timeouts / next_ms into the wake deadline,
+            // exactly like health just above.
+            for (cfg.probers[0..cfg.probers_n], 0..) |def, pi| {
+                const ps = &prober_state[pi];
+                if (ps.pid != 0) {
+                    const to = ps.started_ms + def.timeout_ms;
+                    if (to < wake_at) wake_at = to;
+                } else if (ps.next_ms != 0 and ps.next_ms < wake_at) {
+                    wake_at = ps.next_ms;
                 }
             }
         }
@@ -750,6 +808,128 @@ fn runHealth(
             _ = spawner.spawnCheck(w, envp, path_env, now);
         }
     }
+}
+
+// ------------------------------------------------------------ probers
+//
+// `[prober.NAME]` periodic checks (v1.15). A PARALLEL of the health-probe
+// machinery just above, kept in its own array on purpose: `health` is the
+// sole restart authority, so a prober's pid, timing, and failure count must
+// live somewhere a restart/kill code path can never reach for by accident.
+// Nothing below this point ever touches `spawner.Worker`, `max_restarts`,
+// or calls `posix.kill` on a worker pid.
+
+/// Runtime state for one configured `[prober.NAME]`, indexed the same as
+/// `cli.Config.probers[0..probers_n]`. Deliberately NOT a `spawner.Worker`
+/// field — see the module note above.
+const ProberState = struct {
+    pid: i32 = 0,
+    started_ms: u64 = 0,
+    next_ms: u64 = 0,
+    fails: u8 = 0,
+    last_incident_ms: u64 = 0,
+};
+
+var prober_state: [cli.max_probers]ProberState = undefined;
+
+/// Schedule every configured prober's first run one interval from boot.
+/// Called once from `run()`, after `applyConfig` (probers only run once the
+/// worker set has been resolved) and before the poll loop starts.
+fn initProbers(cfg: *const cli.Config, now: u64) void {
+    for (0..cfg.probers_n) |pi| {
+        prober_state[pi] = .{ .next_ms = now + cfg.probers[pi].interval_ms };
+    }
+}
+
+/// Drive `[prober.NAME]` checks: time out a hung probe (counted as a failure
+/// when it is reaped, same as a non-zero exit), and start whichever probes
+/// are due. Mirrors `runHealth`'s timeout/spawn shape exactly; unlike health,
+/// the pass/fail bookkeeping happens at reap time (`collectProber`) rather
+/// than being deferred through a `done` flag, since `ProberState` carries no
+/// such flag by design (kept minimal — see the module note above).
+fn runProbers(
+    cfg: *const cli.Config,
+    now: u64,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) void {
+    for (cfg.probers[0..cfg.probers_n], 0..) |def, pi| {
+        const ps = &prober_state[pi];
+        if (ps.pid != 0 and now -| ps.started_ms > def.timeout_ms) {
+            // Bounded by `timeout_ms` always: SIGKILL now, reaped later as a
+            // failure (a killed check never exits 0). Never touches a worker.
+            posix.kill(ps.pid, .KILL) catch {};
+        }
+        if (ps.pid == 0 and now >= ps.next_ms) {
+            // Advance the schedule unconditionally, exactly like health's
+            // `next_health_ms`: a persistent exec failure must not fork-storm
+            // every poll tick, it should simply retry next interval.
+            ps.next_ms = now + def.interval_ms;
+            const pid = spawner.spawnCheckArgv(def.cmd, envp, path_env);
+            if (pid != 0) {
+                ps.pid = pid;
+                ps.started_ms = now;
+            }
+        }
+    }
+}
+
+/// One prober check was reaped: `ok` is true only on a clean exit 0. Updates
+/// the consecutive-failure count and, at `fail_threshold`, fires `on_fail`
+/// then resets the streak. This is the ENTIRE blast radius of a prober
+/// firing — no worker pid, `w.restarts`, `max_restarts`, or backoff field is
+/// ever read or written here.
+fn collectProber(cfg: *const cli.Config, state_dir: []const u8, idx: u8, ok: bool, now: u64) void {
+    if (idx >= cfg.probers_n) return; // defensive; idx is reaper-supplied
+    const def = &cfg.probers[idx];
+    const ps = &prober_state[idx];
+    ps.pid = 0;
+    if (ok) {
+        ps.fails = 0;
+        return;
+    }
+    ps.fails +|= 1;
+    logmod.print("[mandor] prober '{s}' check failed ({d}/{d})\n", .{
+        def.name, ps.fails, def.fail_threshold,
+    });
+    if (ps.fails >= def.fail_threshold) {
+        ps.fails = 0;
+        fireProberOnFail(def, ps, state_dir, now);
+    }
+}
+
+/// `on_fail` action for a prober at threshold: `report` always logs + emits
+/// one OTLP warn log (inert without `photon=`); `incident` does that AND
+/// spools a minimal-but-valid incident bundle, cooldown-guarded so a
+/// perpetually-failing prober cannot flood the spool. Never restarts, kills,
+/// or gates any worker.
+fn fireProberOnFail(def: *const cli.ProbeDef, ps: *ProberState, state_dir: []const u8, now: u64) void {
+    logmod.print("[mandor] prober '{s}' failing, on_fail={s}\n", .{ def.name, @tagName(def.on_fail) });
+    telemetry.emitLog(def.name, 1, 1, telemetry.nowNs(), "prober check failed"); // iostream=stderr, severity=warn
+    if (def.on_fail != .incident) return;
+    // `last_incident_ms == 0` means "never spooled" — the cooldown must not gate
+    // the FIRST incident. Without the sentinel, a host whose CLOCK_MONOTONIC (=
+    // uptime) is under the cooldown (fresh VM/CI runner) would drop it, since
+    // `now -| 0 < cooldown`. Mirror detector.StallState's `fired_at_ms != 0` guard.
+    if (ps.last_incident_ms != 0 and now -| ps.last_incident_ms < detector.dedup_cooldown_ms) return;
+    ps.last_incident_ms = now;
+    var verdict_buf: [96]u8 = undefined;
+    const verdict = std.fmt.bufPrint(&verdict_buf, "prober:{s} failing", .{def.name}) catch "prober failing";
+    const in: spool.BundleInput = .{
+        .ts_epoch = @intCast(wallMs() / 1000),
+        .name = def.name,
+        .cmd = def.cmd,
+        .pid = 0,
+        .restarts = 0,
+        .cause = .{ .kind = "prober" },
+        .cause_str = "prober-failing",
+        .trace = .{},
+        .logs_tail = &.{},
+        .stats = &.{},
+        .now_ms = now,
+        .verdict = verdict,
+    };
+    if (spool.write(state_dir, in) != null) incident.total += 1;
 }
 
 /// On failure sets `w.spawn_failed` and stages a synthetic death; the caller
@@ -1069,9 +1249,21 @@ fn handleDeaths(
     path_env: []const u8,
     oom_kills: *u64,
 ) void {
-    const reaped = reaper.drain(workers, !sd.active).reaped_workers;
+    // Mirror the currently-running prober pids into a plain slice: reaper.zig
+    // must never know the supervisor's ProberState type (kept a dedicated,
+    // separate array precisely so a prober pid can never be mistaken for a
+    // worker/health pid), so it only sees raw pids indexed the same as
+    // `cfg.probers[]` / `prober_state[]`.
+    var prober_pids: [cli.max_probers]i32 = undefined;
+    for (0..cfg.probers_n) |pi| prober_pids[pi] = prober_state[pi].pid;
+    const summary = reaper.drain(workers, !sd.active, prober_pids[0..cfg.probers_n]);
+    const reaped = summary.reaped_workers;
     const now = nowMs();
     if (reaped > 0) report.writeState(state_dir, workers, now);
+    // Prober checks reaped this pass: report/incident only — NEVER touches a
+    // worker pid, `max_restarts`, or the restart scheduler (see collectProber).
+    for (summary.prober_reaped[0..summary.prober_reaped_n]) |pr|
+        collectProber(cfg, state_dir, pr.idx, pr.ok, now);
     var oom_hit = false;
     if (reaped > 0) {
         const cur = cgroup.readOomKills() orelse oom_kills.*;
@@ -1612,4 +1804,243 @@ test "validate still fails on a real error (self-dependency)" {
     cfg.start_after[0] = .{ .worker = "api.sh", .cmd = "api.sh" }; // depends on itself
     cfg.start_after_n = 1;
     try testing.expect(validate(&cfg) != 0);
+}
+
+test "validate reports requires without executing them" {
+    var cfg = cli.Config{};
+    var cmds = [_][]const u8{"api.sh"};
+    cfg.commands = &cmds;
+    cfg.require = undefined;
+    cfg.require[0] = .{ .name = "gpu", .cmd = "/bin/false" }; // would fail if executed
+    cfg.require_n = 1;
+    try testing.expectEqual(@as(u8, 0), validate(&cfg)); // parses/reports, never runs /bin/false
+}
+
+// ---------------------------------------------------------- prober tests
+
+fn testSleepMs(ms: u64) void {
+    var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(ms * std.time.ns_per_ms) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+test "prober threshold: on_fail fires exactly at fail_threshold, then resets" {
+    var cfg = cli.Config{};
+    cfg.probers = undefined;
+    cfg.probers[0] = .{
+        .name = "p",
+        .cmd = "/bin/true",
+        .interval_ms = 60_000,
+        .fail_threshold = 3,
+        .on_fail = .report,
+    };
+    cfg.probers_n = 1;
+    const saved = prober_state[0];
+    defer prober_state[0] = saved;
+    prober_state[0] = .{};
+
+    const now: u64 = 1_000_000;
+    collectProber(&cfg, "", 0, false, now);
+    try testing.expectEqual(@as(u8, 1), prober_state[0].fails); // 1/3: not yet
+    collectProber(&cfg, "", 0, false, now);
+    try testing.expectEqual(@as(u8, 2), prober_state[0].fails); // 2/3: not yet
+    collectProber(&cfg, "", 0, false, now);
+    // 3/3: on_fail fires — observable as the streak resetting to 0 exactly
+    // here (fireProberOnFail runs synchronously inside this call, one line
+    // before the reset).
+    try testing.expectEqual(@as(u8, 0), prober_state[0].fails);
+
+    // A success at any point resets the streak immediately, without needing
+    // to reach the threshold.
+    collectProber(&cfg, "", 0, false, now);
+    try testing.expectEqual(@as(u8, 1), prober_state[0].fails);
+    collectProber(&cfg, "", 0, true, now);
+    try testing.expectEqual(@as(u8, 0), prober_state[0].fails);
+
+    // pid is always cleared on reap, success or failure.
+    prober_state[0].pid = 999;
+    collectProber(&cfg, "", 0, true, now);
+    try testing.expectEqual(@as(i32, 0), prober_state[0].pid);
+}
+
+test "prober on_fail=incident spools exactly once per cooldown window; on_fail=report never spools" {
+    var dir_buf: [128]u8 = undefined;
+    const state_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/mandor-prober-test-{d}", .{linux.getpid()});
+    defer {
+        var out: [16]spool.DirEntry = undefined;
+        const n = spool.listIncidents(state_dir, &out, .newest);
+        for (out[0..n]) |*e| {
+            var pb: [256]u8 = undefined;
+            const pp = std.fmt.bufPrintZ(&pb, "{s}/incidents/{s}", .{ state_dir, e.name[0..e.name_len] }) catch continue;
+            _ = linux.unlinkat(linux.AT.FDCWD, pp.ptr, 0);
+        }
+        var ib: [160]u8 = undefined;
+        if (std.fmt.bufPrintZ(&ib, "{s}/incidents", .{state_dir})) |ip|
+            _ = linux.unlinkat(linux.AT.FDCWD, ip.ptr, linux.AT.REMOVEDIR)
+        else |_| {}
+        var db: [160]u8 = undefined;
+        if (std.fmt.bufPrintZ(&db, "{s}", .{state_dir})) |dp|
+            _ = linux.unlinkat(linux.AT.FDCWD, dp.ptr, linux.AT.REMOVEDIR)
+        else |_| {}
+    }
+
+    var cfg = cli.Config{};
+    cfg.probers = undefined;
+    cfg.probers[0] = .{
+        .name = "p",
+        .cmd = "/bin/true",
+        .interval_ms = 60_000,
+        .fail_threshold = 2,
+        .on_fail = .report,
+    };
+    cfg.probers[1] = .{
+        .name = "q",
+        .cmd = "/bin/true",
+        .interval_ms = 60_000,
+        .fail_threshold = 2,
+        .on_fail = .incident,
+    };
+    cfg.probers_n = 2;
+    const saved0 = prober_state[0];
+    const saved1 = prober_state[1];
+    defer {
+        prober_state[0] = saved0;
+        prober_state[1] = saved1;
+    }
+    prober_state[0] = .{};
+    prober_state[1] = .{};
+
+    const before = incident.total;
+    // Deliberately BELOW detector.dedup_cooldown_ms (600_000): CLOCK_MONOTONIC is
+    // host uptime, so a fresh host starts here. The FIRST incident must still fire
+    // (the last_incident_ms==0 sentinel) — a plain `now -| 0 < cooldown` would drop it.
+    const now: u64 = 90_000;
+
+    // Prober 0 (report): crossing the threshold fires but never spools.
+    collectProber(&cfg, state_dir, 0, false, now);
+    collectProber(&cfg, state_dir, 0, false, now);
+    try testing.expectEqual(@as(u8, 0), prober_state[0].fails);
+    try testing.expectEqual(before, incident.total);
+
+    // Prober 1 (incident): crossing the threshold fires AND spools once.
+    collectProber(&cfg, state_dir, 1, false, now);
+    collectProber(&cfg, state_dir, 1, false, now);
+    try testing.expectEqual(@as(u8, 0), prober_state[1].fails);
+    try testing.expectEqual(before + 1, incident.total);
+
+    // Re-crossing the threshold immediately (same `now`) is still inside
+    // detector.dedup_cooldown_ms — no second spool.
+    collectProber(&cfg, state_dir, 1, false, now);
+    collectProber(&cfg, state_dir, 1, false, now);
+    try testing.expectEqual(before + 1, incident.total);
+}
+
+test "prober firing never touches a worker's pid/status/restarts" {
+    var workers_local: [1]spawner.Worker = undefined;
+    try spawner.initWorkers(workers_local[0..1], &.{"/bin/true"});
+    const w = &workers_local[0];
+    w.pid = 4242;
+    w.status = .{ .exited = 0 };
+    w.restarts = 7;
+    const snap_pid = w.pid;
+    const snap_status = w.status;
+    const snap_restarts = w.restarts;
+
+    var cfg = cli.Config{};
+    cfg.probers = undefined;
+    cfg.probers[0] = .{
+        .name = "p",
+        .cmd = "/bin/true",
+        .interval_ms = 60_000,
+        .fail_threshold = 1,
+        .on_fail = .report,
+    };
+    cfg.probers_n = 1;
+    const saved = prober_state[0];
+    defer prober_state[0] = saved;
+    prober_state[0] = .{};
+
+    // Threshold 1: fires on the very first failure. collectProber's own
+    // signature has no `workers` parameter at all — this asserts the
+    // observable guarantee, not just the type-level one.
+    collectProber(&cfg, "", 0, false, 9_000_000);
+
+    try testing.expectEqual(snap_pid, w.pid);
+    try testing.expectEqual(snap_status, w.status);
+    try testing.expectEqual(snap_restarts, w.restarts);
+}
+
+test "prober scheduling: runProbers spawns a due probe and advances next_ms by interval_ms" {
+    var cfg = cli.Config{};
+    cfg.probers = undefined;
+    cfg.probers[0] = .{
+        .name = "p",
+        .cmd = "/bin/true",
+        .interval_ms = 60_000,
+        .timeout_ms = 5_000,
+    };
+    cfg.probers_n = 1;
+    const empty_env = [_:null]?[*:0]const u8{};
+    const envp: [*:null]const ?[*:0]const u8 = &empty_env;
+
+    const saved = prober_state[0];
+    defer prober_state[0] = saved;
+
+    const t0: u64 = 3_000_000;
+    prober_state[0] = .{ .next_ms = t0 }; // due exactly now
+    runProbers(&cfg, t0, envp, "");
+    const pid = prober_state[0].pid;
+    try testing.expect(pid != 0);
+    try testing.expectEqual(t0, prober_state[0].started_ms);
+    try testing.expectEqual(t0 + 60_000, prober_state[0].next_ms);
+
+    // Still running (pid != 0) and not yet due again: must NOT re-spawn.
+    runProbers(&cfg, t0 + 1, envp, "");
+    try testing.expectEqual(pid, prober_state[0].pid);
+
+    // Clean up the real child directly — reap/threshold behavior is covered
+    // by the tests above, this one is only about the schedule.
+    var st: u32 = 0;
+    var tries: u32 = 0;
+    while (tries < 5000) : (tries += 1) {
+        const rc = linux.waitpid(pid, &st, linux.W.NOHANG);
+        if (posix.errno(rc) == .SUCCESS and rc == pid) break;
+        testSleepMs(1);
+    }
+    prober_state[0].pid = 0;
+}
+
+test "prober scheduling: a probe still running past timeout_ms is SIGKILLed" {
+    var cfg = cli.Config{};
+    cfg.probers = undefined;
+    cfg.probers[0] = .{
+        .name = "p",
+        .cmd = "/bin/sleep 30",
+        .interval_ms = 60_000,
+        .timeout_ms = 50,
+    };
+    cfg.probers_n = 1;
+    const empty_env = [_:null]?[*:0]const u8{};
+    const envp: [*:null]const ?[*:0]const u8 = &empty_env;
+
+    const saved = prober_state[0];
+    defer prober_state[0] = saved;
+
+    const t0: u64 = 4_000_000;
+    prober_state[0] = .{ .next_ms = t0 };
+    runProbers(&cfg, t0, envp, ""); // spawns the long-lived probe
+    const pid = prober_state[0].pid;
+    try testing.expect(pid != 0);
+
+    runProbers(&cfg, t0 +| 5_000, envp, ""); // well past timeout_ms=50 -> SIGKILL
+
+    var st: u32 = 0;
+    var reaped = false;
+    var tries: u32 = 0;
+    while (tries < 5000 and !reaped) : (tries += 1) {
+        const rc = linux.waitpid(pid, &st, linux.W.NOHANG);
+        if (posix.errno(rc) == .SUCCESS and rc == pid) reaped = true else testSleepMs(1);
+    }
+    try testing.expect(reaped);
+    try testing.expect(linux.W.IFSIGNALED(st)); // killed, never exited cleanly
+    prober_state[0].pid = 0;
 }

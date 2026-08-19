@@ -340,6 +340,151 @@ pub fn spawnCheck(
     return true;
 }
 
+/// `[prober.NAME]` periodic check: fork/exec an arbitrary command string,
+/// NON-BLOCKING — mirrors `spawnCheck` exactly (stdio to /dev/null, dies
+/// with the supervisor via PDEATHSIG + a getppid guard, signal mask reset)
+/// but tokenizes `cmd` fresh each call instead of reading `w.health_argv`,
+/// since a prober has no `Worker` to hang state off. The caller (the
+/// poll-loop's `runProbers`) owns the returned pid and its own bounded
+/// timeout — this function never waits. Returns 0 on any tokenize/fork
+/// failure (fail-closed: the caller sees "no probe running" and retries
+/// next interval, never blocks, never panics).
+pub fn spawnCheckArgv(
+    cmd: []const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) i32 {
+    var buf: [4096]u8 = undefined;
+    var toks: [max_args][]const u8 = undefined;
+    const toked = cli.tokenize(cmd, &buf, &toks) catch return 0;
+    if (toked.len == 0) return 0;
+    var argv: [max_args + 1]?[*:0]const u8 = undefined;
+    for (toked, 0..) |t, i| argv[i] = @ptrCast(t.ptr);
+    argv[toked.len] = null;
+
+    const supervisor_pid = linux.getpid();
+    const rc = linux.fork();
+    if (posix.errno(rc) != .SUCCESS) return 0;
+    if (rc == 0) {
+        // Probes die with the supervisor — hard, they hold no state.
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        if (linux.getppid() != supervisor_pid) linux.exit(1);
+        const empty = posix.sigemptyset();
+        posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+        const null_rc = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        if (posix.errno(null_rc) == .SUCCESS) {
+            const null_fd: i32 = @intCast(null_rc);
+            _ = linux.dup2(null_fd, 1);
+            _ = linux.dup2(null_fd, 2);
+        }
+        execArgv(@ptrCast(&argv), envp, path_env);
+    }
+    return @intCast(rc);
+}
+
+/// Monotonic milliseconds — local to spawner so `runCheck`'s bounded wait
+/// needs no dependency on the supervisor's own `nowMs`.
+fn monoMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+fn sleepMs(ms: u64) void {
+    var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(ms * std.time.ns_per_ms) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+/// SIGKILL `pid` and reap it, bounded so a wedged reap can never spin PID 1
+/// forever. Returns 255 (the check counts as "failed"). Used by runCheck's
+/// timeout / error paths.
+fn killAndReap(pid: i32) u8 {
+    posix.kill(pid, .KILL) catch {};
+    var tries: u32 = 0;
+    while (tries < 2000) : (tries += 1) {
+        var st: u32 = 0;
+        const wrc = linux.waitpid(pid, &st, linux.W.NOHANG);
+        if (posix.errno(wrc) != .SUCCESS or wrc == pid) break;
+        sleepMs(1);
+    }
+    return 255;
+}
+
+/// `[require.NAME]` boot-gate check: fork/exec `cmd` (tokenized the same way
+/// as a worker command) and BLOCK until it exits or `timeout_ms` elapses.
+/// Boot has no fleet to protect yet — unlike every other spawn path in this
+/// file, a bounded blocking wait here is fine because it runs once, strictly
+/// before any worker exists. Fail-closed: a tokenize/fork/exec problem, or a
+/// timeout (SIGKILL + reap), returns 255; otherwise the child's real exit
+/// code. No allocation, no panic — every syscall errno is handled.
+pub fn runCheck(
+    cmd: []const u8,
+    timeout_ms: u64,
+    envp: [*:null]const ?[*:0]const u8,
+    path_env: []const u8,
+) u8 {
+    var buf: [4096]u8 = undefined;
+    var toks: [max_args][]const u8 = undefined;
+    const toked = cli.tokenize(cmd, &buf, &toks) catch return 255;
+    if (toked.len == 0) return 255;
+    var argv: [max_args + 1]?[*:0]const u8 = undefined;
+    for (toked, 0..) |t, i| argv[i] = @ptrCast(t.ptr);
+    argv[toked.len] = null;
+
+    const supervisor_pid = linux.getpid();
+    const rc = linux.fork();
+    if (posix.errno(rc) != .SUCCESS) return 255;
+    if (rc == 0) {
+        // Dies with the supervisor — it holds no state worth draining.
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        if (linux.getppid() != supervisor_pid) linux.exit(1);
+        const empty = posix.sigemptyset();
+        posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
+        execArgv(@ptrCast(&argv), envp, path_env);
+    }
+    const pid: i32 = @intCast(rc);
+
+    // Wait event-driven where the kernel allows it: a pidfd's POLLIN fires when
+    // the child exits, so `poll` sleeps in ONE syscall until exit or timeout —
+    // zero busy-poll, zero CPU while the check runs. pidfd_open needs kernel
+    // 5.3+ (2019); an older kernel falls back to a coarse bounded waitpid poll.
+    const pfd_rc = linux.pidfd_open(pid, 0);
+    if (posix.errno(pfd_rc) == .SUCCESS) {
+        const pidfd: i32 = @intCast(pfd_rc);
+        var pfds = [_]posix.pollfd{.{ .fd = pidfd, .events = posix.POLL.IN, .revents = 0 }};
+        const to: i32 = @intCast(@min(timeout_ms, @as(u64, std.math.maxInt(i32))));
+        const pr = posix.poll(&pfds, to) catch {
+            _ = linux.close(pidfd);
+            return killAndReap(pid); // poll error (incl. EINTR): fail-closed
+        };
+        _ = linux.close(pidfd);
+        if (pr == 0) return killAndReap(pid); // timed out
+        // Ready ⇒ the child has exited; a blocking reap returns immediately.
+        var st: u32 = 0;
+        _ = linux.waitpid(pid, &st, 0);
+        if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
+        return 255; // signaled/abnormal
+    }
+
+    // Fallback (no pidfd): bounded waitpid poll, as before.
+    const deadline = monoMs() +| timeout_ms;
+    while (true) {
+        var st: u32 = 0;
+        const wrc = linux.waitpid(pid, &st, linux.W.NOHANG);
+        switch (posix.errno(wrc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return 255, // fail-closed
+        }
+        if (wrc == pid) {
+            if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
+            return 255;
+        }
+        if (monoMs() >= deadline) return killAndReap(pid);
+        sleepMs(5);
+    }
+}
+
 pub const InitError = error{BadCommand};
 
 /// Tokenize each command into its worker's fixed buffers and derive log names.
@@ -576,7 +721,11 @@ pub fn spawn(
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &ts);
     w.spawned_at_epoch = ts.sec;
-    resolveExe(w, path_env);
+    // Cache across restarts: argv[0] and PATH can't change for a worker's
+    // lifetime, so resolve the exe once (like build_id below). Skipping the
+    // faccessat-per-PATH-dir scan on every restart matters most in a crash/
+    // backoff storm — exactly when we least want extra syscalls.
+    if (w.exe_len == 0) resolveExe(w, path_env);
     if (w.exe_len > 0 and w.build_id_len == 0) {
         if (elf.readBuildId(w.exe_buf[0..w.exe_len], &w.build_id_buf)) |id|
             w.build_id_len = @intCast(id.len);
@@ -584,7 +733,8 @@ pub fn spawn(
 }
 
 /// Parent-side mirror of the child's exec resolution, so incident bundles
-/// can map the command to a real file path. Runs once per spawn — cold path.
+/// can map the command to a real file path. Runs once per worker (the caller
+/// caches on `exe_len == 0`), never per restart — cold path.
 fn resolveExe(w: *Worker, path_env: []const u8) void {
     const argv0 = std.mem.span(w.argv[0].?);
     if (std.mem.indexOfScalar(u8, argv0, '/') != null) {

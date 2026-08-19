@@ -520,13 +520,15 @@ const restart_metric_unit = "{restart}";
 /// sizes innermost-first and refuses a batch that will not fit body_buf, pass 2
 /// writes, and the final assert proves the two agree.
 pub fn buildOtlpMetrics(samples: []const frame.MetricSample, host_name: []const u8) error{TooLarge}![]const u8 {
+    // scope_len is sample-invariant (a fixed metric set), so derive it ONCE
+    // instead of recomputing it per sample in BOTH the sizing and write passes.
+    var scope_len: usize = 0;
+    for (gauge_metrics) |g| scope_len += delimLen(gaugeMetricLen(g.name, g.unit));
+    scope_len += delimLen(sumMetricLen(restart_metric_name, restart_metric_unit));
+
     // Pass 1: sizes, innermost first.
     var total: usize = 0;
     for (samples) |s| {
-        var scope_len: usize = 0;
-        for (gauge_metrics) |g| scope_len += delimLen(gaugeMetricLen(g.name, g.unit));
-        scope_len += delimLen(sumMetricLen(restart_metric_name, restart_metric_unit));
-
         const resource_len = delimLen(serviceKvLen(s.name)) +
             delimLen(keyValueLen("host.name", host_name));
         const rm_len = delimLen(resource_len) + delimLen(scope_len);
@@ -537,9 +539,6 @@ pub fn buildOtlpMetrics(samples: []const frame.MetricSample, host_name: []const 
     // Pass 2: write.
     var w = Writer{ .buf = &body_buf };
     for (samples) |s| {
-        var scope_len: usize = 0;
-        for (gauge_metrics) |g| scope_len += delimLen(gaugeMetricLen(g.name, g.unit));
-        scope_len += delimLen(sumMetricLen(restart_metric_name, restart_metric_unit));
         const resource_len = delimLen(serviceKvLen(s.name)) +
             delimLen(keyValueLen("host.name", host_name));
         const rm_len = delimLen(resource_len) + delimLen(scope_len);
