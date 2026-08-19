@@ -3109,6 +3109,36 @@ test "buildOtlpEvents batches multiple events into one request" {
     try testing.expect(saw_api and saw_db);
 }
 
+test "buildOtlpEvents truncates the batch at the first un-renderable event" {
+    // Pass 1 sizes each event; an event whose body overflows renderEventBody's
+    // 256-byte scratch trips `catch break`, so the batch stops there and ships
+    // only the events already counted (ephemeral "drop the rest"). This locks in
+    // the partial-batch accounting: pass 2 writes exactly nfit events and the
+    // w.pos == total assert must still hold (a divergence would panic here).
+    const huge = "x" ** 250; // "worker " ++ huge ++ " started" > 256 → TooLarge
+    const evs = [_]frame.Lifecycle{
+        .{ .name = "api", .ev = .started, .t_unix_ns = 1_700_000_000_000_000_000 },
+        .{ .name = huge, .ev = .started, .t_unix_ns = 1_700_000_000_000_000_001 },
+        .{ .name = "db", .ev = .started, .t_unix_ns = 1_700_000_000_000_000_002 }, // after the break → dropped
+    };
+    const body = try buildOtlpEvents(&evs);
+    // Only the first event survives: one resource_logs, service.name "api".
+    var it = Fields{ .b = body };
+    var n_rl: usize = 0;
+    while (it.next()) |f| {
+        if (f.num != 1) continue;
+        n_rl += 1;
+        try testing.expectEqualStrings("api", firstServiceName(body));
+    }
+    try testing.expectEqual(@as(usize, 1), n_rl);
+
+    // A first event too large alone yields error.TooLarge (caller drops the batch).
+    const only_huge = [_]frame.Lifecycle{
+        .{ .name = huge, .ev = .started, .t_unix_ns = 1_700_000_000_000_000_000 },
+    };
+    try testing.expectError(error.TooLarge, buildOtlpEvents(&only_huge));
+}
+
 // ------------------------------------------------- service_prefix (multi-tenant)
 
 /// service.name of a logs-shaped request (buildOtlp / buildOtlpEvent / logs):
