@@ -295,7 +295,13 @@ pub fn parse(
         } else if (std.mem.eql(u8, key, "gpu_interval")) {
             // GPU sampling cadence (daemon-side; GPU itself is auto-detected).
             const s = parseString(value) orelse return error.BadValue;
-            cfg.gpu_interval_ms = cli.parseDuration(s) orelse return error.BadValue;
+            const ms = cli.parseDuration(s) orelse return error.BadValue;
+            // 0 would make the daemon's next_gpu_sample deadline never advance
+            // past now — a poll timeout of 0 every iteration, busy-spinning the
+            // relay child and fork-storming nvidia-smi (cf. health_interval /
+            // digest_interval). Reject it.
+            if (ms == 0) return error.BadValue;
+            cfg.gpu_interval_ms = ms;
         } else if (std.mem.eql(u8, key, "env_file")) {
             cfg.env_file = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "restart_dependents")) {
@@ -1149,6 +1155,8 @@ test "gpu_interval: absent stays null; bad value rejected" {
     const set = try parseTest("gpu_interval = \"5s\"", &storage);
     try t.expectEqual(@as(?u64, 5_000), set.gpu_interval_ms);
     try t.expectError(error.BadValue, parseTest("gpu_interval = \"soon\"", &storage));
+    // 0 would busy-spin the relay daemon's poll loop + fork-storm nvidia-smi.
+    try t.expectError(error.BadValue, parseTest("gpu_interval = \"0s\"", &storage));
 }
 
 test "the old [gpu] section gives a migration error" {
