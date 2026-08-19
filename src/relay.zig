@@ -1008,77 +1008,119 @@ fn renderEventBody(buf: []u8, e: frame.Lifecycle) error{TooLarge}![]const u8 {
 
 const EventAttr = struct { k: []const u8, v: []const u8 };
 
-/// Encode one lifecycle event as an OTLP ExportLogsServiceRequest holding a
-/// single LogRecord. Two-pass sizing identical in shape to buildOtlp.
-pub fn buildOtlpEvent(e: frame.Lifecycle) error{TooLarge}![]const u8 {
-    const sev_num: u64 = switch (e.ev) {
-        .started, .exited_ok, .health_up => sev_info,
-        .restarting, .health_down => sev_warn,
-        .exited_err, .oom => sev_error,
+/// Event kind → OTLP severity number + text.
+fn eventSev(ev: frame.Event) struct { num: u64, text: []const u8 } {
+    return switch (ev) {
+        .started, .exited_ok, .health_up => .{ .num = sev_info, .text = "INFO" },
+        .restarting, .health_down => .{ .num = sev_warn, .text = "WARN" },
+        .exited_err, .oom => .{ .num = sev_error, .text = "ERROR" },
     };
-    const sev_text: []const u8 = switch (e.ev) {
-        .started, .exited_ok, .health_up => "INFO",
-        .restarting, .health_down => "WARN",
-        .exited_err, .oom => "ERROR",
-    };
+}
 
-    var body_scratch: [256]u8 = undefined;
-    const body_txt = try renderEventBody(&body_scratch, e);
-
-    // Numeric context as string attributes (photon reads string attrs), sized
-    // for an i32/u32 with sign. The set depends on the event kind; both passes
-    // iterate the same slice so sizing and writing cannot diverge.
-    var attrs: [2]EventAttr = undefined;
-    var n_attrs: usize = 0;
-    var num_a: [12]u8 = undefined;
-    var num_b: [12]u8 = undefined;
+/// Numeric context for an event as string attributes (photon reads string
+/// attrs), written into caller scratch. Both the sizing and write passes call
+/// this on the same event so they can never diverge.
+fn eventAttrs(e: frame.Lifecycle, attrs: *[2]EventAttr, num_a: *[12]u8, num_b: *[12]u8) error{TooLarge}![]EventAttr {
+    var n: usize = 0;
     switch (e.ev) {
         .exited_err, .oom => {
-            attrs[n_attrs] = .{ .k = "exit.code", .v = std.fmt.bufPrint(&num_a, "{d}", .{e.code}) catch return error.TooLarge };
-            n_attrs += 1;
+            attrs[n] = .{ .k = "exit.code", .v = std.fmt.bufPrint(num_a, "{d}", .{e.code}) catch return error.TooLarge };
+            n += 1;
         },
         .restarting => {
-            attrs[n_attrs] = .{ .k = "backoff.ms", .v = std.fmt.bufPrint(&num_a, "{d}", .{e.backoff_ms}) catch return error.TooLarge };
-            n_attrs += 1;
-            attrs[n_attrs] = .{ .k = "restart.count", .v = std.fmt.bufPrint(&num_b, "{d}", .{e.restarts}) catch return error.TooLarge };
-            n_attrs += 1;
+            attrs[n] = .{ .k = "backoff.ms", .v = std.fmt.bufPrint(num_a, "{d}", .{e.backoff_ms}) catch return error.TooLarge };
+            n += 1;
+            attrs[n] = .{ .k = "restart.count", .v = std.fmt.bufPrint(num_b, "{d}", .{e.restarts}) catch return error.TooLarge };
+            n += 1;
         },
         else => {},
     }
-    const kvs = attrs[0..n_attrs];
+    return attrs[0..n];
+}
 
-    const ns = e.t_unix_ns;
-
-    // Pass 1: sizes, innermost first.
+/// Size of one lifecycle event's resource_logs entry — the pass-1 mirror of
+/// writeEventRl. Renders the body + attrs into local scratch to measure them.
+fn eventRlLen(e: frame.Lifecycle) error{TooLarge}!usize {
+    const sev = eventSev(e.ev);
+    var body_scratch: [256]u8 = undefined;
+    const body_txt = try renderEventBody(&body_scratch, e);
+    var attrs: [2]EventAttr = undefined;
+    var num_a: [12]u8 = undefined;
+    var num_b: [12]u8 = undefined;
+    const kvs = try eventAttrs(e, &attrs, &num_a, &num_b);
     var attr_len: usize = 0;
     for (kvs) |kv| attr_len += delimLen(keyValueLen(kv.k, kv.v));
     const rec_len =
         9 + // time_unix_nano (fixed64, field 1)
-        (1 + varintLen(sev_num)) + // severity_number (field 2)
-        delimLen(sev_text.len) + // severity_text (field 3)
+        (1 + varintLen(sev.num)) + // severity_number (field 2)
+        delimLen(sev.text.len) + // severity_text (field 3)
         delimLen(anyValueLen(body_txt)) + // body (field 5)
         attr_len + // attributes (field 6)
         9; // observed_time_unix_nano (fixed64, field 11)
-    const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
+    const scope_len = delimLen(rec_len);
     const resource_len = delimLen(serviceKvLen(e.name));
     const rl_len = delimLen(resource_len) + delimLen(scope_len);
-    const total = delimLen(rl_len); // ExportLogsServiceRequest.resource_logs
-    if (total > body_buf.len) return error.TooLarge;
+    return delimLen(rl_len); // ExportLogsServiceRequest.resource_logs entry
+}
 
-    // Pass 2: write.
-    var w = Writer{ .buf = &body_buf };
+/// Write one lifecycle event's resource_logs entry into `w`. Re-renders body +
+/// attrs — deterministic, the same values eventRlLen sized.
+fn writeEventRl(w: *Writer, e: frame.Lifecycle) error{TooLarge}!void {
+    const sev = eventSev(e.ev);
+    var body_scratch: [256]u8 = undefined;
+    const body_txt = try renderEventBody(&body_scratch, e);
+    var attrs: [2]EventAttr = undefined;
+    var num_a: [12]u8 = undefined;
+    var num_b: [12]u8 = undefined;
+    const kvs = try eventAttrs(e, &attrs, &num_a, &num_b);
+    var attr_len: usize = 0;
+    for (kvs) |kv| attr_len += delimLen(keyValueLen(kv.k, kv.v));
+    const rec_len = 9 + (1 + varintLen(sev.num)) + delimLen(sev.text.len) +
+        delimLen(anyValueLen(body_txt)) + attr_len + 9;
+    const scope_len = delimLen(rec_len);
+    const resource_len = delimLen(serviceKvLen(e.name));
+    const rl_len = delimLen(resource_len) + delimLen(scope_len);
+    const ns = e.t_unix_ns;
     w.delim(1, rl_len); // resource_logs
     w.delim(1, resource_len); //   resource
-    putServiceName(&w, e.name); //     attributes (origin-prefixed)
+    putServiceName(w, e.name); //     attributes (origin-prefixed)
     w.delim(2, scope_len); //   scope_logs
     w.delim(2, rec_len); //     log_records
     w.fixed64(1, ns); //       time_unix_nano
-    w.uint(2, sev_num); //       severity_number
-    w.string(3, sev_text); //       severity_text
-    putAnyValue(&w, 5, body_txt); //       body
-    for (kvs) |kv| putKeyValue(&w, 6, kv.k, kv.v); //       attributes
+    w.uint(2, sev.num); //       severity_number
+    w.string(3, sev.text); //       severity_text
+    putAnyValue(w, 5, body_txt); //       body
+    for (kvs) |kv| putKeyValue(w, 6, kv.k, kv.v); //       attributes
     w.fixed64(11, ns); //       observed_time_unix_nano
+}
 
+/// Encode one lifecycle event as an OTLP ExportLogsServiceRequest (one
+/// resource_logs). Thin wrapper over the batch encoder so both share one code
+/// path — a 1-event batch is byte-identical to the pre-batch single output.
+pub fn buildOtlpEvent(e: frame.Lifecycle) error{TooLarge}![]const u8 {
+    return buildOtlpEvents(&.{e});
+}
+
+/// Encode a batch of lifecycle events as ONE OTLP ExportLogsServiceRequest, one
+/// resource_logs per event. Same two-pass sizing + ephemeral drop-the-rest
+/// discipline as buildOtlpLogs: if the batch will not fit body_buf, encode as
+/// many events as fit and drop the rest; only a first event too large alone
+/// yields error.TooLarge (caller then drops the batch).
+pub fn buildOtlpEvents(events: []const frame.Lifecycle) error{TooLarge}![]const u8 {
+    // Pass 1: how many events fit, sizes innermost-first.
+    var total: usize = 0;
+    var nfit: usize = 0;
+    for (events) |e| {
+        const rl = eventRlLen(e) catch break; // un-renderable (never for capped names) → ship what we have
+        if (total + rl > body_buf.len) break; // batch full → drop the rest (ephemeral tier)
+        total += rl;
+        nfit += 1;
+    }
+    if (nfit == 0) return error.TooLarge;
+
+    // Pass 2: write the nfit events that fit.
+    var w = Writer{ .buf = &body_buf };
+    for (events[0..nfit]) |e| try writeEventRl(&w, e);
     std.debug.assert(w.pos == total); // sizing and writing must agree
     return body_buf[0..w.pos];
 }
@@ -1487,6 +1529,15 @@ const metric_batch_cap = 64;
 var metric_samples: [metric_batch_cap]frame.MetricSample = undefined;
 var metric_names: [metric_batch_cap][ship_name_cap]u8 = undefined;
 
+// One drain cycle's lifecycle events, batched into a single /v1/logs POST (like
+// the metric batch) instead of one TCP round trip each — a full-fleet start or
+// crash cascade is one POST, not N. Sized to the worker cap; a burst past it
+// drops the overflow (ephemeral tier, same as a full metric batch). `ev_names`
+// holds the name bytes, which alias into pipe_buf/scratch otherwise.
+const event_batch_cap = 64;
+var event_batch: [event_batch_cap]frame.Lifecycle = undefined;
+var event_names: [event_batch_cap][ship_name_cap]u8 = undefined;
+
 // Streamed-log batch (P3, opt-in) — bounded, daemon-local, zero-alloc. Each
 // drain cycle accumulates the cycle's log lines here and ships them in ONE
 // /v1/logs POST after the loop (same one-cycle lifetime as the metric batch, so
@@ -1588,9 +1639,10 @@ var daemon_host_name: []const u8 = "unknown";
 var daemon_host_id: []const u8 = "unknown";
 
 /// Drain everything currently readable from the pipe, ship it best-effort, and
-/// report whether EOF (parent gone) was seen. Metric samples are batched into a
-/// single OTLP request; lifecycle events post one LogRecord each. Any encode or
-/// send failure drops the record — routine telemetry is ephemeral.
+/// report whether EOF (parent gone) was seen. Metric samples, streamed log
+/// lines, and lifecycle events are each batched into a single OTLP request per
+/// cycle. Any encode or send failure drops the batch — routine telemetry is
+/// ephemeral.
 fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
     var eof = false;
     while (pipe_filled < pipe_buf.len) {
@@ -1610,6 +1662,7 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
     }
 
     var n_samples: usize = 0;
+    var n_events: usize = 0;
     resetLogBatch(); // one cycle's log lines only
     var scratch: [256]u8 = undefined;
     var off: usize = 0;
@@ -1625,11 +1678,14 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
                 } // batch full → drop (best-effort routine metric)
             },
             .lifecycle_event => |e| {
-                if (buildOtlpEvent(e)) |b| {
-                    _ = post(host, port, "/v1/logs", b, token);
-                } else |_| {
-                    // too large to encode → drop (routine telemetry is ephemeral)
-                }
+                // Batch (like the metric path) → one /v1/logs POST after the
+                // loop. Copy the name out of the decode scratch so it outlives it.
+                if (n_events < event_batch_cap and e.name.len <= ship_name_cap) {
+                    @memcpy(event_names[n_events][0..e.name.len], e.name);
+                    event_batch[n_events] = e;
+                    event_batch[n_events].name = event_names[n_events][0..e.name.len];
+                    n_events += 1;
+                } // batch full or name too long → drop (ephemeral)
             },
             .log_line => |l| {
                 // Accumulate into the batch shipped after the loop (mirrors the
@@ -1672,6 +1728,16 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
     // Ephemeral — an encode or send failure drops the batch (no retry, no spool).
     if (n_logs > 0) {
         if (buildOtlpLogs(log_records[0..n_logs], daemon_host_name, daemon_host_id)) |b| {
+            _ = post(host, port, "/v1/logs", b, token);
+        } else |_| {
+            // whole batch too large to encode → drop (ephemeral tier)
+        }
+    }
+
+    // Lifecycle events: one /v1/logs POST for the whole cycle's batch (was one
+    // TCP round trip per event). Ephemeral — an encode/send failure drops it.
+    if (n_events > 0) {
+        if (buildOtlpEvents(event_batch[0..n_events])) |b| {
             _ = post(host, port, "/v1/logs", b, token);
         } else |_| {
             // whole batch too large to encode → drop (ephemeral tier)
@@ -3016,6 +3082,61 @@ test "buildOtlpEvent renders body, severity, and service.name" {
     try testing.expectEqual(sev_warn, Fields.get(rec2, 2).?.int);
     try testing.expectEqualStrings("WARN", Fields.get(rec2, 3).?.bytes);
     try testing.expectEqualStrings("worker db unhealthy", avStr(Fields.get(rec2, 5).?.bytes));
+}
+
+test "buildOtlpEvents batches multiple events into one request" {
+    const evs = [_]frame.Lifecycle{
+        .{ .name = "api", .ev = .started, .t_unix_ns = 1_700_000_000_000_000_000 },
+        .{ .name = "db", .ev = .exited_err, .code = 7, .t_unix_ns = 1_700_000_000_000_000_001 },
+    };
+    const body = try buildOtlpEvents(&evs);
+    // Two resource_logs entries (field 1), one per event, each with its own
+    // service.name — proving the events rode ONE request instead of two POSTs.
+    var it = Fields{ .b = body };
+    var n_rl: usize = 0;
+    var saw_api = false;
+    var saw_db = false;
+    while (it.next()) |f| {
+        if (f.num != 1) continue; // resource_logs
+        n_rl += 1;
+        const res = Fields.get(f.bytes, 1).?.bytes;
+        const attr = Fields.get(res, 1).?.bytes;
+        const nm = avStr(Fields.get(attr, 2).?.bytes);
+        if (std.mem.eql(u8, nm, "api")) saw_api = true;
+        if (std.mem.eql(u8, nm, "db")) saw_db = true;
+    }
+    try testing.expectEqual(@as(usize, 2), n_rl);
+    try testing.expect(saw_api and saw_db);
+}
+
+test "buildOtlpEvents truncates the batch at the first un-renderable event" {
+    // Pass 1 sizes each event; an event whose body overflows renderEventBody's
+    // 256-byte scratch trips `catch break`, so the batch stops there and ships
+    // only the events already counted (ephemeral "drop the rest"). This locks in
+    // the partial-batch accounting: pass 2 writes exactly nfit events and the
+    // w.pos == total assert must still hold (a divergence would panic here).
+    const huge = "x" ** 250; // "worker " ++ huge ++ " started" > 256 → TooLarge
+    const evs = [_]frame.Lifecycle{
+        .{ .name = "api", .ev = .started, .t_unix_ns = 1_700_000_000_000_000_000 },
+        .{ .name = huge, .ev = .started, .t_unix_ns = 1_700_000_000_000_000_001 },
+        .{ .name = "db", .ev = .started, .t_unix_ns = 1_700_000_000_000_000_002 }, // after the break → dropped
+    };
+    const body = try buildOtlpEvents(&evs);
+    // Only the first event survives: one resource_logs, service.name "api".
+    var it = Fields{ .b = body };
+    var n_rl: usize = 0;
+    while (it.next()) |f| {
+        if (f.num != 1) continue;
+        n_rl += 1;
+        try testing.expectEqualStrings("api", firstServiceName(body));
+    }
+    try testing.expectEqual(@as(usize, 1), n_rl);
+
+    // A first event too large alone yields error.TooLarge (caller drops the batch).
+    const only_huge = [_]frame.Lifecycle{
+        .{ .name = huge, .ev = .started, .t_unix_ns = 1_700_000_000_000_000_000 },
+    };
+    try testing.expectError(error.TooLarge, buildOtlpEvents(&only_huge));
 }
 
 // ------------------------------------------------- service_prefix (multi-tenant)
