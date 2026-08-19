@@ -3,6 +3,26 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.15.3] - 2026-08-19
+
+### Changed
+- **The node/host sampler resolves its CPU-temp source once and caches it.**
+  `readCpuTemp` re-walked up to 48 sysfs `name`/`type` files
+  (`/sys/class/hwmon/hwmon0..15`, then `/sys/class/thermal/thermal_zone0..31`)
+  on every 5s node tick, forever — always returning 0 on the common sensor-less
+  cloud VM. The source (an hwmon chip or a thermal zone) is now probed once and
+  cached for the daemon's life — the same one-time-detection contract as GPU
+  auto-detect — after which each tick reads exactly one file (or none). The
+  temperature *value* is still read fresh each tick; selection is unchanged
+  (first source with a CPU name and a readable temp, hwmon before thermal). A
+  sensor appearing after start needs a restart to be detected. Off the PID-1
+  path.
+- **Two per-tick syscall trims on the supervision sampler.** `countFds` skips
+  `.`/`..` with a single first-byte test instead of a `strlen` + two string
+  compares per `/proc/<pid>/fd` entry; and the supervisor self-metric caches
+  `getpid()` (a real syscall) instead of re-issuing it every 5s tick. No
+  behavior change.
+
 ## [1.15.2] - 2026-08-19
 
 ### Changed

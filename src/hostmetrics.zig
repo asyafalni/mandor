@@ -601,41 +601,6 @@ fn readTrimmed(path: [*:0]const u8, buf: []u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n\x00");
 }
 
-/// CPU temperature (whole °C) from the first CPU-temp hwmon chip, else 0.
-/// Bounded probe of /sys/class/hwmon/hwmon0..15: read each `name`, and on the
-/// first whose name is in the CPU-temp allowlist, read that hwmon's temp1_input
-/// (milli-°C -> °C). Fail-closed: a missing dir/file, a non-CPU name, or an
-/// unreadable temp1_input is skipped; none found -> 0. All buffers are fixed
-/// stack allocations; no heap.
-fn readCpuTemp() u32 {
-    var path_buf: [64]u8 = undefined;
-    var name_buf: [64]u8 = undefined;
-    var temp_buf: [64]u8 = undefined;
-    var i: u32 = 0;
-    while (i < 16) : (i += 1) { // bounded probe hwmon0..hwmon15
-        const name_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/hwmon/hwmon{d}/name", .{i}) catch continue;
-        const name = readFile(name_path.ptr, &name_buf) orelse continue;
-        if (!isCpuTempChip(name)) continue;
-        // name_buf holds `name`; path_buf is free to reuse for the temp path.
-        const temp_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/hwmon/hwmon{d}/temp1_input", .{i}) catch continue;
-        const temp = readFile(temp_path.ptr, &temp_buf) orelse continue;
-        return parseMilliCelsius(temp); // first CPU-temp chip wins
-    }
-    // Fallback: /sys/class/thermal/thermal_zoneN — where hosts that don't expose
-    // an hwmon coretemp/k10temp chip (Intel x86_pkg_temp, ARM cpu-thermal) put
-    // the CPU sensor. Bounded probe; a missing zone/temp is simply skipped.
-    i = 0;
-    while (i < 32) : (i += 1) {
-        const type_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/thermal/thermal_zone{d}/type", .{i}) catch continue;
-        const zone = readFile(type_path.ptr, &name_buf) orelse continue;
-        if (!isCpuThermalZone(zone)) continue;
-        const temp_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/thermal/thermal_zone{d}/temp", .{i}) catch continue;
-        const temp = readFile(temp_path.ptr, &temp_buf) orelse continue;
-        return parseMilliCelsius(temp); // first CPU thermal zone wins
-    }
-    return 0;
-}
-
 /// host.name from /proc/sys/kernel/hostname (trimmed). Falls back to the
 /// stable literal "unknown" so the OTLP resource attribute is never empty.
 pub fn hostName(buf: []u8) []const u8 {
@@ -662,6 +627,73 @@ pub const Sampler = struct {
     prev_core_total: [max_cores]u64 = [_]u64{0} ** max_cores,
     prev_core_idle: [max_cores]u64 = [_]u64{0} ** max_cores,
     have_prev: bool = false,
+
+    // CPU-temp source, resolved once (see cpuTemp) and cached for the sampler's
+    // life — the same one-time-detection contract as GPU auto-detect.
+    temp_probed: bool = false, // true once the source has been looked for
+    temp_kind: u8 = 0, // 0 = none found, 1 = hwmon chip, 2 = thermal zone
+    temp_idx: u32 = 0, // index of the winning hwmon/thermal_zone
+
+    /// CPU temperature (whole °C), 0 when no CPU-temp sensor is present.
+    ///
+    /// The SOURCE is resolved once, on the first tick, and cached for life —
+    /// the same one-time-detection contract as GPU auto-detect (a sensor that
+    /// appears after start needs a restart to be picked up). In exchange, a
+    /// sensor-less host stops re-walking up to 48 sysfs `name`/`type` files
+    /// every tick: after the probe it reads exactly one file (or none). The
+    /// temperature VALUE is still read fresh each tick from the cached source.
+    ///
+    /// Probe order matches the original scan: hwmon0..15 (coretemp/k10temp/…
+    /// via the allowlist), then thermal_zone0..31 (x86_pkg_temp, ARM
+    /// cpu-thermal); first match wins. All buffers are fixed stack; no heap.
+    ///
+    /// Fail-closed corollary of caching the source: if the cached temp file
+    /// later becomes unreadable (sensor removed), this returns 0 rather than
+    /// re-scanning for another source — same restart-to-rediscover contract.
+    fn cpuTemp(self: *Sampler) u32 {
+        if (!self.temp_probed) {
+            self.temp_probed = true;
+            var path_buf: [64]u8 = undefined;
+            var name_buf: [64]u8 = undefined;
+            var temp_buf: [64]u8 = undefined;
+            var i: u32 = 0;
+            while (i < 16) : (i += 1) { // bounded probe hwmon0..hwmon15
+                const name_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/hwmon/hwmon{d}/name", .{i}) catch continue;
+                const name = readFile(name_path.ptr, &name_buf) orelse continue;
+                if (!isCpuTempChip(name)) continue;
+                // Commit only if temp1_input is actually readable — the original
+                // scan skipped a CPU-named chip with no readable temp, so the
+                // winner is the first source with a name AND a temp.
+                const temp_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/hwmon/hwmon{d}/temp1_input", .{i}) catch continue;
+                if (readFile(temp_path.ptr, &temp_buf) == null) continue;
+                self.temp_kind = 1;
+                self.temp_idx = i;
+                break;
+            }
+            if (self.temp_kind == 0) { // no hwmon chip — fall back to thermal zones
+                i = 0;
+                while (i < 32) : (i += 1) {
+                    const type_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/thermal/thermal_zone{d}/type", .{i}) catch continue;
+                    const zone = readFile(type_path.ptr, &name_buf) orelse continue;
+                    if (!isCpuThermalZone(zone)) continue;
+                    const temp_path = std.fmt.bufPrintZ(&path_buf, "/sys/class/thermal/thermal_zone{d}/temp", .{i}) catch continue;
+                    if (readFile(temp_path.ptr, &temp_buf) == null) continue;
+                    self.temp_kind = 2;
+                    self.temp_idx = i;
+                    break;
+                }
+            }
+        }
+        var path_buf: [64]u8 = undefined;
+        var temp_buf: [64]u8 = undefined;
+        const path = switch (self.temp_kind) {
+            1 => std.fmt.bufPrintZ(&path_buf, "/sys/class/hwmon/hwmon{d}/temp1_input", .{self.temp_idx}) catch return 0,
+            2 => std.fmt.bufPrintZ(&path_buf, "/sys/class/thermal/thermal_zone{d}/temp", .{self.temp_idx}) catch return 0,
+            else => return 0, // no source found at probe time
+        };
+        const temp = readFile(path.ptr, &temp_buf) orelse return 0;
+        return parseMilliCelsius(temp);
+    }
 
     /// Reads /proc + statfs and returns a HostSample. NEVER fails: any
     /// unreadable or garbage file yields zeros for its fields. All buffers are
@@ -711,9 +743,9 @@ pub const Sampler = struct {
         var uptime_buf: [128]u8 = undefined;
         out.uptime_s = parseUptime(readFile("/proc/uptime", &uptime_buf) orelse "");
 
-        // CPU temperature: bounded probe of hwmon0..15, first CPU-temp chip wins;
-        // 0 when no CPU-temp chip is present (fail-closed).
-        out.cpu_temp_c = readCpuTemp();
+        // CPU temperature from the once-probed, cached source (hwmon or thermal
+        // zone); 0 when none is present (fail-closed). See cpuTemp.
+        out.cpu_temp_c = self.cpuTemp();
 
         // Per-interface network counters. Read /proc/net/dev (8 KiB covers many
         // interfaces; truncation is safe — we parse what we read) and fill the
