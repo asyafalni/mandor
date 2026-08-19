@@ -646,6 +646,10 @@ pub const Sampler = struct {
     /// Probe order matches the original scan: hwmon0..15 (coretemp/k10temp/…
     /// via the allowlist), then thermal_zone0..31 (x86_pkg_temp, ARM
     /// cpu-thermal); first match wins. All buffers are fixed stack; no heap.
+    ///
+    /// Fail-closed corollary of caching the source: if the cached temp file
+    /// later becomes unreadable (sensor removed), this returns 0 rather than
+    /// re-scanning for another source — same restart-to-rediscover contract.
     fn cpuTemp(self: *Sampler) u32 {
         if (!self.temp_probed) {
             self.temp_probed = true;
