@@ -3,6 +3,17 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.15.2] - 2026-08-19
+
+### Changed
+- **The relay daemon batches lifecycle events into one OTLP request per cycle.**
+  Each process-lifecycle event (started / exited / restarting / OOM / health)
+  previously did its own `socket`+`connect`+`write`+`read`+`close` POST to
+  `/v1/logs`; they now ride one batched POST per drain cycle, the same shape as
+  the metric and streamed-log paths — a full-fleet start or crash cascade is one
+  round trip instead of N. Byte-identical single-event output; off the PID-1
+  path; ephemeral tier (a batch is dropped on encode/send failure).
+
 ## [1.15.1] - 2026-08-19
 
 ### Changed
