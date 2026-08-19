@@ -3,6 +3,22 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.15.1] - 2026-08-19
+
+### Changed
+- **The `mandor relay --daemon` telemetry child is now poll-driven.** It woke
+  every second and re-scanned the incident spool dir (`getdents64`) each time —
+  even fully idle — for the life of the container whenever `photon=` is set. It
+  now sleeps in `poll([pipe, signalfd], timeout)` bounded only by the next
+  node/GPU sample deadline (≤5s), so an idle daemon consumes ~0 CPU between
+  samples (live-verified against photon: ~0 CPU jiffies over a 6s idle window vs
+  the old 1 Hz spin) instead of a directory scan every second. A pipe frame (a
+  worker-death lifecycle event correlates with its incident) wakes it
+  immediately, so incidents still ship promptly; the spool scan is rate-limited
+  so the poll loop can't turn into a `getdents64` storm under log load; and
+  parent death is now detected via `POLLHUP`, faster than before. Off the
+  PID-1 supervision path; no behavior change to metrics/incident delivery.
+
 ## [1.15.0] - 2026-08-14
 
 ### Added

@@ -1370,9 +1370,12 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
 // flushing the spool one last time first. STABILITY LEADS: no syscall error,
 // bad frame, or send failure ever ends the loop — worst case is a skipped cycle.
 
-/// Seconds between cycles. The pipe is drained fully each cycle, so this only
-/// bounds shutdown/EOF latency and the spool retry cadence, not throughput.
-const daemon_cycle_s = 1;
+/// Minimum interval between spool-dir scans (getdents64). The daemon loop is
+/// poll-driven (below) and can wake many times a second under pipe load, so the
+/// durable spool tier is rate-limited here: a worker-death lifecycle frame on
+/// the pipe still wakes us, so a correlated incident ships within one interval,
+/// and the ≤5s node-sample tick is the idle safety-net scan.
+const spool_scan_ms = 1000;
 
 // Shipped-set watermark.
 //
@@ -1787,11 +1790,20 @@ pub fn runDaemon(
     var next_gpu_sample_ms: u64 = if (gpu_present) monoMs() +| gpu_interval_ms else 0;
 
     var shipped: Shipped = .{};
+    var last_spool_ms: u64 = 0;
 
     while (true) {
-        // Spool first: priority, durable, retried on failure.
-        if (!shipSpool(&shipped, spool_dir, hp.host, hp.port, token)) {
-            if (resolve.resolve(endpoint)) |new_hp| hp = new_hp;
+        // Spool tier: durable, retried on failure — rate-limited to spool_scan_ms
+        // so a poll-driven loop waking fast under pipe load can't turn into a
+        // getdents64 storm. A frame on the pipe (below) wakes us, so a correlated
+        // incident still ships within one interval; the ≤5s node tick is the
+        // idle safety-net.
+        const loop_now = monoMs();
+        if (loop_now -| last_spool_ms >= spool_scan_ms) {
+            last_spool_ms = loop_now;
+            if (!shipSpool(&shipped, spool_dir, hp.host, hp.port, token)) {
+                if (resolve.resolve(endpoint)) |new_hp| hp = new_hp;
+            }
         }
 
         // Routine: drain the pipe (best-effort). EOF means the parent is gone.
@@ -1856,27 +1868,25 @@ pub fn runDaemon(
             next_gpu_sample_ms +|= gpu_interval_ms;
         }
 
-        // Sleep the cycle, but never past the next node-sample deadline so the
-        // sample fires on time. next_node_sample_ms is in the future here (it was
-        // just advanced above if it was due), so the bound stays positive and the
-        // loop never busy-spins.
-        var sleep_ms: u64 = daemon_cycle_s * 1000;
+        // Wait event-driven until the next sample deadline OR a pipe/signal
+        // event — no fixed cycle, so an idle daemon consumes no CPU between the
+        // (≤5s) node samples instead of waking every second to rescan the spool.
+        // A pipe frame (metric/log/lifecycle, or EOF) or a TERM on the signalfd
+        // wakes us immediately; the timeout only bounds the next sample. Both
+        // deadlines are in the future here (advanced above when due), so the
+        // timeout is >= 0 and the loop never busy-spins.
         const now_ms = monoMs();
-        if (next_node_sample_ms > now_ms) {
-            const until = next_node_sample_ms - now_ms;
-            if (until < sleep_ms) sleep_ms = until;
+        var timeout_ms: u64 = next_node_sample_ms -| now_ms;
+        if (gpu_present) {
+            const g = next_gpu_sample_ms -| now_ms;
+            if (g < timeout_ms) timeout_ms = g;
         }
-        // Fold the GPU deadline into the sleep bound too, so an interval shorter
-        // than the node cadence still fires on time.
-        if (gpu_present and next_gpu_sample_ms > now_ms) {
-            const until = next_gpu_sample_ms - now_ms;
-            if (until < sleep_ms) sleep_ms = until;
-        }
-        var ts = linux.timespec{
-            .sec = @intCast(sleep_ms / 1000),
-            .nsec = @intCast((sleep_ms % 1000) * 1_000_000),
+        var pfds = [_]posix.pollfd{
+            .{ .fd = pipe_fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = sigfd, .events = posix.POLL.IN, .revents = 0 }, // fd < 0 is ignored by poll
         };
-        _ = linux.nanosleep(&ts, &ts);
+        const to: i32 = @intCast(@min(timeout_ms, @as(u64, std.math.maxInt(i32))));
+        _ = posix.poll(&pfds, to) catch 0; // EINTR/spurious wake → loop re-checks deadlines + drains
     }
 }
 
