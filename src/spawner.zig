@@ -395,6 +395,21 @@ fn sleepMs(ms: u64) void {
     _ = linux.nanosleep(&ts, null);
 }
 
+/// SIGKILL `pid` and reap it, bounded so a wedged reap can never spin PID 1
+/// forever. Returns 255 (the check counts as "failed"). Used by runCheck's
+/// timeout / error paths.
+fn killAndReap(pid: i32) u8 {
+    posix.kill(pid, .KILL) catch {};
+    var tries: u32 = 0;
+    while (tries < 2000) : (tries += 1) {
+        var st: u32 = 0;
+        const wrc = linux.waitpid(pid, &st, linux.W.NOHANG);
+        if (posix.errno(wrc) != .SUCCESS or wrc == pid) break;
+        sleepMs(1);
+    }
+    return 255;
+}
+
 /// `[require.NAME]` boot-gate check: fork/exec `cmd` (tokenized the same way
 /// as a worker command) and BLOCK until it exits or `timeout_ms` elapses.
 /// Boot has no fleet to protect yet — unlike every other spawn path in this
@@ -428,33 +443,44 @@ pub fn runCheck(
         execArgv(@ptrCast(&argv), envp, path_env);
     }
     const pid: i32 = @intCast(rc);
-    const deadline = monoMs() +| timeout_ms;
 
+    // Wait event-driven where the kernel allows it: a pidfd's POLLIN fires when
+    // the child exits, so `poll` sleeps in ONE syscall until exit or timeout —
+    // zero busy-poll, zero CPU while the check runs. pidfd_open needs kernel
+    // 5.3+ (2019); an older kernel falls back to a coarse bounded waitpid poll.
+    const pfd_rc = linux.pidfd_open(pid, 0);
+    if (posix.errno(pfd_rc) == .SUCCESS) {
+        const pidfd: i32 = @intCast(pfd_rc);
+        var pfds = [_]posix.pollfd{.{ .fd = pidfd, .events = posix.POLL.IN, .revents = 0 }};
+        const to: i32 = @intCast(@min(timeout_ms, @as(u64, std.math.maxInt(i32))));
+        const pr = posix.poll(&pfds, to) catch {
+            _ = linux.close(pidfd);
+            return killAndReap(pid); // poll error (incl. EINTR): fail-closed
+        };
+        _ = linux.close(pidfd);
+        if (pr == 0) return killAndReap(pid); // timed out
+        // Ready ⇒ the child has exited; a blocking reap returns immediately.
+        var st: u32 = 0;
+        _ = linux.waitpid(pid, &st, 0);
+        if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
+        return 255; // signaled/abnormal
+    }
+
+    // Fallback (no pidfd): bounded waitpid poll, as before.
+    const deadline = monoMs() +| timeout_ms;
     while (true) {
         var st: u32 = 0;
         const wrc = linux.waitpid(pid, &st, linux.W.NOHANG);
         switch (posix.errno(wrc)) {
             .SUCCESS => {},
             .INTR => continue,
-            else => return 255, // fail-closed: treat as not met
+            else => return 255, // fail-closed
         }
         if (wrc == pid) {
             if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
-            return 255; // signaled or other abnormal exit: fail-closed
-        }
-        if (monoMs() >= deadline) {
-            posix.kill(pid, .KILL) catch {};
-            // Bounded reap: SIGKILL lands almost immediately, but never spin
-            // forever waiting for it.
-            var tries: u32 = 0;
-            while (tries < 2000) : (tries += 1) {
-                var st2: u32 = 0;
-                const wrc2 = linux.waitpid(pid, &st2, linux.W.NOHANG);
-                if (posix.errno(wrc2) != .SUCCESS or wrc2 == pid) break;
-                sleepMs(1);
-            }
             return 255;
         }
+        if (monoMs() >= deadline) return killAndReap(pid);
         sleepMs(5);
     }
 }
