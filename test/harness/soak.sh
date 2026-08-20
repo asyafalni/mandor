@@ -61,7 +61,6 @@ max_restarts = -1
 backoff_max = "200ms"
 state_dir = "$STATE"
 metrics_port = $METRICS_PORT
-health_interval = "5s"
 workers = ["$TMP/bin/spam", "$TMP/bin/flap", "$TMP/bin/steady"]
 
 [worker.flap]
@@ -69,6 +68,7 @@ essential = false
 
 [worker.steady]
 health = "/bin/true"
+health_interval = "5s"
 TOML
 
 "$MANDOR" --config="$TMP/soak.toml" >/dev/null 2>&1 &
