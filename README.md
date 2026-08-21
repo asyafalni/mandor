@@ -474,7 +474,6 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `interval` | `[prober.NAME]` | — | |
 | `on_fail` | `[prober.NAME]` | — | |
 | `timeout` | `[prober.NAME]` | — | |
-| `fail_threshold` | `[prober.NAME]` | — | |
 
 GPU metrics are auto-detected (no enable toggle). The only tunable is the
 global `gpu_interval` key (default `15s`); the old `[gpu]` section was flattened

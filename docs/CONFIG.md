@@ -419,16 +419,14 @@ check    = "/opt/checks/pipeline-status.sh"   # simple check-once script
 interval = "2m"                               # required
 on_fail  = "report"                           # "report" (default) | "incident"
 timeout  = "10s"                              # optional; default 10s
-# fail_threshold = 1                          # optional; consecutive fails before on_fail
 ```
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `check` | string | — (**required**) | Command to run on the timer; exit 0 = healthy |
 | `interval` | duration | — (**required**) | How often to run the check (must be > 0) |
-| `on_fail` | string | `report` | `report` → an OTLP log to photon + a local warn line; `incident` → that plus a spooled incident bundle (cooldown-guarded) |
+| `on_fail` | string | `report` | `report` → an OTLP log to photon + a local warn line; `incident` → that plus a spooled incident bundle (cooldown-guarded). Fires on each failing check; the `incident` path is cooldown-guarded against spam |
 | `timeout` | duration | `10s` | A check running longer is SIGKILLed and counts as a failure |
-| `fail_threshold` | int ≥ 1 | `1` | Consecutive failures before `on_fail` fires |
 
 Like all telemetry, a prober's `report`/`incident` output ships to photon only
 when `photon=` is set; the local log line prints regardless.

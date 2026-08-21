@@ -829,7 +829,6 @@ const ProberState = struct {
     pid: i32 = 0,
     started_ms: u64 = 0,
     next_ms: u64 = 0,
-    fails: u8 = 0,
     last_incident_ms: u64 = 0,
 };
 
@@ -877,28 +876,19 @@ fn runProbers(
     }
 }
 
-/// One prober check was reaped: `ok` is true only on a clean exit 0. Updates
-/// the consecutive-failure count and, at `fail_threshold`, fires `on_fail`
-/// then resets the streak. This is the ENTIRE blast radius of a prober
-/// firing — no worker pid, `w.restarts`, `max_restarts`, or backoff field is
-/// ever read or written here.
+/// One prober check was reaped: `ok` is true only on a clean exit 0. A failure
+/// fires `on_fail` immediately (the `incident` path is cooldown-guarded, so a
+/// perpetually-failing prober cannot flood the spool). This is the ENTIRE blast
+/// radius of a prober firing — no worker pid, `w.restarts`, `max_restarts`, or
+/// backoff field is ever read or written here.
 fn collectProber(cfg: *const cli.Config, state_dir: []const u8, idx: u8, ok: bool, now: u64) void {
     if (idx >= cfg.probers_n) return; // defensive; idx is reaper-supplied
     const def = &cfg.probers[idx];
     const ps = &prober_state[idx];
     ps.pid = 0;
-    if (ok) {
-        ps.fails = 0;
-        return;
-    }
-    ps.fails +|= 1;
-    logmod.print("[mandor] prober '{s}' check failed ({d}/{d})\n", .{
-        def.name, ps.fails, def.fail_threshold,
-    });
-    if (ps.fails >= def.fail_threshold) {
-        ps.fails = 0;
-        fireProberOnFail(def, ps, state_dir, now);
-    }
+    if (ok) return;
+    logmod.print("[mandor] prober '{s}' check failed\n", .{def.name});
+    fireProberOnFail(def, ps, state_dir, now);
 }
 
 /// `on_fail` action for a prober at threshold: `report` always logs + emits
@@ -1827,14 +1817,13 @@ fn testSleepMs(ms: u64) void {
     _ = linux.nanosleep(&ts, null);
 }
 
-test "prober threshold: on_fail fires exactly at fail_threshold, then resets" {
+test "prober reap clears pid on both success and failure" {
     var cfg = cli.Config{};
     cfg.probers = undefined;
     cfg.probers[0] = .{
         .name = "p",
         .cmd = "/bin/true",
         .interval_ms = 60_000,
-        .fail_threshold = 3,
         .on_fail = .report,
     };
     cfg.probers_n = 1;
@@ -1843,25 +1832,14 @@ test "prober threshold: on_fail fires exactly at fail_threshold, then resets" {
     prober_state[0] = .{};
 
     const now: u64 = 1_000_000;
-    collectProber(&cfg, "", 0, false, now);
-    try testing.expectEqual(@as(u8, 1), prober_state[0].fails); // 1/3: not yet
-    collectProber(&cfg, "", 0, false, now);
-    try testing.expectEqual(@as(u8, 2), prober_state[0].fails); // 2/3: not yet
-    collectProber(&cfg, "", 0, false, now);
-    // 3/3: on_fail fires — observable as the streak resetting to 0 exactly
-    // here (fireProberOnFail runs synchronously inside this call, one line
-    // before the reset).
-    try testing.expectEqual(@as(u8, 0), prober_state[0].fails);
-
-    // A success at any point resets the streak immediately, without needing
-    // to reach the threshold.
-    collectProber(&cfg, "", 0, false, now);
-    try testing.expectEqual(@as(u8, 1), prober_state[0].fails);
-    collectProber(&cfg, "", 0, true, now);
-    try testing.expectEqual(@as(u8, 0), prober_state[0].fails);
-
-    // pid is always cleared on reap, success or failure.
+    // A failure fires on_fail (report: log/emit only, nothing to assert here)
+    // and clears the pid so the next interval can spawn again.
     prober_state[0].pid = 999;
+    collectProber(&cfg, "", 0, false, now);
+    try testing.expectEqual(@as(i32, 0), prober_state[0].pid);
+
+    // A success is a no-op beyond clearing the pid.
+    prober_state[0].pid = 888;
     collectProber(&cfg, "", 0, true, now);
     try testing.expectEqual(@as(i32, 0), prober_state[0].pid);
 }
@@ -1893,14 +1871,12 @@ test "prober on_fail=incident spools exactly once per cooldown window; on_fail=r
         .name = "p",
         .cmd = "/bin/true",
         .interval_ms = 60_000,
-        .fail_threshold = 2,
         .on_fail = .report,
     };
     cfg.probers[1] = .{
         .name = "q",
         .cmd = "/bin/true",
         .interval_ms = 60_000,
-        .fail_threshold = 2,
         .on_fail = .incident,
     };
     cfg.probers_n = 2;
@@ -1919,19 +1895,15 @@ test "prober on_fail=incident spools exactly once per cooldown window; on_fail=r
     // (the last_incident_ms==0 sentinel) — a plain `now -| 0 < cooldown` would drop it.
     const now: u64 = 90_000;
 
-    // Prober 0 (report): crossing the threshold fires but never spools.
+    // Prober 0 (report): a failure fires but never spools.
     collectProber(&cfg, state_dir, 0, false, now);
-    collectProber(&cfg, state_dir, 0, false, now);
-    try testing.expectEqual(@as(u8, 0), prober_state[0].fails);
     try testing.expectEqual(before, incident.total);
 
-    // Prober 1 (incident): crossing the threshold fires AND spools once.
+    // Prober 1 (incident): the first failure fires AND spools once.
     collectProber(&cfg, state_dir, 1, false, now);
-    collectProber(&cfg, state_dir, 1, false, now);
-    try testing.expectEqual(@as(u8, 0), prober_state[1].fails);
     try testing.expectEqual(before + 1, incident.total);
 
-    // Re-crossing the threshold immediately (same `now`) is still inside
+    // Further failures at the same `now` are still inside
     // detector.dedup_cooldown_ms — no second spool.
     collectProber(&cfg, state_dir, 1, false, now);
     collectProber(&cfg, state_dir, 1, false, now);
@@ -1955,7 +1927,6 @@ test "prober firing never touches a worker's pid/status/restarts" {
         .name = "p",
         .cmd = "/bin/true",
         .interval_ms = 60_000,
-        .fail_threshold = 1,
         .on_fail = .report,
     };
     cfg.probers_n = 1;
@@ -1963,9 +1934,9 @@ test "prober firing never touches a worker's pid/status/restarts" {
     defer prober_state[0] = saved;
     prober_state[0] = .{};
 
-    // Threshold 1: fires on the very first failure. collectProber's own
-    // signature has no `workers` parameter at all — this asserts the
-    // observable guarantee, not just the type-level one.
+    // A failure fires on_fail. collectProber's own signature has no `workers`
+    // parameter at all — this asserts the observable guarantee, not just the
+    // type-level one.
     collectProber(&cfg, "", 0, false, 9_000_000);
 
     try testing.expectEqual(snap_pid, w.pid);

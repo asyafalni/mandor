@@ -3,6 +3,29 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.15.4] - 2026-08-21
+
+### Removed
+- **`[prober.NAME] fail_threshold` is gone.** A prober now fires `on_fail` on
+  each failing check rather than after N consecutive failures. The knob did not
+  earn its place: for `on_fail = report` a report is a cheap warn line + one OTLP
+  log, so there was no flapping to damp; for `on_fail = incident` the incident
+  path is already cooldown-guarded against spam, leaving `fail_threshold` only
+  the narrow job of suppressing the *first* incident from a single transient
+  blip. A prober is a coarse status monitor by design — N-consecutive semantics
+  are what a worker `health` check is for. A `fail_threshold` key in a
+  `[prober.*]` section is now an unknown-key error, so drop it from your config.
+
+### Changed
+- **Config-surface budget raised 43 → 47 (CI gate), deliberately.** v1.15.0's
+  `[require.*]`/`[prober.*]` features grew the documented config surface from 41
+  to 48 keys without the budget being raised at the time. Removing the
+  over-built `fail_threshold` (above) trims it to 47; the remaining growth
+  (`require` check/timeout, `prober` check/interval/on_fail/timeout) is the
+  irreducible surface of two shipped, reviewed features. The gate is a tripwire
+  for *accidental* surface creep — this raise is the deliberate, justified act
+  it asks for.
+
 ## [1.15.3] - 2026-08-19
 
 ### Changed
