@@ -3,6 +3,22 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.15.5] - 2026-08-21
+
+### Changed
+- **The per-line warn/error classifier (`logSeverity`) is ~2–4× cheaper.** It
+  runs on every captured line when `photon=` is set (to bucket the Tier-2
+  digest), and it probed six keywords at each character position — re-lowercasing
+  the same byte up to six times. It now does one `toLower(line[i])` and a `switch`
+  on the keyword initial (each is distinct: error/exception→`e`, panic→`p`,
+  fatal→`f`, traceback→`t`, warn→`w`), reaching only the keyword(s) that could
+  match — ~6× fewer `toLower` calls per byte. Byte-identical output (guarded by a
+  fuzzed differential test against a whole-line `containsIgnoreCase` reference);
+  measured ~1.4 → ~0.5 µs/line on a 187-byte info line (`bench/hotline.zig`;
+  2–4× swing with VM load). Found by a measure-first pass — at a 100k line/s
+  flood to photon this is ~140 ms/s of a core down to ~50 ms/s. Offline (no
+  `photon=`) the classifier never runs, so nothing changes there.
+
 ## [1.15.4] - 2026-08-21
 
 ### Removed

@@ -8,10 +8,14 @@ that needs evidence rather than assertion. This directory holds it.
 ```
 zig run bench/scan.zig -OReleaseSafe
 zig run bench/cold.zig -OReleaseSafe
+zig run bench/hotline.zig -OReleaseSafe
 ```
 
-These measure the two places in mandor with worse-than-linear shape, both on
-the **cold** (per-incident) path — the hot per-line path has none.
+`scan`/`cold` measure the two places with worse-than-linear *shape*, both on the
+**cold** (per-incident) path. `hotline` measures the one per-line **hot**-path
+cost that only appears when `photon=` is set: the warn/error severity classifier
+(`summarize.logSeverity`), which runs on every captured line so the Tier-2 digest
+can bucket it.
 
 ### Findings (2026-07-22, x86_64 WSL, ReleaseSafe)
 
@@ -34,9 +38,38 @@ to-do.** The reasoning, so no one re-optimizes on a hunch:
   mismatched byte, so the "optimization" was already happening. Measure before
   optimizing.
 
-The hot path — `Assembler.feed`, `echoLine`, `ring.push` — is O(line length)
-with no scan, sort, or search per line. That is the path "fast like the flash"
+The offline hot path — `Assembler.feed`, `echoLine`, `ring.push` — is O(line
+length) with no scan, sort, or search per line. That path "fast like the flash"
 is really about, and it is already optimal.
+
+### `logSeverity` classifier, photon on (2026-08-21, x86_64 WSL, ReleaseSafe)
+
+`hotline.zig` measures the per-line severity classifier that runs **only when
+`photon=` is set** (offline, it never executes — so this never contradicts the
+"offline hot path is optimal" line above). Worst case is a high-volume INFO
+flood: every line is scanned to full length, finding no keyword.
+
+Numbers are noisy on this WSL2 VM (5 isolated runs shown as a range); the
+*structural* win is the reliable part — the old form lowercased each byte up to
+six times, the new one does it once.
+
+| Variant | Measured (187 B line, 5 runs) | Kept? |
+|---|---|---|
+| per-position ×6 `kwAt` (pre-v1.15.5) | **~1.3–1.7 µs/line** | no |
+| first-char dispatch (v1.15.5) | **~0.4–0.7 µs/line** (~**2–4×**) | yes |
+
+Unlike `errorish`, this one *was* worth changing — and only measurement showed
+why. `errorish`'s inner loop short-circuits on the first byte; `logSeverity`
+did not — it probed six keywords at every position, re-lowercasing the same
+character six times. A `switch` on one `toLower(line[i])`, dispatched on the
+keyword initial (each is distinct: error/exception→`e`, panic→`p`, fatal→`f`,
+traceback→`t`, warn→`w`), computes the lowercase once and reaches only the
+keyword(s) that could match. Byte-identical (a fuzzed differential test vs a
+whole-line `containsIgnoreCase` reference guards it). At a 100k line/s flood
+this is ~140 ms/s of a core down to ~50 ms/s — CPU, the top-priority resource,
+on the one per-line branch that scales with external load. (The measured
+multiple swings 2–4× with VM load; ~6× fewer `toLower` calls per byte is the
+floor the constant factors erode.)
 
 ## End-to-end comparison (vs other init/supervisors)
 

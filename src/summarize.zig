@@ -67,10 +67,13 @@ pub fn errorish(line: []const u8) bool {
         containsIgnoreCase(line, "warn");
 }
 
-/// Case-insensitive keyword match at a fixed position (comptime lowercase needle).
-inline fn kwAt(line: []const u8, at: usize, comptime kw: []const u8) bool {
+/// Case-insensitive match of `kw` (comptime lowercase) at `line[at..]`, GIVEN the
+/// caller has already matched kw[0] against toLower(line[at]) — verifies only the
+/// remainder. Paired with the first-char switch in logSeverity.
+inline fn kwRest(line: []const u8, at: usize, comptime kw: []const u8) bool {
     if (at + kw.len > line.len) return false;
     inline for (kw, 0..) |c, k| {
+        if (k == 0) continue; // first char already matched by the switch
         if (std.ascii.toLower(line[at + k]) != c) return false;
     }
     return true;
@@ -78,19 +81,29 @@ inline fn kwAt(line: []const u8, at: usize, comptime kw: []const u8) bool {
 
 /// Content severity of a log line for the Tier-2 digest: 2 = error-class keyword
 /// (error/panic/fatal/exception/traceback), 1 = "warn", 0 = none. Error outranks
-/// warn. ONE pass over the line (early per-position rejection) — not six separate
-/// `containsIgnoreCase` scans — because the digest classifies on the capture path
-/// and telemetry must never slow supervision. Unlike `errorish` (which lumps warn
-/// in with error), this keeps warnings at severity 1 so photon doesn't alert on
-/// them as errors.
+/// warn. ONE pass over the line, dispatched on the keyword INITIAL: each keyword
+/// starts with a distinct char (error/exception→e, panic→p, fatal→f,
+/// traceback→t, warn→w), so one toLower(line[i]) + a switch reaches only the
+/// keyword(s) that could match at that position — a char that starts no keyword
+/// costs a single switch. This runs on every captured line when `photon=` is set,
+/// so telemetry must never slow supervision. The old form probed six keywords at
+/// each position, re-lowercasing line[i] up to six times; this lowercases it once
+/// — measured ~2–4× faster per line (bench/hotline.zig; VM-noisy) and byte-
+/// identical (the differential test below guards equivalence).
 pub fn logSeverity(line: []const u8) u8 {
     var sev: u8 = 0;
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
-        if (kwAt(line, i, "error") or kwAt(line, i, "panic") or
-            kwAt(line, i, "fatal") or kwAt(line, i, "exception") or
-            kwAt(line, i, "traceback")) return 2;
-        if (sev == 0 and kwAt(line, i, "warn")) sev = 1;
+        switch (std.ascii.toLower(line[i])) {
+            'e' => if (kwRest(line, i, "error") or kwRest(line, i, "exception")) return 2,
+            'p' => if (kwRest(line, i, "panic")) return 2,
+            'f' => if (kwRest(line, i, "fatal")) return 2,
+            't' => if (kwRest(line, i, "traceback")) return 2,
+            'w' => if (sev == 0 and kwRest(line, i, "warn")) {
+                sev = 1;
+            },
+            else => {},
+        }
     }
     return sev;
 }
@@ -479,6 +492,74 @@ test "logSeverity separates error, warn, and info by content" {
     // no keyword → 0
     try std.testing.expectEqual(@as(u8, 0), logSeverity("listening on :8080"));
     try std.testing.expectEqual(@as(u8, 0), logSeverity(""));
+}
+
+test "logSeverity: first-char dispatch matches a brute-force reference" {
+    // The dispatch (one toLower/position, switch on the keyword initial) must be
+    // byte-identical to the whole-line contains definition. The reference uses a
+    // DIFFERENT algorithm (containsIgnoreCase over the full line per keyword), so
+    // agreement across a fuzzed corpus is real evidence, not a tautology.
+    const ref = struct {
+        fn severity(line: []const u8) u8 {
+            if (containsIgnoreCase(line, "error") or containsIgnoreCase(line, "panic") or
+                containsIgnoreCase(line, "fatal") or containsIgnoreCase(line, "exception") or
+                containsIgnoreCase(line, "traceback")) return 2;
+            if (containsIgnoreCase(line, "warn")) return 1;
+            return 0;
+        }
+    }.severity;
+
+    // Explicit boundary cases: keyword at end, truncated keyword, mixed case,
+    // overlaps, adjacent keywords, and the shared 'e' initial (error/exception).
+    const fixed = [_][]const u8{
+        "",                  "e",         "err",
+        "error",             "ERROR",     "eRRoR",
+        "exception",         "exceptio",  "an exception here",
+        "warn",              "WARN",      "warning",
+        "war",               "trace",     "traceback",
+        "tracebac",          "panic!",    "the fatal flaw",
+        "prefixerrorsuffix", "warnerror", "errorwarn",
+        "eeeeeeee",          "wewewewe",  "xyzzy no keywords",
+        ".....",
+    };
+    for (fixed) |l| try std.testing.expectEqual(ref(l), logSeverity(l));
+
+    // Fuzzed corpus over a small alphabet rich in keyword characters, so partial
+    // and 1-3 char keyword overlaps appear by chance at arbitrary positions and
+    // cases. Random bytes essentially never form the long keywords
+    // (exception/traceback), so ~1 line in 3 also splices a full keyword at a
+    // random position in random case — the fuzz then independently exercises
+    // every keyword branch, not just the boundary/overlap surface.
+    const alphabet = "eErRoOpPaAnNiIcCfFtTlLxXwWbBkKsSuU 0123456789";
+    const kws = [_][]const u8{ "error", "panic", "fatal", "exception", "traceback", "warn" };
+    var seed: u64 = 0x9e3779b97f4a7c15;
+    var buf: [48]u8 = undefined;
+    var iter: usize = 0;
+    while (iter < 20000) : (iter += 1) {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const len = (seed >> 40) % (buf.len + 1);
+        var k: usize = 0;
+        while (k < len) : (k += 1) {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            buf[k] = alphabet[(seed >> 33) % alphabet.len];
+        }
+        // Splice a full keyword into some lines (random case), when it fits.
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        if ((seed >> 30) % 3 == 0) {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            const kw = kws[(seed >> 30) % kws.len];
+            if (kw.len <= len) {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                const at = (seed >> 30) % (len - kw.len + 1);
+                for (kw, 0..) |c, ki| {
+                    seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                    buf[at + ki] = if ((seed >> 30) & 1 == 0) std.ascii.toUpper(c) else c;
+                }
+            }
+        }
+        const line = buf[0..len];
+        try std.testing.expectEqual(ref(line), logSeverity(line));
+    }
 }
 
 test "signature ignores digits, distinguishes cause and name" {
