@@ -93,6 +93,43 @@ on the one per-line branch that scales with external load. (The measured
 multiple swings 2–4× with VM load; ~6× fewer `toLower` calls per byte is the
 floor the constant factors erode.)
 
+## Startup + spawn/reap cost (`startup.sh`)
+
+```
+zig build -Doptimize=ReleaseSafe && MANDOR=zig-out/bin/mandor bash bench/startup.sh
+```
+
+Boot→all-spawned latency and the per-restart fork/exec/reap cost are the same
+`spawn()` path, so one measurement gives both: time mandor start→exit with N
+`/bin/true` workers (clean exits are never retried), intercept = boot overhead,
+slope = per-spawn+reap = per-restart cost.
+
+### Findings (2026-08-21, x86_64 WSL, ReleaseSafe, best of 8)
+
+| N | start→exit | vs `/bin/true` floor (~3–8 ms, VM-noisy) |
+|---|---|---|
+| 1 | ~7–12 ms | boot ≈ **~4 ms** over the process-launch floor |
+| 16 | ~20–28 ms | |
+| 32 | ~42 ms | |
+| 64 | ~69–75 ms | slope ≈ **~1 ms/worker** |
+
+**No hotspot, no headroom — recorded, not a to-do.**
+
+- **The per-worker ~1 ms is process creation, not mandor.** With `/bin/true`
+  workers (no shell) the slope is unchanged, so it isn't interpreter startup —
+  it's `fork`+`execve`+`pipe2`+`dup2`+`waitpid`, all inherent to spawning a
+  worker. WSL2's process creation is slow; a real container host is faster. The
+  `/bin/true` launch floor itself swung 3→8 ms between runs — the kernel/VM, not
+  mandor, dominates and varies.
+- **Restart-storm is bounded by backoff, not spawn cost.** A crashloop restarts
+  at most every `backoff` (≥200 ms initial), and the ~1 ms respawn is <0.5 % of
+  that. `resolveExe` (the PATH walk) and the ELF build-id read are cached across
+  restarts (once per worker lifetime), so a crashloop pays only fork/exec/reap.
+- **The one lever is rejected.** `vfork` could shave the fork cost but risks
+  PID-1 address-space corruption between fork and exec — off the table for the
+  process that must never die. resolveExe caching is the spawn optimization, and
+  it already shipped (v1.15 / #61 context).
+
 ## End-to-end comparison (vs other init/supervisors)
 
 ```
