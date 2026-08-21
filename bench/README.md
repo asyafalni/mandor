@@ -9,6 +9,7 @@ that needs evidence rather than assertion. This directory holds it.
 zig run bench/scan.zig -OReleaseSafe
 zig run bench/cold.zig -OReleaseSafe
 zig run bench/hotline.zig -OReleaseSafe
+zig run bench/fanout.zig -OReleaseSafe
 ```
 
 `scan`/`cold` measure the two places with worse-than-linear *shape*, both on the
@@ -41,6 +42,27 @@ to-do.** The reasoning, so no one re-optimizes on a hunch:
 The offline hot path — `Assembler.feed`, `echoLine`, `ring.push` — is O(line
 length) with no scan, sort, or search per line. That path "fast like the flash"
 is really about, and it is already optimal.
+
+### Many-workers per-wake bookkeeping (2026-08-21, x86_64 WSL, ReleaseSafe)
+
+`fanout.zig` measures the one per-wake cost that scales with worker count and is
+theoretically cacheable: `pumpIo` rebuilds the pollfd/owner/kind arrays (up to 3
+fds/worker) every wake, then scans them after `poll()`.
+
+| Workers | fds | Measured |
+|---|---|---|
+| 1 | 2 | **~6 ns/wake** |
+| 16 | 32 | **~64 ns/wake** |
+| 64 | 128 | **~260 ns/wake** |
+
+**Not worth caching, and that is the recorded conclusion.** ~4 ns/fd. Even at the
+64-worker ceiling the rebuild is ~260 ns — 5–20% of the single `poll()` syscall
+(~1–5 µs) it sits beside, and a fraction of the per-line drain that follows a
+readable wake. Caching the set to skip the rebuild would add a dirty flag plus
+cache invalidation on every spawn/death — state and branches on the PID-1 loop —
+to save a quarter-microsecond at an extreme worker count. The 5 s sampler's
+per-worker `/proc` reads are O(N) syscalls but ~40/s at N=64: inherent, trivial.
+The many-worker path has no hot spot.
 
 ### `logSeverity` classifier, photon on (2026-08-21, x86_64 WSL, ReleaseSafe)
 
