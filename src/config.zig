@@ -539,11 +539,6 @@ fn proberSetting(cfg: *FileConfig, pi: usize, key: []const u8, value: []const u8
         } else {
             return error.BadValue;
         }
-    } else if (std.mem.eql(u8, key, "fail_threshold")) {
-        // A bare integer, like every other int key (metrics_port, psi_*, …) — no quotes.
-        const n = std.fmt.parseInt(u8, value, 10) catch return error.BadValue;
-        if (n < 1) return error.BadValue;
-        cfg.probers[pi].fail_threshold = n;
     } else {
         return error.Syntax; // unknown key inside a [prober.*] section
     }
@@ -1323,17 +1318,16 @@ test "prober section parses with defaults and overrides" {
     try t.expectEqual(@as(u64, 120_000), cfg.probers[0].interval_ms);
     try t.expectEqual(@as(u64, 10_000), cfg.probers[0].timeout_ms);
     try t.expectEqual(cli.ProbeDef.OnFail.report, cfg.probers[0].on_fail);
-    try t.expectEqual(@as(u8, 1), cfg.probers[0].fail_threshold);
-    const c2 = try parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"incident\"\nfail_threshold=3", &s);
+    const c2 = try parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"incident\"", &s);
     try t.expectEqual(cli.ProbeDef.OnFail.incident, c2.probers[0].on_fail);
-    try t.expectEqual(@as(u8, 3), c2.probers[0].fail_threshold);
 }
-test "prober: missing interval/check, bad on_fail, threshold=0 are errors" {
+test "prober: missing interval/check, bad on_fail, dropped fail_threshold are errors" {
     var s: [cli.max_workers][]const u8 = undefined;
     try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"", &s)); // no interval
     try t.expectError(error.BadValue, parseTest("[prober.p]\ninterval=\"5s\"", &s)); // no check
     try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\non_fail=\"nope\"", &s));
-    try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\nfail_threshold=0", &s));
+    // fail_threshold was removed in v1.15.4 — now an unknown key, not a knob.
+    try t.expectError(error.Syntax, parseTest("[prober.p]\ncheck=\"x\"\ninterval=\"5s\"\nfail_threshold=2", &s));
     // A malformed check (unbalanced quote) is rejected at parse, not left to
     // silently never tokenize at runtime.
     try t.expectError(error.BadValue, parseTest("[prober.p]\ncheck=\"sh -c 'oops\"\ninterval=\"5s\"", &s));

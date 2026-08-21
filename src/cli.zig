@@ -58,7 +58,6 @@ pub const ProbeDef = struct {
     interval_ms: u64,
     timeout_ms: u64 = 10_000,
     on_fail: OnFail = .report,
-    fail_threshold: u8 = 1,
 };
 
 pub const Mode = enum { supervise, report, validate };

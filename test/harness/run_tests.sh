@@ -1538,7 +1538,6 @@ cat > "$TMP/prober.toml" <<TOML
 [prober.p]
 check = "sh -c 'exit 1'"
 interval = "1s"
-fail_threshold = 1
 TOML
 cat > "$TMP/w86.sh" <<'SH'
 #!/bin/sh
