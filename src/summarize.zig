@@ -525,8 +525,13 @@ test "logSeverity: first-char dispatch matches a brute-force reference" {
     for (fixed) |l| try std.testing.expectEqual(ref(l), logSeverity(l));
 
     // Fuzzed corpus over a small alphabet rich in keyword characters, so partial
-    // and full keywords appear by chance at arbitrary positions and cases.
+    // and 1-3 char keyword overlaps appear by chance at arbitrary positions and
+    // cases. Random bytes essentially never form the long keywords
+    // (exception/traceback), so ~1 line in 3 also splices a full keyword at a
+    // random position in random case — the fuzz then independently exercises
+    // every keyword branch, not just the boundary/overlap surface.
     const alphabet = "eErRoOpPaAnNiIcCfFtTlLxXwWbBkKsSuU 0123456789";
+    const kws = [_][]const u8{ "error", "panic", "fatal", "exception", "traceback", "warn" };
     var seed: u64 = 0x9e3779b97f4a7c15;
     var buf: [48]u8 = undefined;
     var iter: usize = 0;
@@ -537,6 +542,20 @@ test "logSeverity: first-char dispatch matches a brute-force reference" {
         while (k < len) : (k += 1) {
             seed = seed *% 6364136223846793005 +% 1442695040888963407;
             buf[k] = alphabet[(seed >> 33) % alphabet.len];
+        }
+        // Splice a full keyword into some lines (random case), when it fits.
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        if ((seed >> 30) % 3 == 0) {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            const kw = kws[(seed >> 30) % kws.len];
+            if (kw.len <= len) {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                const at = (seed >> 30) % (len - kw.len + 1);
+                for (kw, 0..) |c, ki| {
+                    seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                    buf[at + ki] = if ((seed >> 30) & 1 == 0) std.ascii.toUpper(c) else c;
+                }
+            }
         }
         const line = buf[0..len];
         try std.testing.expectEqual(ref(line), logSeverity(line));
