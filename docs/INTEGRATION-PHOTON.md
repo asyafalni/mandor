@@ -10,14 +10,20 @@ mandor tells its story to photon — without breaking mandor's product boundary
 and even then the supervision path itself opens no socket).
 
 > **Self-sufficient as of the OTLP-telemetry work.** When `photon=` is set,
-> mandor ships **incidents, per-process/supervisor metrics, node/host metrics,
-> optional GPU metrics, and process-lifecycle events** to photon directly as
-> OTLP — **no collector in the container is required** for any of them. A single
-> long-lived `mandor relay --daemon` child owns the socket (watches the incident
-> spool, drains a non-blocking telemetry pipe, and samples the node on its own
-> timer); the supervision path never touches a socket. Because mandor now pushes
-> node and GPU metrics itself, one mandor with the host mounted in **supersedes
-> photon's standalone `photon-agent`**. By default mandor still *curates* — it
+> mandor ships **incidents, per-process/supervisor metrics, and
+> process-lifecycle events** to photon directly as OTLP — **no collector in the
+> container is required** for any of them. A single long-lived
+> `mandor relay --daemon` child owns the socket (watches the incident spool and
+> drains a non-blocking telemetry pipe); the supervision path never touches a
+> socket.
+>
+> **Division of labour (v1.16).** mandor describes its **workers**; photon's
+> standalone **`photon-agent`** describes the **host** — and, since photon's
+> live process table, every process on it, GPU per process included, tagged
+> with the mandor it runs under. The node/host + GPU metrics mandor shipped
+> from v1.9 to v1.15 (which briefly let it "supersede" photon-agent) are gone;
+> both run side by side and photon joins them on `host.name` / `host.id`.
+> By default mandor still *curates* — it
 > does **not** ship raw per-line worker logs and never ships traces, so log
 > content reaches photon inside incident bundles (their flagged log-tail
 > summary) and — as of the log-signal-v2 work — a curated **warn/error digest**
@@ -57,9 +63,9 @@ service_prefix = "tenant-a-"     # service.name becomes e.g. "tenant-a-api"
 ### 1. Metrics — native OTLP push when `photon=` is set
 
 **With `photon=` set, mandor pushes OTLP metrics itself** (`/v1/metrics`, via the
-relay daemon) — no collector needed. Three resource scopes, all carrying the SAME
-`host.name`/`host.id` so photon's Infrastructure / Hosts view groups them under
-one node:
+relay daemon) — no collector needed. One resource scope per worker, every one
+carrying the SAME `host.name`/`host.id` photon-agent reports for the host, so
+photon's Infrastructure / Hosts view groups them under one node:
 
 - **Per-process + supervisor.** One `ResourceMetrics` per worker
   (`service.name=<worker>`, origin-prefixed by `service_prefix` when set) with
@@ -71,27 +77,23 @@ one node:
   Processes table). Sampled on the /proc cadence (5s), delivered best-effort over
   a non-blocking pipe — dropped under backpressure so telemetry never stalls
   supervision.
-- **Node / host.** One host-scoped resource (`host.name`/`host.id`/`os.type`)
-  with `system.cpu.utilization` (`cpu=total` + per-core `cpu=<n>`),
-  `system.cpu.logical.count`, `system.cpu.load_average.{1m,5m,15m}`,
-  `system.memory.{usage,limit,utilization}`, `system.paging.usage` (swap),
-  `system.network.io` (per-interface × direction),
-  `system.filesystem.{usage,utilization}` (per-mount), `system.disk.io`
-  (per-device), plus mandor-extension gauges `system.uptime` and
-  `system.cpu.temperature`. Sampled **inside the daemon** (its own /proc + statfs
-  reads on a 5s timer) — the supervision path carries none of it. Emitted
-  automatically whenever `photon=` is set; there is no separate toggle.
-- **GPU** (auto-detected — no `[gpu] enabled` toggle; the daemon probes once at
-  startup, default 15s sample interval).
-  `system.gpu.{utilization,memory.usage,memory.utilization,temperature,power}`
-  per GPU (`gpu`, `gpu.name`). NVIDIA via an `nvidia-smi` shell-out (mandor is
-  static/libc-free, so it cannot dlopen NVML); AMD/Intel via DRM sysfs.
-  Fail-closed — no GPU found at the startup probe ⇒ nothing shipped (logged
-  once), no effect on anything else, and no re-probe (a GPU appearing later
-  needs a restart).
+- **Not the host.** No `system.*`, no `system.gpu.*`: mandor samples nothing
+  node-level (removed in v1.16, together with the `gpu_interval` key and the
+  daemon's node timer). photon-agent runs on every host and ships the machine's
+  CPU/memory/disk/network/GPU plus a live per-process table — every process,
+  with NVML per-process GPU memory and SM/encoder/decoder utilization, and for
+  the ones under a mandor the supervising pid and the worker name mandor gives
+  them — so the two views line up. **mandor stamps `MANDOR_WORKER=<name>` into
+  every worker's environment** (v1.16): the environment survives `exec`, so an
+  entrypoint that `exec`s the real program, or a `#!/usr/bin/env` shebang, still
+  names the pid exactly as mandor's `service.name` does; photon-agent reads it
+  from `/proc/<pid>/environ` and falls back to deriving `basename(argv[0])` when
+  it cannot.
+  What only the supervisor knows stays here: restarts, exit causes, incidents,
+  the digest, lifecycle.
 
 Config specifics live in [CONFIG.md](CONFIG.md); the whole telemetry surface is
-`photon=` plus the global `gpu_interval` key and the small `[logs]` section.
+`photon=` plus the small `[logs]` section.
 
 **The Prometheus `--metrics=PORT` endpoint (127.0.0.1) is a separate, local pull
 option**, unrelated to the photon push path above. photon ingests by push only —
@@ -361,8 +363,10 @@ services:
   app:
     image: my-app            # ENTRYPOINT ["/mandor", "--config=/mandor.toml"]
     volumes: [mandor-state:/var/lib/mandor]
-    # photon = "photon:4318" in mandor.toml pushes incidents, per-process +
-    # host (+ opt-in GPU) metrics, and lifecycle events directly — no collector.
+    # photon = "photon:4318" in mandor.toml pushes incidents, per-process
+    # metrics, and lifecycle events directly — no collector. The host itself
+    # (and every process on it, GPU included) is photon-agent's, installed on
+    # the node, not in this container.
   photon:
     image: ghcr.io/nevindra/photon:latest
     ports: ["8080:8080"]
@@ -371,10 +375,10 @@ volumes:
   mandor-state:
 ```
 
-To have this mandor also report the **host** (superseding `photon-agent`), mount
-`/proc`, `/sys`, `/etc/machine-id` (and `/dev/nvidia*` + `nvidia-smi` for GPU)
-into the `app` container — node-exporter style, additive to supervising its
-workers.
+mandor does **not** report the host: install `photon-agent` on the node for
+that. It sees this container's mandor and workers from outside (tree, GPU
+share, container link) and photon lines them up with the metrics above by
+`host.name` / `host.id`.
 
 ## Non-goals
 

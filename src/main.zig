@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Invisible subcommand: `mandor relay <bundle.json>` (photon bridge).
     // The supervisor path never networks; this runs only when invoked.
     if (vec.len >= 3 and std.mem.eql(u8, std.mem.span(vec[1]), "relay")) {
-        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [interval] [service_prefix]`.
+        // Long-lived form: `mandor relay --daemon <endpoint> <spool_dir> <pipe_fd> [service_prefix]`.
         // Spawned by the supervisor when `photon=` is set (it owns the socket so
         // the supervision path never does). <spool_dir> is the mandor state dir
         // (the one holding incidents/); <pipe_fd> is the inherited read end.
@@ -97,15 +97,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const endpoint = std.mem.span(vec[3]);
             const spool_dir = std.mem.span(vec[4]);
             const pipe_fd = std.fmt.parseInt(i32, std.mem.span(vec[5]), 10) catch return 2;
-            // vec[6] = gpu interval ms (absent on an older spawn -> 15s). vec[7] =
-            // service prefix ("" = none). GPU on/off is auto-detected by the daemon,
-            // not passed. Log streaming is per-worker, so no toggle is threaded.
-            const gpu_interval_ms: u64 = if (vec.len >= 7)
-                (std.fmt.parseInt(u64, std.mem.span(vec[6]), 10) catch 15_000)
-            else
-                15_000;
-            const service_prefix: []const u8 = if (vec.len >= 8) std.mem.span(vec[7]) else "";
-            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, gpu_interval_ms, service_prefix, init.environ.block.slice);
+            // vec[6] = service prefix ("" = none). The daemon samples nothing
+            // host-level (photon-agent does), so no interval is threaded; log
+            // streaming is per-worker, so no toggle is either.
+            const service_prefix: []const u8 = if (vec.len >= 7) std.mem.span(vec[6]) else "";
+            return @import("relay.zig").runDaemon(endpoint, spool_dir, pipe_fd, service_prefix, init.environ.block.slice);
         }
         const endpoint: ?[]const u8 = if (vec.len >= 4) std.mem.span(vec[3]) else null;
         return @import("relay.zig").run(vec[2], endpoint, init.environ.block.slice);
@@ -171,9 +167,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     error.LogsStreamRemoved => "'[logs] stream' was removed — streaming is now " ++
                         "per worker: set stream = true inside a [worker.NAME] section. The " ++
                         "curated warn/error digest ships by default; [logs] keeps max_rate/digest*",
-                    error.GpuSectionRemoved => "the '[gpu]' section was removed — set the global " ++
-                        "'gpu_interval' key instead (GPU metrics are auto-detected: on when a " ++
-                        "device is present, off otherwise; there is no enable toggle)",
+                    error.GpuSectionRemoved => "the '[gpu]' section was removed — mandor no longer " ++
+                        "samples the host: node and GPU metrics (system.*, system.gpu.*) come from " ++
+                        "photon-agent, which reports every process on the host, GPU per process included",
+                    error.HostMetricsRemoved => "'gpu_interval' was removed — mandor no longer samples " ++
+                        "the host: node and GPU metrics (system.*, system.gpu.*) come from photon-agent; " ++
+                        "mandor ships only what it supervises (process.*, incidents, logs, lifecycle)",
                     error.PerWorkerOnly => "'expected_exit' / 'health_interval' / " ++
                         "'health_start_period' are now per-worker only — move them into a " ++
                         "[worker.NAME] section (they describe a specific binary, not the fleet)",
@@ -195,7 +194,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 if (file_cfg.max_restarts) |m| cfg.max_restarts = m;
             }
             if (cfg.on_incident == null) cfg.on_incident = file_cfg.on_incident;
-            if (file_cfg.gpu_interval_ms) |v| cfg.gpu_interval_ms = v;
             if (file_cfg.logs_max_rate) |v| cfg.logs.max_rate = v;
             if (file_cfg.logs_digest) |v| cfg.logs.digest = v;
             if (file_cfg.logs_digest_interval_ms) |v| cfg.logs.digest_interval_ms = v;
@@ -462,8 +460,7 @@ test {
     _ = @import("resolve.zig");
     _ = @import("frame.zig");
     _ = @import("telemetry.zig");
-    _ = @import("hostmetrics.zig");
-    _ = @import("gpu.zig");
+    _ = @import("hostid.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("signals.zig");
         _ = @import("spawner.zig");

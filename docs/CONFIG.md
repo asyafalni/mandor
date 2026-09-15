@@ -51,34 +51,14 @@ never touches one. That child ships three things to photon:
   the same cadence as the `/proc` sampler (5 s) and delivered over a
   **non-blocking** pipe: best-effort, dropped under backpressure so telemetry
   can never stall supervision.
-- **Node / host metrics** → OTLP metrics (`/v1/metrics`). One host-scoped
-  resource (`host.name` / `host.id` / `os.type="linux"`) carrying the node totals
-  so each worker is visible against its host baseline in photon's Infrastructure
-  view. Emitted automatically whenever `photon` is set — there is **no separate
-  toggle** (same minimal-surface rule as the rest of telemetry), sampled every
-  5 s over the non-blocking, drop-under-backpressure pipe. Metrics shipped:
-  `system.cpu.utilization` (`cpu=total` **and one point per core** `cpu=<n>`),
-  `system.cpu.logical.count`, `system.cpu.load_average.1m` / `.5m` / `.15m`,
-  `system.memory.usage` (`state=used|free`), `system.memory.limit`,
-  `system.memory.utilization`, `system.paging.usage` (`state=used|free`, swap;
-  emitted only when the host has swap), `system.network.io` (monotonic sum, **per
-  interface** `device=<if>` × `direction=receive|transmit`), and
-  `system.filesystem.usage` / `system.filesystem.utilization` (**per mount**
-  `mountpoint=<mp>`, real filesystems only). Two **mandor-extension** gauges
-  (no OTel semantic-convention name): `system.uptime` (seconds) and
-  `system.cpu.temperature` (`Cel`; first CPU-temp hwmon chip — `coretemp`,
-  `k10temp`, `zenpower`, `cpu_thermal`, `k8temp` — emitted only when present).
-  Host identity comes from `/proc/sys/kernel/hostname` and
-  `/etc/machine-id` (falling back to `boot_id`, then the literal `unknown`).
-- **GPU metrics** (auto-detected) → OTLP metrics (`/v1/metrics`). The relay
-  daemon probes for a GPU once at startup (no enable toggle — see
-  "GPU metrics" below) and, if one is present, shells out to `nvidia-smi`
-  every `gpu_interval` (default 15 s) and emits per-GPU
-  `system.gpu.utilization`, `system.gpu.memory.usage`,
-  `system.gpu.memory.utilization`, `system.gpu.temperature`, `system.gpu.power`
-  (attrs `gpu=<i>`, `gpu.name=<n>`), same host identity as the node metrics.
-  Fail-closed: no GPU found at the startup probe ⇒ no GPU points, logged once,
-  and no effect on supervision or other telemetry.
+- **Not the host.** mandor ships nothing node-level — no `system.*`, no
+  `system.gpu.*`. Since v1.16 that is [photon-agent](https://github.com/nevindra/photon)'s
+  job: it runs on every host, reports the machine (CPU per core, memory, disks,
+  network, GPU) and every process on it — GPU per process included — and knows
+  which processes run under a mandor. mandor's telemetry describes its
+  **workers**; the shared `host.name` / `host.id` is what lines the two up in
+  photon (host identity comes from `/proc/sys/kernel/hostname` and
+  `/etc/machine-id`, falling back to `boot_id`, then the literal `unknown`).
 - **Process-lifecycle events** → OTLP logs (`/v1/logs`): `started`, `exited`
   (ok / error / OOM), `restarting` (with backoff), `unhealthy`. Best-effort,
   same pipe.
@@ -96,20 +76,13 @@ keeping to the four-CLI-flag / minimal-key rule. `PHOTON_OTLP_TOKEN` (env, kept
 off the process cmdline; the bearer var's name changed in v1.12) sets the
 bearer token when photon requires auth.
 
-### GPU metrics (the `gpu_interval` key)
+### No host or GPU sampling (`gpu_interval` removed in v1.16)
 
-Auto-detected, not a toggle: the relay daemon probes for a GPU once at
-startup (no re-probe — a GPU appearing later needs a restart) and samples it
-only if present, off the supervision path. mandor is a static binary, so it
-collects GPU metrics by shelling out to `nvidia-smi` rather than linking
-NVML. GPU sampling is on automatically when a device is found, and silent
-(logged once) when it isn't — there is no enable/disable toggle. The one
-tunable is the sample cadence, a **global** key (the old `[gpu]` section was
-flattened to it in v1.14; an old `[gpu]` section now gives a migration error):
-
-| Key (global) | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `gpu_interval` | duration | `15s` | GPU sample cadence (the 15 s default suits most cases) |
+mandor no longer samples the node it runs on. The `[gpu]` section (v1.14) and
+the `gpu_interval` key that replaced it (v1.16) both give a **migration error**
+pointing here rather than being silently ignored: delete the key. Host and GPU
+metrics — including the GPU memory and SM/encoder/decoder share of each
+supervised worker, which mandor never had — come from photon-agent.
 
 ### The three-tier log → photon model
 
@@ -192,15 +165,22 @@ Global rate cap (the `[logs]` section):
 | --- | --- | --- | --- |
 | `max_rate` | int | `0` | Rate cap in lines/sec across all streaming workers. `0` = unlimited; above it, excess lines in each 1-second window are dropped (counted, never spooled) before a frame is built |
 
-### Deploying mandor as a node monitor
+### mandor is not a node monitor
 
-The `system.*` / `system.gpu.*` metrics describe the **node**, read from `/proc`,
-`/sys`, `statfs`, and `nvidia-smi`. mandor reports whatever those show: inside a
-normal container that is the container's cgroup-scoped view. To report the
-**host** (superseding a standalone node agent), run one mandor with the host
-mounted in — `/proc`, `/sys`, `/etc/machine-id`, and, for GPU, `/dev/nvidia*`
-plus `nvidia-smi` in the image — the node-exporter model. This is additive: the
-same binary still supervises its workers.
+mandor describes its **workers**, not the machine. There is no "mount `/proc`
+and `/sys` in" node-monitor deployment any more: install photon-agent on the
+host for that (it also sees the mandor-supervised processes, with their GPU
+share, from the outside). What mandor adds to photon is what only the
+supervisor knows — restarts, exit causes, incidents, the curated log digest,
+lifecycle events — keyed by the same `host.name` / `host.id`.
+
+### What a worker sees: `MANDOR_WORKER`
+
+Every worker's environment carries `MANDOR_WORKER=<name>` — the name mandor
+derived or was given (`[worker.NAME] name`), the same `service.name` its
+metrics, incidents and logs travel under. It is for observers that outlive an
+`exec` (photon-agent's host-side process table names the pid by it) and for a
+worker that wants to know what it is called; mandor reads nothing back from it.
 
 ## Per-worker keys — `[worker.NAME]` sections
 
