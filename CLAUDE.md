@@ -21,7 +21,9 @@
   binary opens no socket, spawns no child, and phones nowhere — the
   offline-by-default guarantee is unchanged. When `photon` IS set (either source),
   mandor ships incidents, per-process/supervisor metrics, and process-lifecycle
-  events to photon as OTLP. All network I/O lives in a single long-lived
+  events to photon as OTLP — **and nothing about the host**: node and GPU
+  metrics are photon-agent's (always installed on the host; it also sees the
+  mandor-supervised processes, GPU share included). All network I/O lives in a single long-lived
   `mandor relay --daemon` child (it owns the socket, watches the spool, drains a
   non-blocking pipe); **the supervision path itself never touches a socket.**
   The other network toggle is the local metrics endpoint (`--metrics`). No
@@ -50,8 +52,8 @@ mandor (PID 1, this repo)
     ├── telemetry  supervisor-side emit: non-blocking pipe (frame.zig wire format)
     ├── relay      the `mandor relay --daemon` child: owns the socket, OTLP
     │              encoders, watches the spool, drains the pipe, retries incidents
-    ├── hostmetrics node /proc + statfs sampling (daemon-side, node-monitor mode)
-    └── gpu         NVIDIA (nvidia-smi shell-out) + AMD/Intel (DRM sysfs), auto-detected
+    └── hostid     host.name / host.id for the OTLP resource (the node itself is
+                   photon-agent's — mandor samples no host or GPU metrics, v1.16)
 ```
 
 ### Incident bundle schema (stable contract — sidecar + AI depend on it)
@@ -96,8 +98,8 @@ forever). New work follows the same discipline — compile early, size-gate, shi
    always work — zero-config is a feature).
 5. **Telemetry milestones (post-1.0, all SHIPPED).** ✅ OPT-IN
    OTLP telemetry via the `mandor relay --daemon` child (incidents, per-process
-   + supervisor metrics, node/host metrics, auto-detected GPU metrics, lifecycle
-   events); ✅ log-signal v2 (v1.11.0) — a curated warn/error **digest**
+   + supervisor metrics, lifecycle events; the node/host + GPU metrics added in
+   v1.9 were **removed again in v1.16** — photon-agent owns the host); ✅ log-signal v2 (v1.11.0) — a curated warn/error **digest**
    (default-on when `photon=`, dedup-by-signature, flood-proof, `[logs] digest`),
    **per-worker** full streaming (`[worker.NAME] stream`, replacing the old global
    toggle) with automatic backpressure shedding, and `service_prefix` for
@@ -184,15 +186,15 @@ mandor/
 │   ├── capture.zig  ring.zig  sampler.zig  detector.zig  cgroup.zig
 │   ├── summarize.zig  incident.zig  spool.zig  history.zig
 │   ├── report.zig  cost.zig  metrics.zig  elf.zig  caps.zig  secret.zig
-│   ├── telemetry.zig  relay.zig  frame.zig  hostmetrics.zig  gpu.zig  resolve.zig
+│   ├── telemetry.zig  relay.zig  frame.zig  hostid.zig  resolve.zig
 │   ├── log.zig  jsonbuf.zig  fuzz.zig
 │   └── parsers/ (go.zig  rust.zig  python.zig  node.zig  java.zig  zigp.zig)
 └── test/ (fixtures/  harness/  container/  photon/)
 ```
 
 The telemetry cluster (`telemetry.zig` emit path, `relay.zig` OTLP encoders +
-the `relay --daemon`, `frame.zig` pipe wire format, `hostmetrics.zig` node
-sampling, `gpu.zig`, `resolve.zig` DNS) is inert unless `photon=` is set.
+the `relay --daemon`, `frame.zig` pipe wire format, `hostid.zig` host identity,
+`resolve.zig` DNS) is inert unless `photon=` is set.
 
 ## Product boundaries (do not blur)
 
@@ -210,9 +212,14 @@ sampling, `gpu.zig`, `resolve.zig` DNS) is inert unless `photon=` is set.
 - **Curate by default.** mandor ships log *content* two curated ways — inside
   incident bundles, and as the default-on warn/error **digest** (deduped by
   signature, low-rate, flood-proof). Full per-line streaming is strictly opt-in
-  and **per worker** (`[worker.NAME] stream`). GPU sampling is **auto-detected**
-  (the daemon probes once at startup — on when a device is present, off with a
-  one-time log otherwise; no toggle). Traces are never shipped.
+  and **per worker** (`[worker.NAME] stream`). Traces are never shipped.
+- **Processes, not the host (v1.16).** mandor describes what it supervises —
+  `process.*` per worker, restarts, incidents, lifecycle, the digest — and
+  never the node: no `system.*`, no `system.gpu.*`, no `/proc`-of-the-host
+  mounts. photon-agent is always installed on the host and reports the machine
+  and every process on it (GPU per process included, tagged with the mandor it
+  runs under). `gpu_interval` / `[gpu]` are migration errors. Do not bring
+  host sampling back into this binary.
 - **TOML is a behavior overlay, the CLI is the source of truth.** The active
   worker set is whatever the CLI `--` args spawn (else the TOML `workers=`); every
   `[worker.NAME]` section and `[secret.*]` grant is matched to that set *by name*.

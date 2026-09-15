@@ -52,7 +52,6 @@ pub fn nowNs() u64 {
 pub fn spawnDaemon(
     endpoint: []const u8,
     state_dir: []const u8,
-    gpu_interval_ms: u64,
     service_prefix: []const u8,
     envp: [*:null]const ?[*:0]const u8,
     path_env: []const u8,
@@ -67,7 +66,6 @@ pub fn spawnDaemon(
     var fd_buf: [16]u8 = undefined;
     var ep_buf: [96]u8 = undefined;
     var sd_buf: [512]u8 = undefined;
-    var gi_buf: [24]u8 = undefined;
     var sp_buf: [96]u8 = undefined;
     const fd_str = std.fmt.bufPrintZ(&fd_buf, "{d}", .{read_fd}) catch {
         _ = linux.close(read_fd);
@@ -84,11 +82,6 @@ pub fn spawnDaemon(
         _ = linux.close(write_end);
         return;
     };
-    const gi_str = std.fmt.bufPrintZ(&gi_buf, "{d}", .{gpu_interval_ms}) catch {
-        _ = linux.close(read_fd);
-        _ = linux.close(write_end);
-        return;
-    };
     // Service prefix as one trailing argv string (the origin tag, "" = none).
     // Capped upstream (cli.max_service_prefix) so it always fits sp_buf.
     const sp_str = std.fmt.bufPrintZ(&sp_buf, "{s}", .{service_prefix}) catch {
@@ -97,10 +90,10 @@ pub fn spawnDaemon(
         return;
     };
 
-    // `mandor relay --daemon <endpoint> <state_dir> <read_fd> <interval> <service_prefix>` —
-    // main.zig routes it. GPU on/off is auto-detected by the daemon itself, so
-    // no gpu-enabled toggle is passed. Log streaming is decided supervisor-side
-    // per worker, so no streaming toggle is passed either. The string buffers
+    // `mandor relay --daemon <endpoint> <state_dir> <read_fd> <service_prefix>` —
+    // main.zig routes it. Nothing about the host is passed: the daemon samples no
+    // node metrics (that is photon-agent's job). Log streaming is decided
+    // supervisor-side per worker, so no streaming toggle is passed either. The string buffers
     // live on this stack frame; spawnDetached forks and the child execs from
     // its copy before this function returns, so they are valid for the exec.
     const argv = [_:null]?[*:0]const u8{
@@ -110,7 +103,6 @@ pub fn spawnDaemon(
         @ptrCast(ep_str.ptr),
         @ptrCast(sd_str.ptr),
         @ptrCast(fd_str.ptr),
-        @ptrCast(gi_str.ptr),
         @ptrCast(sp_str.ptr),
     };
     const pid = spawner.spawnDetached(&argv, envp, path_env, read_fd);

@@ -3,6 +3,34 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.16.0] - 2026-09-15
+
+### Removed
+- **mandor no longer samples the host.** The node metrics the relay daemon
+  shipped since v1.9 (`system.cpu.*`, `system.memory.*`, `system.paging.usage`,
+  `system.network.io`, `system.filesystem.*`, `system.disk.io`, `system.uptime`,
+  `system.cpu.temperature`) and the auto-detected GPU metrics (`system.gpu.*`,
+  via `nvidia-smi` / DRM sysfs) are gone, together with `hostmetrics.zig`,
+  `gpu.zig`, the daemon's node/GPU timers and the interval it took on argv. The
+  "mount `/proc` and `/sys` in and mandor supersedes a node agent" deployment
+  (v1.9, roadmap #51) is withdrawn: **mandor describes the processes under its
+  supervision; photon-agent describes the host.** photon-agent is always
+  installed on the node and now ships a live per-process table of the whole
+  machine — NVML per-process GPU memory and SM/encoder/decoder share included,
+  something mandor (static, no NVML) could never do — and tags each process
+  with the mandor it runs under and the worker name mandor would give it, so
+  the two views meet in photon on the `host.name` / `host.id` every mandor
+  emission still carries (`hostid.zig`, all that remains of the module).
+- **`gpu_interval` is a migration error** (as `[gpu]` already was): a config
+  that still tunes host sampling stops startup with a message pointing at
+  photon-agent, rather than silently keeping a knob that does nothing.
+  Config surface 47 → 46 keys; the CI budget follows.
+
+### Changed
+- The relay daemon's idle wake-up is now an explicit 5 s `idle_tick_ms` (the
+  spool safety-net scan) instead of riding the node sampler's cadence; the
+  poll-driven loop is otherwise unchanged. Stripped release binary ≈335 KB.
+
 ## [1.15.5] - 2026-08-21
 
 ### Changed

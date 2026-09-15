@@ -24,9 +24,6 @@ pub const FileConfig = struct {
     max_restarts: ?i32 = null,
     on_incident: ?[]const u8 = null,
     photon: ?[]const u8 = null,
-    /// `gpu_interval` global key: null = absent (caller keeps the cli.Config
-    /// default). GPU sampling is auto-detected by the daemon (no enable toggle).
-    gpu_interval_ms: ?u64 = null,
     /// `[logs]` section: null = key absent (caller keeps the cli.Config default).
     logs_max_rate: ?u32 = null,
     /// `[logs]` Tier-2 digest knobs: null = key absent (caller keeps the
@@ -138,7 +135,7 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
     };
 }
 
-pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuSectionRemoved, PerWorkerOnly };
+pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuSectionRemoved, HostMetricsRemoved, PerWorkerOnly };
 
 /// Parse TOML-subset text. String values are slices into `text`; worker
 /// commands land in `cmd_storage`.
@@ -293,15 +290,10 @@ pub fn parse(
         } else if (std.mem.eql(u8, key, "psi_cpu_pct")) {
             cfg.psi_cpu_pct = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
         } else if (std.mem.eql(u8, key, "gpu_interval")) {
-            // GPU sampling cadence (daemon-side; GPU itself is auto-detected).
-            const s = parseString(value) orelse return error.BadValue;
-            const ms = cli.parseDuration(s) orelse return error.BadValue;
-            // 0 would make the daemon's next_gpu_sample deadline never advance
-            // past now — a poll timeout of 0 every iteration, busy-spinning the
-            // relay child and fork-storming nvidia-smi (cf. health_interval /
-            // digest_interval). Reject it.
-            if (ms == 0) return error.BadValue;
-            cfg.gpu_interval_ms = ms;
+            // v1.16: mandor stopped sampling the host (node + GPU metrics are
+            // photon-agent's). A config that still tunes it should say so loudly
+            // rather than silently keep a knob that does nothing.
+            return error.HostMetricsRemoved;
         } else if (std.mem.eql(u8, key, "env_file")) {
             cfg.env_file = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "restart_dependents")) {
@@ -371,10 +363,10 @@ fn workerKey(key: []const u8) ?ArrayTarget {
 const Section = union(enum) { worker: []const u8, secret: []const u8, logs, require: []const u8, prober: []const u8 };
 
 /// `[worker.NAME]` / `[secret.NAME]` / `[logs]` / `[require.NAME]` /
-/// `[prober.NAME]` -> the section kind (+ NAME where applicable). `[gpu]` was
-/// flattened to the global `gpu_interval` key in v1.14 and now gives a
-/// migration error. Any other header is a hard error: configs are small, so a
-/// typo should stop startup rather than be ignored.
+/// `[prober.NAME]` -> the section kind (+ NAME where applicable). `[gpu]` (v1.14)
+/// and its successor `gpu_interval` (v1.16) are gone with host sampling and
+/// give a migration error. Any other header is a hard error: configs are small,
+/// so a typo should stop startup rather than be ignored.
 fn sectionHeader(line: []const u8) ParseError!Section {
     if (line[line.len - 1] != ']') return error.Syntax;
     const inner = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
@@ -1136,29 +1128,17 @@ test "secret section: every rejection is a hard error" {
     ));
 }
 
-test "gpu_interval: global key parses" {
+test "gpu_interval gives a migration error: mandor no longer samples the host" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    const cfg = try parseTest("gpu_interval = \"10s\"", &storage);
-    try t.expectEqual(@as(?u64, 10_000), cfg.gpu_interval_ms);
-}
-
-test "gpu_interval: absent stays null; bad value rejected" {
-    var storage: [cli.max_workers][]const u8 = undefined;
-    // Absent -> field stays null (caller keeps the cli.Config default of 15s).
-    const none = try parseTest("workers = [\"./a\"]", &storage);
-    try t.expectEqual(@as(?u64, null), none.gpu_interval_ms);
-    const set = try parseTest("gpu_interval = \"5s\"", &storage);
-    try t.expectEqual(@as(?u64, 5_000), set.gpu_interval_ms);
-    try t.expectError(error.BadValue, parseTest("gpu_interval = \"soon\"", &storage));
-    // 0 would busy-spin the relay daemon's poll loop + fork-storm nvidia-smi.
-    try t.expectError(error.BadValue, parseTest("gpu_interval = \"0s\"", &storage));
+    try t.expectError(error.HostMetricsRemoved, parseTest("gpu_interval = \"10s\"", &storage));
+    try t.expectError(error.HostMetricsRemoved, parseTest("gpu_interval = \"0s\"", &storage));
 }
 
 test "the old [gpu] section gives a migration error" {
     var storage: [cli.max_workers][]const u8 = undefined;
-    // `[gpu] interval` / `[gpu] enabled` were flattened to the global
-    // `gpu_interval` key in v1.14 — the section itself must give a dedicated
-    // migration error, not a bare Syntax error.
+    // `[gpu] interval` / `[gpu] enabled` were flattened to `gpu_interval` in
+    // v1.14 and host sampling left mandor altogether in v1.16 — the section
+    // must still give a dedicated migration error, not a bare Syntax error.
     try t.expectError(error.GpuSectionRemoved, parseTest("[gpu]\ninterval = \"20s\"", &storage));
     try t.expectError(error.GpuSectionRemoved, parseTest("[gpu]\nenabled = true", &storage));
 }

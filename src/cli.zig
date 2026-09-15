@@ -181,9 +181,6 @@ pub const Config = struct {
     /// resolved to indices, defaults/overrides applied, validated.
     secrets: [max_secrets]SecretDef = undefined,
     secrets_n: usize = 0,
-    /// GPU sampling cadence (`gpu_interval` TOML key; daemon-side). GPU is
-    /// auto-detected — this only tunes the interval. Default 15s.
-    gpu_interval_ms: u64 = 15_000,
     /// `[logs]` global streaming rate cap + Tier-2 digest knobs (TOML-only).
     /// Per-worker streaming opt-in lives in `stream`/`stream_n` above; this holds
     /// `max_rate` and the `digest`/`digest_interval_ms`/`digest_threshold` knobs.
