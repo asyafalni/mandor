@@ -137,9 +137,9 @@ body and costs ~6 KB of `.text` for identical behaviour.
 
 `src/fuzz.zig` mutation-fuzzes everything that consumes input mandor does not
 control: worker stderr (the six trace parsers), the worker's ELF header,
-`mandor.toml`, argv, `/proc` and cgroup text, `nvidia-smi` CSV output, mandor's
+`mandor.toml`, argv, `/proc` and cgroup text, mandor's
 own state files, the incident-bundle serializer, the OTLP encoders (metrics /
-host / GPU / streamed-log + warn-error-digest records, and the pipe-frame decoder
+streamed-log + warn-error-digest records, and the pipe-frame decoder
 — output must stay a decodable protobuf), the
 capture ring buffer, and the cost accumulators. It runs as part of
 `zig build test`, with a different seed each invocation.
