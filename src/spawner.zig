@@ -611,13 +611,11 @@ pub fn spawn(
     // value + records the child read fd and its `env=<fd>` C-string). Static
     // per-spawn scratch, no alloc; fail-closed per secret (see prepSecrets).
     const nsec = prepSecrets(w);
-    // Merge parent env + per-worker extras + secret fd envs BEFORE fork (no
-    // alloc, static scratch — spawns are serialized in the single-threaded
-    // supervisor). Secret envs must be included even with no other extras.
-    const child_envp: [*:null]const ?[*:0]const u8 = if (w.extra_env_n > 0 or g_env_n > 0 or nsec > 0)
-        mergeEnv(envp, w, nsec)
-    else
-        envp;
+    // Merge parent env + per-worker extras + secret fd envs + the worker's
+    // own name BEFORE fork (no alloc, static scratch — spawns are serialized
+    // in the single-threaded supervisor). Always merged: every worker carries
+    // `MANDOR_WORKER=<name>` (see fmtWorkerEnv).
+    const child_envp: [*:null]const ?[*:0]const u8 = mergeEnv(envp, w, nsec);
     const supervisor_pid = linux.getpid(); // must be pre-fork for the guard
     const rc = linux.fork();
     if (posix.errno(rc) != .SUCCESS) {
@@ -758,12 +756,29 @@ fn resolveExe(w: *Worker, path_env: []const u8) void {
 }
 
 // Parent env (cap 480) + g_env (32) + extra_env (16) + secret fd envs
-// (cli.max_secrets) + null terminator.
-var merged_env: [513 + 17 + cli.max_secrets]?[*:0]const u8 = undefined;
+// (cli.max_secrets) + MANDOR_WORKER + null terminator.
+var merged_env: [513 + 17 + 1 + cli.max_secrets]?[*:0]const u8 = undefined;
+
+/// `MANDOR_WORKER=<name>\0` — the one thing mandor tells a worker about itself.
+/// The environment survives `exec` (an entrypoint script that `exec`s the real
+/// program keeps it) where the pid's comm and cmdline do not, so a host-side
+/// observer (photon-agent's process table) can name the process exactly as
+/// mandor does — the `service.name` on its metrics, incidents and logs — even
+/// through `#!/usr/bin/env` shebangs and exec wrappers. Static scratch like
+/// the secret envs: spawns are serialized, and the child copies it at exec.
+var worker_env_buf: [16 + name_cap + 1]u8 = undefined;
+
+fn fmtWorkerEnv(name: []const u8, out: []u8) ?[:0]const u8 {
+    return std.fmt.bufPrintZ(out, "MANDOR_WORKER={s}", .{name}) catch null;
+}
 
 fn mergeEnv(envp: [*:null]const ?[*:0]const u8, w: *const Worker, nsec: usize) [*:null]const ?[*:0]const u8 {
     var n: usize = 0;
     while (envp[n] != null and n < 480) : (n += 1) merged_env[n] = envp[n];
+    if (fmtWorkerEnv(w.nameSlice(), &worker_env_buf)) |e| {
+        merged_env[n] = e.ptr;
+        n += 1;
+    }
     for (g_env[0..g_env_n]) |e| {
         merged_env[n] = e;
         n += 1;
@@ -1045,6 +1060,16 @@ test "onPath resolves an executable on PATH without forking" {
     // A name with '/' is checked as a path directly.
     try std.testing.expect(onPath("/bin/sh", ""));
     try std.testing.expect(!onPath("/bin/definitely-not-here-x", ""));
+}
+
+test "fmtWorkerEnv names the worker for whoever inherits its environment" {
+    var buf: [16 + name_cap + 1]u8 = undefined;
+    const s = fmtWorkerEnv("api-2", &buf).?;
+    try std.testing.expectEqualStrings("MANDOR_WORKER=api-2", s);
+    try std.testing.expectEqual(@as(u8, 0), buf[s.len]);
+    // The longest name mandor can produce still fits.
+    const long = "a" ** name_cap;
+    try std.testing.expect(fmtWorkerEnv(long, &buf) != null);
 }
 
 test "fmtFdEnv formats env=fd, null-terminated" {

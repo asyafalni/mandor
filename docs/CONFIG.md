@@ -174,6 +174,14 @@ share, from the outside). What mandor adds to photon is what only the
 supervisor knows — restarts, exit causes, incidents, the curated log digest,
 lifecycle events — keyed by the same `host.name` / `host.id`.
 
+### What a worker sees: `MANDOR_WORKER`
+
+Every worker's environment carries `MANDOR_WORKER=<name>` — the name mandor
+derived or was given (`[worker.NAME] name`), the same `service.name` its
+metrics, incidents and logs travel under. It is for observers that outlive an
+`exec` (photon-agent's host-side process table names the pid by it) and for a
+worker that wants to know what it is called; mandor reads nothing back from it.
+
 ## Per-worker keys — `[worker.NAME]` sections
 
 Anything specific to one worker lives in a `[worker.NAME]` section, where

@@ -218,8 +218,9 @@ the `relay --daemon`, `frame.zig` pipe wire format, `hostid.zig` host identity,
   never the node: no `system.*`, no `system.gpu.*`, no `/proc`-of-the-host
   mounts. photon-agent is always installed on the host and reports the machine
   and every process on it (GPU per process included, tagged with the mandor it
-  runs under). `gpu_interval` / `[gpu]` are migration errors. Do not bring
-  host sampling back into this binary.
+  runs under — named by the `MANDOR_WORKER=<name>` mandor stamps into every
+  worker's environment at spawn, which survives `exec`). `gpu_interval` /
+  `[gpu]` are migration errors. Do not bring host sampling back into this binary.
 - **TOML is a behavior overlay, the CLI is the source of truth.** The active
   worker set is whatever the CLI `--` args spawn (else the TOML `workers=`); every
   `[worker.NAME]` section and `[secret.*]` grant is matched to that set *by name*.
