@@ -26,6 +26,15 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
   photon-agent, rather than silently keeping a knob that does nothing.
   Config surface 47 → 46 keys; the CI budget follows.
 
+### Added
+- **`MANDOR_WORKER=<name>` in every worker's environment.** The name mandor
+  gives a worker (its `service.name` on every OTLP emission), stamped at spawn
+  so it survives `exec` — an entrypoint script that `exec`s the real program,
+  or a `#!/usr/bin/env python3` shebang, leaves comm and cmdline saying `ffmpeg`
+  or `python3` where mandor says `transcoder`. photon-agent reads it off
+  `/proc/<pid>/environ` and names the row exactly as mandor does; anything else
+  that inherits the environment can use it too. mandor reads nothing back.
+
 ### Changed
 - The relay daemon's idle wake-up is now an explicit 5 s `idle_tick_ms` (the
   spool safety-net scan) instead of riding the node sampler's cadence; the

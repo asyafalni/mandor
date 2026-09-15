@@ -83,7 +83,12 @@ photon's Infrastructure / Hosts view groups them under one node:
   CPU/memory/disk/network/GPU plus a live per-process table — every process,
   with NVML per-process GPU memory and SM/encoder/decoder utilization, and for
   the ones under a mandor the supervising pid and the worker name mandor gives
-  them (`basename(argv[0])`, `-N` on a repeat) — so the two views line up.
+  them — so the two views line up. **mandor stamps `MANDOR_WORKER=<name>` into
+  every worker's environment** (v1.16): the environment survives `exec`, so an
+  entrypoint that `exec`s the real program, or a `#!/usr/bin/env` shebang, still
+  names the pid exactly as mandor's `service.name` does; photon-agent reads it
+  from `/proc/<pid>/environ` and falls back to deriving `basename(argv[0])` when
+  it cannot.
   What only the supervisor knows stays here: restarts, exit causes, incidents,
   the digest, lifecycle.
 
