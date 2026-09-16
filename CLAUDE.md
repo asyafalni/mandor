@@ -106,7 +106,7 @@ forever). New work follows the same discipline — compile early, size-gate, shi
    multi-tenant photon; ✅ app-shared secret store (`[secret.NAME]`).
    Offline-by-default is unchanged — none of this activates without `photon=`.
    Since then: ✅ v1.12.0 — the four deploy-varying keys read from ENV
-   (`PHOTON_OTLP_HTTP_ENDPOINT`, `PHOTON_OTLP_TOKEN`, `MANDOR_SERVICE_PREFIX`,
+   (`PHOTON_OTLP_HTTP_ENDPOINT`, `PHOTON_INGEST_TOKEN` — alias `PHOTON_OTLP_TOKEN`, `MANDOR_SERVICE_PREFIX`,
    `MANDOR_STATE_DIR`; ENV overrides TOML) and GPU became auto-detected; ✅
    v1.13.0 — the TOML is a name-keyed behavior overlay over the CLI-chosen worker
    set (orphan sections tolerated, secrets degrade to the present subset).

@@ -5,7 +5,7 @@ Precedence: **CLI > ENV > TOML > default**. The CLI carries only
 setting is a TOML key, so the command line stays readable. CLI-only always works; `mandor.toml`
 is loaded from `--config=PATH` (must exist) or `./mandor.toml` (best-effort).
 Only four deploy-varying keys are env-settable — `photon` (`PHOTON_OTLP_HTTP_ENDPOINT`),
-the relay bearer token (`PHOTON_OTLP_TOKEN`), `service_prefix`
+the relay bearer token (`PHOTON_INGEST_TOKEN`, photon's own name; `PHOTON_OTLP_TOKEN` is the older alias), `service_prefix`
 (`MANDOR_SERVICE_PREFIX`), and `state_dir` (`MANDOR_STATE_DIR`) — each marked
 below; ENV overrides a TOML value for those four, and CLI (where a flag
 exists) overrides ENV. Everything else is TOML/CLI only.
@@ -24,7 +24,7 @@ names stay safe in the Prometheus exposition format.
 | `stop_grace = "10s"` | — | `10s` | TERM→KILL escalation window on shutdown |
 | `state_dir = "/path"` | `--state-dir=` / `MANDOR_STATE_DIR` | `/var/lib/mandor` | State file + incident spool + history |
 | `metrics_port = 9464` | `--metrics=` | off | Prometheus text endpoint on 127.0.0.1 |
-| `photon = "127.0.0.1:4318"` | — / `PHOTON_OTLP_HTTP_ENDPOINT` | off | Ship incidents + metrics + lifecycle events to photon as OTLP; fully offline without it. `PHOTON_OTLP_HTTP_ENDPOINT` overrides the TOML value — a full URL or a bare `host:port`, mandor strips the scheme either way. Auth via `PHOTON_OTLP_TOKEN` env. See "photon telemetry" below |
+| `photon = "127.0.0.1:4318"` | — / `PHOTON_OTLP_HTTP_ENDPOINT` | off | Ship incidents + metrics + lifecycle events to photon as OTLP; fully offline without it. `PHOTON_OTLP_HTTP_ENDPOINT` overrides the TOML value — a full URL or a bare `host:port`, mandor strips the scheme either way. Auth via `PHOTON_INGEST_TOKEN` env (photon's name for it; `PHOTON_OTLP_TOKEN` still read). See "photon telemetry" below |
 | `service_prefix = "tenant-a-"` | — / `MANDOR_SERVICE_PREFIX` | `""` | Origin/tenant tag prepended to `service.name` on **every** OTLP emission (metrics, incidents, lifecycle, streamed logs, the digest), so several mandor origins can share one multi-tenant photon without `service.name` colliding. Telemetry-only — the bare worker name is unchanged in the log `[name]` prefix, `report`, and Prometheus labels; `host.id` still distinguishes hosts. Default `""` = unchanged; inert without `photon=` |
 | `on_incident = "CMD"` | — | off | Exec CMD after each bundle write, bundle path appended |
 | `ready_fd = 5` | — | off | s6-style readiness: workers write a newline to this fd |
@@ -72,7 +72,7 @@ never shipped either way. The other telemetry behaviours (metrics on when
 `photon` is set, the 5 s sample cadence, the daemon's internal buffer size) are
 fixed and intentionally not exposed as separate keys — `photon`, the per-worker
 `stream` toggle, plus the small `[logs]` rate cap are the whole telemetry surface,
-keeping to the four-CLI-flag / minimal-key rule. `PHOTON_OTLP_TOKEN` (env, kept
+keeping to the four-CLI-flag / minimal-key rule. `PHOTON_INGEST_TOKEN` (env, kept
 off the process cmdline; the bearer var's name changed in v1.12) sets the
 bearer token when photon requires auth.
 
@@ -441,7 +441,7 @@ give-up/essential/oneshot worker's code when those trigger, honoring
 
 `MANDOR_RELEASE` / `GIT_SHA` (release id in bundles); the four deploy-varying
 config keys — `MANDOR_STATE_DIR`, `PHOTON_OTLP_HTTP_ENDPOINT`,
-`PHOTON_OTLP_TOKEN` (relay bearer auth, renamed in v1.12),
+`PHOTON_INGEST_TOKEN` (relay bearer auth — the same name photon, photon-agent and photon-loadgen use, so one token variable serves the whole stack; `PHOTON_OTLP_TOKEN` (v1.12–v1.16.0) is read as an alias),
 `MANDOR_SERVICE_PREFIX` — override their TOML equivalents (see "Precedence"
 above). `/dev/termination-log`, when present (Kubernetes), receives the
 latest incident verdict automatically.

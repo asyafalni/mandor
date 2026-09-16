@@ -215,7 +215,7 @@ not a CLI flag — the everyday CLI stays at four flags (`--config` loads the
 TOML). As of v1.12, mandor also reads `PHOTON_OTLP_HTTP_ENDPOINT` from the
 environment — a full URL or a bare `host:port`, scheme-stripped either way —
 which **overrides** a TOML `photon=` value (CLI > ENV > TOML > default; see
-[CONFIG.md](CONFIG.md)). Auth: set `PHOTON_OTLP_TOKEN` (the bearer env var
+[CONFIG.md](CONFIG.md)). Auth: set `PHOTON_INGEST_TOKEN` (photon's own name for its ingest token — `PHOTON_OTLP_TOKEN` is read as an alias; the bearer env var
 was renamed in v1.12) in the environment and the relay sends
 `Authorization: Bearer …`. The generic `on_incident` hook remains for custom
 tooling and the premium sidecar (a separate, per-incident detached process).
