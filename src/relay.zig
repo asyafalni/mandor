@@ -64,7 +64,7 @@ pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const
         return 1;
     };
     // photon requires a bearer token; inherited env keeps it off /proc cmdline.
-    const token = spawner.findEnv(environ, "PHOTON_OTLP_TOKEN") orelse "";
+    const token = photonToken(environ);
     return post(host, port, "/v1/logs", body, token);
 }
 
@@ -1421,6 +1421,17 @@ fn drainPipe(pipe_fd: i32, host: u32, port: u16, token: []const u8) bool {
     return eof;
 }
 
+/// photon's ingest bearer token from the environment: `PHOTON_INGEST_TOKEN`
+/// (the name photon itself, photon-agent and photon-loadgen use — one name
+/// across the stack) or the older `PHOTON_OTLP_TOKEN` (v1.12–v1.16.0), first
+/// non-empty wins. Empty = no bearer header.
+pub fn photonToken(environ: [:null]const ?[*:0]const u8) []const u8 {
+    if (spawner.findEnv(environ, "PHOTON_INGEST_TOKEN")) |t| {
+        if (t.len != 0) return t;
+    }
+    return spawner.findEnv(environ, "PHOTON_OTLP_TOKEN") orelse "";
+}
+
 /// CLOCK_MONOTONIC in milliseconds — the daemon's scheduling clock for the idle
 /// tick. Saturating so a bad clock read can never trap. Monotonic (not
 /// REALTIME) so a wall-clock step cannot skew the cadence.
@@ -1467,7 +1478,7 @@ pub fn runDaemon(
         err("bad photon endpoint (want ip:port)");
         return 2;
     };
-    const token = spawner.findEnv(environ, "PHOTON_OTLP_TOKEN") orelse "";
+    const token = photonToken(environ);
 
     // Block SIGPIPE so a photon that resets the connection mid-write makes the
     // socket write return EPIPE (handled as an ordinary send failure) instead of
@@ -1553,6 +1564,17 @@ pub fn runDaemon(
 }
 
 const testing = std.testing;
+
+test "photonToken: PHOTON_INGEST_TOKEN first, PHOTON_OTLP_TOKEN as the alias, empty when neither" {
+    const both: [:null]const ?[*:0]const u8 = &.{ "PHOTON_OTLP_TOKEN=old", "PHOTON_INGEST_TOKEN=new" };
+    try testing.expectEqualStrings("new", photonToken(both));
+    const old_only: [:null]const ?[*:0]const u8 = &.{"PHOTON_OTLP_TOKEN=old"};
+    try testing.expectEqualStrings("old", photonToken(old_only));
+    const blank_new: [:null]const ?[*:0]const u8 = &.{ "PHOTON_INGEST_TOKEN=", "PHOTON_OTLP_TOKEN=old" };
+    try testing.expectEqualStrings("old", photonToken(blank_new));
+    const none: [:null]const ?[*:0]const u8 = &.{"PATH=/bin"};
+    try testing.expectEqualStrings("", photonToken(none));
+}
 
 test "statusOk accepts real 2xx and nothing else" {
     try testing.expect(statusOk("HTTP/1.1 200 OK\r\n"));

@@ -194,7 +194,7 @@ life without opening a single incident file. Always on, no configuration:
 CLI-only always works — `mandor.toml` just saves typing. CLI flags override
 file values. Four deploy-varying keys also read from the environment, which
 overrides the file (`MANDOR_STATE_DIR` for `state_dir`, and as of v1.12
-`PHOTON_OTLP_HTTP_ENDPOINT` for `photon`, `PHOTON_OTLP_TOKEN` for the relay
+`PHOTON_OTLP_HTTP_ENDPOINT` for `photon`, `PHOTON_INGEST_TOKEN` for the relay
 bearer token, `MANDOR_SERVICE_PREFIX` for `service_prefix`) — see
 [Config keys](#config-keys). Everything else is TOML/CLI only.
 
@@ -327,7 +327,7 @@ its whole story to [photon](https://github.com/nevindra/photon) (mandor's
 OTEL-native sister project) as OTLP, **no collector required**. All network I/O
 lives in a single long-lived `mandor relay --daemon` child; the supervision path
 never touches a socket, and telemetry is dropped under backpressure before it can
-ever stall supervision. Auth via the `PHOTON_OTLP_TOKEN` env var. The endpoint
+ever stall supervision. Auth via the `PHOTON_INGEST_TOKEN` env var (photon's own name; `PHOTON_OTLP_TOKEN` still works). The endpoint
 and token, along with `service_prefix` and `state_dir`, are also settable from
 the environment — see [Config keys](#config-keys) below. With `photon` unset,
 none of this activates.
@@ -429,7 +429,7 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `state_dir` | global | `--state-dir=` | `MANDOR_STATE_DIR` |
 | `metrics_port` | global | `--metrics=` | |
 | `photon` | global | — | `PHOTON_OTLP_HTTP_ENDPOINT` |
-| (relay bearer token) | — | — | `PHOTON_OTLP_TOKEN` |
+| (relay bearer token) | — | — | `PHOTON_INGEST_TOKEN` (alias `PHOTON_OTLP_TOKEN`) |
 | `service_prefix` | global | — | `MANDOR_SERVICE_PREFIX` |
 | `on_incident` | global | — | |
 | `ready_fd` | global | — | |

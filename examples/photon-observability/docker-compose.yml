@@ -11,7 +11,7 @@ services:
     volumes:
       - mandor-state:/var/lib/mandor
     environment:
-      - PHOTON_OTLP_TOKEN=${PHOTON_OTLP_TOKEN}   # relay sends Authorization: Bearer …
+      - PHOTON_INGEST_TOKEN=${PHOTON_INGEST_TOKEN}   # relay sends Authorization: Bearer …
       - MANDOR_RELEASE=app@1.4.2       # groups incidents by deploy
 
   photon:

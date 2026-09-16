@@ -65,11 +65,13 @@ pub fn iso8601Ms(buf: *[24]u8, epoch_ms: u64) []const u8 {
 }
 
 /// Env value redaction: any variable whose NAME smells like a credential.
+/// `pass` covers `password` and `passwd` and the abbreviated `DB_PASS` / `MB_DB_PASS` that
+/// container images set as plain ENV; a false positive (`BYPASS_CACHE`) costs one redacted
+/// value in a bundle, a false negative ships a credential.
 pub fn envRedacted(name: []const u8) bool {
     return summarize.containsIgnoreCase(name, "secret") or
         summarize.containsIgnoreCase(name, "token") or
-        summarize.containsIgnoreCase(name, "password") or
-        summarize.containsIgnoreCase(name, "passwd") or
+        summarize.containsIgnoreCase(name, "pass") or
         summarize.containsIgnoreCase(name, "key") or
         summarize.containsIgnoreCase(name, "credential");
 }
@@ -540,6 +542,8 @@ test "envRedacted heuristics" {
     try std.testing.expect(envRedacted("api_key"));
     try std.testing.expect(envRedacted("GITHUB_TOKEN"));
     try std.testing.expect(envRedacted("AWS_SECRET_ACCESS_KEY"));
+    try std.testing.expect(envRedacted("MB_DB_PASS"));
+    try std.testing.expect(envRedacted("PGPASSWORD"));
     try std.testing.expect(!envRedacted("PORT"));
     try std.testing.expect(!envRedacted("GOMAXPROCS"));
 }

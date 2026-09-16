@@ -3,6 +3,20 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.16.1] - 2026-09-16
+
+### Changed
+- **`PHOTON_INGEST_TOKEN` is the token variable** — photon's own name for its ingest token,
+  the one photon-agent and photon-loadgen already use — so one variable serves the whole
+  stack. `PHOTON_OTLP_TOKEN` (v1.12–v1.16.0) is still read as an alias; the newer name wins
+  when both are set.
+
+### Fixed
+- **Incident bundles redact `*PASS*` environment names.** The rule matched `password` and
+  `passwd` but not the abbreviated `DB_PASS` / `MB_DB_PASS` that container images set as a
+  plain `ENV`, so such a value could ride into a spooled bundle and on to photon. `pass` is
+  now a needle like `secret`, `token`, `key` and `credential`.
+
 ## [1.16.0] - 2026-09-15
 
 ### Removed
