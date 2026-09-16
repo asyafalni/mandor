@@ -3,6 +3,14 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.16.1] - 2026-09-16
+
+### Fixed
+- **Incident bundles redact `*PASS*` environment names.** The rule matched `password` and
+  `passwd` but not the abbreviated `DB_PASS` / `MB_DB_PASS` that container images set as a
+  plain `ENV`, so such a value could ride into a spooled bundle and on to photon. `pass` is
+  now a needle like `secret`, `token`, `key` and `credential`.
+
 ## [1.16.0] - 2026-09-15
 
 ### Removed
