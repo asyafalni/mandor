@@ -1,7 +1,7 @@
 # Contributor: Alfin Syafalni <alfin@nodeflux.io>
 # Maintainer: Alfin Syafalni <alfin@nodeflux.io>
 pkgname=mandor
-pkgver=1.17.0
+pkgver=1.17.1
 pkgrel=0
 pkgdesc="Tiny PID-1 process supervisor for containers with crash forensics"
 url="https://github.com/asyafalni/mandor"
