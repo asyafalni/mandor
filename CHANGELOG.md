@@ -3,7 +3,7 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [Unreleased]
+## [1.17.0] - 2026-10-13
 
 ### Removed
 - **PSI (pressure-stall) sampling, the `stall:*` incident cause, and `psi_mem_pct` /
