@@ -3,7 +3,7 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [Unreleased]
+## [1.17.2] - 2026-10-13
 
 ### Fixed
 - **A bundle photon rejects no longer holds back the incidents behind it.** Any non-2xx used to
