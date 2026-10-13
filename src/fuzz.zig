@@ -54,7 +54,6 @@ const config_seed =
     \\state_dir = "/var/lib/mandor"
     \\stop_grace = "10s"
     \\photon = "127.0.0.1:4318"
-    \\psi_mem_pct = 80
     \\workers = [
     \\  "./api --port 8080",
     \\  "./worker",
@@ -76,7 +75,6 @@ const config_seed =
 ;
 
 const stat_seed = "1234 (my (evil) worker) S 1 1234 1234 0 -1 4194560 900 0 0 0 12 5 0 0 20 0 3 0 8400 12582912 512";
-const psi_seed = "some avg10=0.00 avg60=12.34 avg300=0.00 total=1234\nfull avg10=0.00 avg60=5.00 avg300=0.00 total=99";
 // Must match history.serialize byte-for-byte in shape: the loader keys off the
 // literal `{"sig":"` prefix and a fixed 16-digit hex field. A seed in any other
 // shape silently matches nothing and fuzzes an early return.
@@ -266,7 +264,6 @@ fn configTarget(text: []const u8) void {
 
 fn procTarget(text: []const u8) void {
     const fields = sampler.parseStat(text);
-    _ = sampler.parsePsiAvg60(text);
     // Feed parsed /proc values onward the way sample() does. parseStat yields
     // whatever the text held, so the consumers must survive it too.
     if (fields) |f| {
@@ -569,7 +566,7 @@ fn prng() std.Random.DefaultPrng {
 /// for. Kept valid on purpose — a seed that fails to build is a seed that
 /// fuzzes an early return and makes the suite greener, not stronger.
 const relay_seed =
-    "{\"v\":7,\"ts\":\"2026-07-17T22:47:03Z\",\"name\":\"api\",\"kind\":\"signal\"," ++
+    "{\"v\":8,\"ts\":\"2026-07-17T22:47:03Z\",\"name\":\"api\",\"kind\":\"signal\"," ++
     "\"release\":\"api@1.4.2\",\"pid\":42,\"restarts\":3," ++
     "\"trace\":{\"lang\":\"go\",\"frames\":[\"main.crash\"]}," ++
     "\"verdict\":\"go panic: said \\\"boom\\\" in main.crash\"}";
@@ -780,7 +777,6 @@ test "seed valid: history, /proc and state files" {
     try std.testing.expect(std.mem.indexOf(u8, round, "\"sig\":\"") != null);
 
     try std.testing.expect(sampler.parseStat(stat_seed) != null);
-    try std.testing.expect(sampler.parsePsiAvg60(psi_seed) > 0);
     try std.testing.expect(report.formatHuman(&fmt_buf, report_seed, 1_000_000, null) != null);
 }
 
@@ -799,13 +795,10 @@ test "fuzz: config parser survives mutated toml" {
     for (0..iterations) |_| configTarget(mutate(rnd, config_seed, &buf));
 }
 
-test "fuzz: /proc parsers survive mutated stat and pressure text" {
+test "fuzz: /proc parser survives mutated stat text" {
     var p = prng();
     const rnd = p.random();
-    for (0..iterations) |i| {
-        const seed = if (i % 2 == 0) stat_seed else psi_seed;
-        procTarget(mutate(rnd, seed, &buf));
-    }
+    for (0..iterations) |_| procTarget(mutate(rnd, stat_seed, &buf));
 }
 
 test "fuzz: elf build-id parser survives hostile headers" {

@@ -31,8 +31,6 @@ pub const FileConfig = struct {
     logs_digest: ?bool = null,
     logs_digest_interval_ms: ?u64 = null,
     logs_digest_threshold: ?u32 = null,
-    psi_mem_pct: ?u16 = null,
-    psi_cpu_pct: ?u16 = null,
     /// "dependent=dependency" worker-name pairs.
     start_after: [cli.max_workers]cli.HealthSpec = undefined,
     start_after_n: u8 = 0,
@@ -135,7 +133,7 @@ fn pairSlot(cfg: *FileConfig, target: ArrayTarget) ?struct { arr: []cli.HealthSp
     };
 }
 
-pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuSectionRemoved, HostMetricsRemoved, PerWorkerOnly };
+pub const ParseError = error{ Syntax, BadValue, TooManyWorkers, RestartRemoved, UnhealthyKeyRemoved, LogsStreamRemoved, GpuSectionRemoved, HostMetricsRemoved, PsiRemoved, PerWorkerOnly };
 
 /// Parse TOML-subset text. String values are slices into `text`; worker
 /// commands land in `cmd_storage`.
@@ -285,10 +283,10 @@ pub fn parse(
             cfg.on_incident = parseString(value) orelse return error.BadValue;
         } else if (std.mem.eql(u8, key, "photon")) {
             cfg.photon = parseString(value) orelse return error.BadValue;
-        } else if (std.mem.eql(u8, key, "psi_mem_pct")) {
-            cfg.psi_mem_pct = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
-        } else if (std.mem.eql(u8, key, "psi_cpu_pct")) {
-            cfg.psi_cpu_pct = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
+        } else if (std.mem.eql(u8, key, "psi_mem_pct") or std.mem.eql(u8, key, "psi_cpu_pct")) {
+            // v1.17: PSI is the whole cgroup's pressure (the whole host's, on a
+            // package install), not any one worker's. mandor reports per process.
+            return error.PsiRemoved;
         } else if (std.mem.eql(u8, key, "gpu_interval")) {
             // v1.16: mandor stopped sampling the host (node + GPU metrics are
             // photon-agent's). A config that still tunes it should say so loudly
@@ -1126,6 +1124,12 @@ test "secret section: every rejection is a hard error" {
         W ++ "[secret.dup]\nworkers = [\"gateway\"]\n[secret.dup]\nworkers = [\"gateway\"]",
         &storage,
     ));
+}
+
+test "psi_mem_pct / psi_cpu_pct give a migration error: pressure is not per worker" {
+    var storage: [cli.max_workers][]const u8 = undefined;
+    try t.expectError(error.PsiRemoved, parseTest("psi_mem_pct = 80", &storage));
+    try t.expectError(error.PsiRemoved, parseTest("psi_cpu_pct = 0", &storage));
 }
 
 test "gpu_interval gives a migration error: mandor no longer samples the host" {

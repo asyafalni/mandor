@@ -424,7 +424,6 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     var next_digest_ms: u64 = run_start_ms +| digest_interval_ms;
     var sample_tick: u32 = 0;
     var oom_kills: u64 = cgroup.readOomKills() orelse 0;
-    var stall_det: detector.StallState = .{};
     const metrics_server: ?metrics.Server = if (cfg.metrics_port) |port| blk: {
         const srv = metrics.Server.init(port);
         if (srv == null)
@@ -605,7 +604,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         if (now_sample >= next_sample_ms) {
             next_sample_ms = now_sample + sampler.interval_ms;
             sample_tick +%= 1;
-            runSamplerTick(workers, cfg, state_dir, &stall_det, sample_tick, now_sample);
+            runSamplerTick(workers, state_dir, sample_tick, now_sample);
         }
 
         // Tier-2 digest flush: on the timer, or early when any one signature's
@@ -903,7 +902,7 @@ fn fireProberOnFail(def: *const cli.ProbeDef, ps: *ProberState, state_dir: []con
     // `last_incident_ms == 0` means "never spooled" — the cooldown must not gate
     // the FIRST incident. Without the sentinel, a host whose CLOCK_MONOTONIC (=
     // uptime) is under the cooldown (fresh VM/CI runner) would drop it, since
-    // `now -| 0 < cooldown`. Mirror detector.StallState's `fired_at_ms != 0` guard.
+    // `now -| 0 < cooldown`. Mirror the detector's `fired_at_ms != 0` cooldown guard.
     if (ps.last_incident_ms != 0 and now -| ps.last_incident_ms < detector.dedup_cooldown_ms) return;
     ps.last_incident_ms = now;
     var verdict_buf: [96]u8 = undefined;
@@ -1158,23 +1157,19 @@ fn pumpIo(
 }
 
 /// One sampler tick: /proc sampling, cost accounting, leak and recycle
-/// checks per worker, then the container-wide PSI stall check and the
-/// periodic state flush. Called only when a tick is actually due, so the
+/// checks per worker, then the periodic state flush. Called only when a tick is actually due, so the
 /// loop's common path pays nothing for it.
 fn runSamplerTick(
     workers: []spawner.Worker,
-    cfg: *const cli.Config,
     state_dir: []const u8,
-    stall_det: *detector.StallState,
     sample_tick: u32,
     now: u64,
 ) void {
-    const psi = sampler.readPsi(); // container-wide, read once per tick
     const wall = wallMs();
     const t_ns = wall *| 1_000_000; // one wall read per tick, ms → ns
     for (workers, 0..) |*w, i| {
         if (w.pid > 0) {
-            sampler.sample(&w.stats, w.pid, now, psi);
+            sampler.sample(&w.stats, w.pid, now);
             const s = w.stats.at(w.stats.len - 1);
             cost.get(i).update(s.rss_kb, s.cpu_pct, s.fds, s.threads, sampler.interval_ms, wall);
             // Per-worker telemetry: the Sample field types match frame's exactly
@@ -1199,7 +1194,7 @@ fn runSamplerTick(
     // when a daemon is actually consuming it.
     if (telemetry.enabled()) {
         if (self_pid == 0) self_pid = linux.getpid();
-        sampler.sample(&self_stats, self_pid, now, psi);
+        sampler.sample(&self_stats, self_pid, now);
         const ss = self_stats.at(self_stats.len - 1);
         telemetry.emitMetric(.{
             .name = "mandor",
@@ -1210,14 +1205,7 @@ fn runSamplerTick(
             .restarts = 0,
             .t_unix_ns = t_ns,
         });
-        // Node-level host metrics (system.*) are sampled inside the relay daemon
-        // now, not here: PID 1 no longer reads /proc for the node or crosses the
-        // pipe with a host frame. See relay.runDaemon's node-sample block.
     }
-    // PSI stall is container-scoped: check once, attribute the
-    // incident to the largest consumer of the pressured resource.
-    if (stall_det.stallCheck(psi, cfg.psi_mem_pct, cfg.psi_cpu_pct, now)) |res|
-        incident.onStall(state_dir, workers, res, psi, now);
     // Near-zero idle footprint: deaths flush state immediately, so
     // the periodic freshness write only needs to run every 30 s.
     if (sample_tick % 6 == 0) {

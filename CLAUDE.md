@@ -39,7 +39,7 @@ mandor (PID 1, this repo)
 ├── capture        per-worker stdout/stderr pipes → ring buffers (default 256KB)
 ├── sampler        /proc/<pid>/{stat,status} poll (default 5s): CPU%, RSS, fds, threads
 ├── detector       incident triggers: nonzero exit, fatal signal, cgroup OOM,
-│                  restart-loop (N in M min), monotonic RSS climb, PSI stall
+│                  restart-loop (N in M min), monotonic RSS climb
 ├── summarize      heuristic engine (NO LLM): error dedup by signature,
 │                  trace parsing, pattern verdicts ("restart loop", "leak suspect")
 ├── report         `mandor report` → human text or --json (+ --incidents, --cost)
@@ -58,7 +58,7 @@ mandor (PID 1, this repo)
 
 ### Incident bundle schema (stable contract — sidecar + AI depend on it)
 
-> Illustrative shape below. The **live schema is v7** (structured `cause`
+> Illustrative shape below. The **live schema is v8** (structured `cause`
 > object, first-class `exception.type`/`message`, structured trace frames,
 > release-correlation `history`) — the authority is `src/spool.zig` and the
 > golden fixtures; every change bumps `"v"`. See docs/INTEGRATION-PHOTON.md for
@@ -225,7 +225,10 @@ the `relay --daemon`, `otlp.zig` the OTLP message structs for `nilo_proto`, `fra
   and every process on it (GPU per process included, tagged with the mandor it
   runs under — named by the `MANDOR_WORKER=<name>` mandor stamps into every
   worker's environment at spawn, which survives `exec`). `gpu_interval` /
-  `[gpu]` are migration errors. Do not bring host sampling back into this binary.
+  `[gpu]` are migration errors, and so are `psi_mem_pct` / `psi_cpu_pct`
+  (v1.17): a cgroup-wide number is not a worker's. mandor is not a node
+  exporter — do not bring host- or cgroup-wide sampling back into this binary.
+  `host.name`/`host.id` stay only as labels joining a worker to its node.
 - **TOML is a behavior overlay, the CLI is the source of truth.** The active
   worker set is whatever the CLI `--` args spawn (else the TOML `workers=`); every
   `[worker.NAME]` section and `[secret.*]` grant is matched to that set *by name*.

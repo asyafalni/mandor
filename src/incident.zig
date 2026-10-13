@@ -455,31 +455,3 @@ pub fn onLeak(state_dir: []const u8, workers: []spawner.Worker, w: *spawner.Work
     in.verdict = summarize.verdictLeak(&verdict_buf, info.growth_mb, info.minutes);
     writeBundle(state_dir, in);
 }
-
-/// Container-wide PSI stall: attribute to the largest live consumer of the
-/// pressured resource (RSS for memory, CPU% for cpu) as the likely culprit.
-pub fn onStall(state_dir: []const u8, workers: []spawner.Worker, kind: detector.StallKind, psi: sampler.Psi, now_ms: u64) void {
-    var culprit: ?*spawner.Worker = null;
-    var best: u64 = 0;
-    for (workers) |*w| {
-        if (w.pid <= 0 or w.stats.len == 0) continue;
-        const s = w.stats.at(w.stats.len - 1);
-        const metric: u64 = if (kind == .memory) s.rss_kb else s.cpu_pct;
-        if (metric >= best) {
-            best = metric;
-            culprit = w;
-        }
-    }
-    const w = culprit orelse return; // no live workers → nothing to blame
-    total += 1;
-    const cause_str: []const u8 = if (kind == .memory) "stall:memory" else "stall:cpu";
-    var in = commonInput(workers, w, now_ms, cause_str, w.pid);
-    const hist = recordKindHistory(state_dir, cause_str, w);
-    setHistory(&in, &hist);
-    in.logs_tail = collectCompact(w);
-    in.logs_dropped = compactor.dropped;
-    in.stats = collectStats(w);
-    const pct: u16 = if (kind == .memory) psi.mem / 100 else psi.cpu / 100;
-    in.verdict = summarize.verdictStall(&verdict_buf, cause_str, pct, w.nameSlice());
-    writeBundle(state_dir, in);
-}

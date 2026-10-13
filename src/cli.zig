@@ -127,9 +127,6 @@ pub const Config = struct {
     /// Tenant/origin tag prepended to `service.name` on every OTLP emission
     /// (TOML-only; telemetry surface only). "" = no prefix (unchanged behavior).
     service_prefix: []const u8 = "",
-    /// Container-wide PSI stall thresholds (whole percent; 0 = off).
-    psi_mem_pct: u16 = 0,
-    psi_cpu_pct: u16 = 0,
     /// Per-worker extras (TOML-only): "name=KEY=VAL" env pairs, "name=/path"
     /// working dirs, and names of workers that are one-shot init tasks.
     env_pairs: [64]HealthSpec = undefined,
@@ -248,8 +245,6 @@ pub fn parse(
                 std.mem.startsWith(u8, arg, "--health-start-period=") or
                 std.mem.startsWith(u8, arg, "--on-incident=") or
                 std.mem.startsWith(u8, arg, "--photon=") or
-                std.mem.startsWith(u8, arg, "--psi-mem=") or
-                std.mem.startsWith(u8, arg, "--psi-cpu=") or
                 std.mem.startsWith(u8, arg, "--health=") or
                 std.mem.startsWith(u8, arg, "--health-interval=") or
                 std.mem.startsWith(u8, arg, "--ready-fd=") or
@@ -530,7 +525,6 @@ test "the CLI is four flags; everything else moved to mandor.toml" {
         "--backoff-max=1s",  "--stop-grace=5s",      "--expected-exit=143",
         "--health=a=/bin/t", "--health-interval=1s", "--health-start-period=1s",
         "--ready-fd=5",      "--on-incident=/n",     "--photon=1.2.3.4:1",
-        "--psi-mem=80",      "--psi-cpu=90",
     }) |flag| {
         try expectError(error.MovedToToml, parseTest(&.{ flag, "./a" }, &storage));
     }

@@ -173,6 +173,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     error.HostMetricsRemoved => "'gpu_interval' was removed — mandor no longer samples " ++
                         "the host: node and GPU metrics (system.*, system.gpu.*) come from photon-agent; " ++
                         "mandor ships only what it supervises (process.*, incidents, logs, lifecycle)",
+                    error.PsiRemoved => "'psi_mem_pct' / 'psi_cpu_pct' were removed — pressure " ++
+                        "stall is the whole cgroup's (the whole host's, outside a container), not " ++
+                        "any one worker's; mandor reports per process. Node pressure is photon-agent's",
                     error.PerWorkerOnly => "'expected_exit' / 'health_interval' / " ++
                         "'health_start_period' are now per-worker only — move them into a " ++
                         "[worker.NAME] section (they describe a specific binary, not the fleet)",
@@ -198,12 +201,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (file_cfg.logs_digest) |v| cfg.logs.digest = v;
             if (file_cfg.logs_digest_interval_ms) |v| cfg.logs.digest_interval_ms = v;
             if (file_cfg.logs_digest_threshold) |v| cfg.logs.digest_threshold = v;
-            if (cfg.psi_mem_pct == 0) {
-                if (file_cfg.psi_mem_pct) |v| cfg.psi_mem_pct = v;
-            }
-            if (cfg.psi_cpu_pct == 0) {
-                if (file_cfg.psi_cpu_pct) |v| cfg.psi_cpu_pct = v;
-            }
             cfg.not_essential = file_cfg.not_essential;
             cfg.not_essential_n = file_cfg.not_essential_n;
             if (file_cfg.restart_dependents) |b| cfg.restart_dependents = b;

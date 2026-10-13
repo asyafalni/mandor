@@ -113,7 +113,7 @@ export MANDOR_STATE_DIR="$TMP/state2"
 timeout 10 "$MANDOR" "sh $TMP/crash_go.sh" >"$TMP/11" 2>&1
 c=$?
 f=$(ls "$TMP/state2/incidents/"*.json 2>/dev/null | head -1)
-if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":7' "$f" \
+if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":8' "$f" \
    && grep -q '"kind":"exit"' "$f" && grep -q '"exit_code":2' "$f" \
    && grep -q '"cause_str":"exit:2"' "$f" \
    && grep -q '"lang":"go"' "$f" \
@@ -121,9 +121,9 @@ if [ $c -eq 2 ] && [ -n "$f" ] && grep -q '"v":7' "$f" \
    && grep -q '"type":"runtime error"' "$f" \
    && grep -q '"exe":"[^"]*/sh"' "$f" \
    && grep -q 'go panic in main.crash' "$f"; then
-  ok "incident bundle v7: structured frames + exception + verdict"
+  ok "incident bundle v8: structured frames + exception + verdict"
 else
-  bad "incident bundle v7" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
+  bad "incident bundle v8" "exit $c, file=$f: $(head -c 300 "$f" 2>/dev/null)"
 fi
 unset MANDOR_STATE_DIR
 
@@ -595,14 +595,14 @@ else
   echo "skip cap_drop/no_new_privs (not root)"
 fi
 
-# 45. PSI fields present in the incident bundle stats timeline (schema v7).
-# Worker lives past the first 5s sample so stats_timeline is populated.
+# 45. The stats timeline is the worker's own numbers only (schema v8): no
+# cgroup-wide PSI. Worker lives past the first 5s sample so it is populated.
 export MANDOR_STATE_DIR="$TMP/state45"
 timeout 12 "$MANDOR" "sh -c 'sleep 6; exit 3'" >/dev/null 2>&1
 f=$(ls "$TMP/state45/incidents/"*.json 2>/dev/null | head -1)
-if [ -n "$f" ] && grep -q '"v":7' "$f" && grep -q '"psi_mem"' "$f" && grep -q '"core":' "$f"; then
-  ok "bundle v7 carries psi_mem + limits.core"
-else bad "psi/core in bundle" "$(head -c 200 "$f" 2>/dev/null)"; fi
+if [ -n "$f" ] && grep -q '"v":8' "$f" && grep -q '"rss_mb"' "$f" && ! grep -q '"psi_' "$f" && grep -q '"core":' "$f"; then
+  ok "bundle v8 stats are per worker (no psi_*) + limits.core"
+else bad "per-worker stats/core in bundle" "$(head -c 200 "$f" 2>/dev/null)"; fi
 unset MANDOR_STATE_DIR
 
 # 46. cost report: a worker sampled over time yields a cost profile.

@@ -213,7 +213,6 @@ the CLI. `mandor validate -- <cmds>` validates against exactly those workers.
 ```toml
 max_restarts = 3
 metrics_port = 9464
-psi_mem_pct = 80               # incident if container memory pressure sustains >80%
 env_file = ".env"              # KEY=VAL lines for all workers
 on_incident = "/notify"        # exec'd with each incident bundle path
 photon = "127.0.0.1:4318"      # auto-forward incidents to photon (OTLP)
@@ -437,8 +436,6 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `ready_fd` | global | — | |
 | `restart_dependents` | global | — | |
 | `env_file` | global | — | |
-| `psi_mem_pct` | global | — | |
-| `psi_cpu_pct` | global | — | |
 | `digest` | `[logs]` | — | |
 | `digest_interval` | `[logs]` | — | |
 | `digest_threshold` | `[logs]` | — | |
@@ -472,9 +469,11 @@ these four deploy-varying keys are env-settable — the rest is TOML/CLI.**
 | `on_fail` | `[prober.NAME]` | — | |
 | `timeout` | `[prober.NAME]` | — | |
 
-There is no host or GPU sampling in mandor since v1.16 (`gpu_interval` and the
-older `[gpu]` section give a migration error): photon-agent reports the host,
-and each supervised worker's GPU share, from outside the container.
+mandor reports per worker, never the machine — it is not a node exporter.
+There is no host or GPU sampling since v1.16 (`gpu_interval` and the older
+`[gpu]` section give a migration error), and no cgroup pressure (PSI) since
+v1.17 (`psi_mem_pct` / `psi_cpu_pct` give a migration error): photon-agent
+reports the host, its pressure, and each supervised worker's GPU share.
 
 **Declarative checks (v1.15).** `[require.NAME]` runs a command **before any
 worker** and aborts boot fail-closed on non-zero (a GPU/driver precondition,

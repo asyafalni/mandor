@@ -30,8 +30,6 @@ names stay safe in the Prometheus exposition format.
 | `ready_fd = 5` | — | off | s6-style readiness: workers write a newline to this fd |
 | `restart_dependents = true` | — | `false` | OTP `rest_for_one`: a dependency's restart recycles its dependents |
 | `env_file = ".env"` | — | off | KEY=VAL file loaded into every worker's environment |
-| `psi_mem_pct = 80` | — | off | Incident when container memory pressure (PSI some avg60) sustains above this % |
-| `psi_cpu_pct = 90` | — | off | Incident when container CPU pressure sustains above this % |
 
 ### photon telemetry (the `photon` key)
 
@@ -76,9 +74,15 @@ keeping to the four-CLI-flag / minimal-key rule. `PHOTON_INGEST_TOKEN` (env, kep
 off the process cmdline; the bearer var's name changed in v1.12) sets the
 bearer token when photon requires auth.
 
-### No host or GPU sampling (`gpu_interval` removed in v1.16)
+### Per worker only: no host, GPU or pressure sampling
 
-mandor no longer samples the node it runs on. The `[gpu]` section (v1.14) and
+mandor reports what it supervises, per worker, and never the machine — it is
+not a node exporter. **PSI (`psi_mem_pct` / `psi_cpu_pct`) was removed in
+v1.17**: pressure-stall is one number for the whole cgroup (the whole host's,
+on a package install), so a `stall:*` incident could only guess which worker
+to blame. Both keys give a **migration error**; node pressure is photon-agent's.
+
+mandor no longer samples the node it runs on (v1.16). The `[gpu]` section (v1.14) and
 the `gpu_interval` key that replaced it (v1.16) both give a **migration error**
 pointing here rather than being silently ignored: delete the key. Host and GPU
 metrics — including the GPU memory and SM/encoder/decoder share of each

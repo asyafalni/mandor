@@ -5,6 +5,17 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
 
 ## [Unreleased]
 
+### Removed
+- **PSI (pressure-stall) sampling, the `stall:*` incident cause, and `psi_mem_pct` /
+  `psi_cpu_pct`.** mandor reports per worker and is not a node exporter: PSI is one number for
+  the whole cgroup (the whole host's, on a package install), stamped onto every worker's samples,
+  and a `stall:*` incident could only guess which worker to blame (the largest RSS or CPU). Both
+  keys now give a migration error; node pressure is photon-agent's.
+- **Incident bundle schema v8**: `stats_timeline` entries drop `psi_mem` / `psi_cpu` / `psi_io`
+  and carry only the worker's own `rss_mb` and `cpu_pct`.
+- Dead host-sampling leftovers: `spawner.onPath` (the `nvidia-smi` probe for the removed GPU
+  sampler) and comments still describing the v1.16-removed node sampler.
+
 ### Changed
 - **The relay's OTLP protobuf is encoded by `nilo_proto`** (nilo v0.8.0), mandor's first
   dependency. The messages are plain structs in `src/otlp.zig`; `encodeInto` writes them into

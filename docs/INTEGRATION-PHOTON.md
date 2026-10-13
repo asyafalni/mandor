@@ -190,7 +190,7 @@ such drops are counted; the shed is lossy by design (ephemeral tier).
 
 ### 3. Incidents — the real story; shipped and durable
 
-The incident bundle (schema v7, versioned contract in `src/spool.zig`) is a
+The incident bundle (schema v8, versioned contract in `src/spool.zig`) is a
 ready-made OTEL *event*: structured cause, exception type/message, stack
 frames with `file:line`/`in_app` (Sentry vocabulary), deduplicated log tail,
 stats timeline, release/build-id, and recurrence history — now including
@@ -287,7 +287,7 @@ OTLP receiver answers with an `ExportLogsServiceResponse` protobuf (an empty
 > ```
 > /api/services  -> ["sh"]
 > /api/storage   -> logs: total_rows 1, bytes 7022
-> /api/search    -> mandor.bundle with the full schema-v7 incident
+> /api/search    -> mandor.bundle with the full schema-v8 incident
 > ```
 >
 > photon promoted `service.name` to its own column and stored the whole bundle,

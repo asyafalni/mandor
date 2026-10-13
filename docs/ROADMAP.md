@@ -104,7 +104,7 @@ core-dump, JSON logging). Only extensions of existing subsystems survived.
 
 | # | Feature | Cx | Value | Notes |
 |---|---------|----|-------|-------|
-| 35 ✅ | PSI stall sampling (cgroup v2 pressure) → `stall:*` detector cause | S | ● ● ● ○ | SHIPPED v0.16 — psi_mem_pct/psi_cpu_pct, PSI in bundle stats (schema v6) |
+| 35 ✅ | PSI stall sampling (cgroup v2 pressure) → `stall:*` detector cause | S | ● ● ● ○ | SHIPPED v0.16 — psi_mem_pct/psi_cpu_pct, PSI in bundle stats (schema v6). **REMOVED v1.17**: cgroup-wide, not per worker (schema v8) |
 | 36 ✅ | `no_new_privs` + `cap_drop` at exec | S | ● ● ● ○ | SHIPPED v0.16 — per-worker cap bounding-set (names or "all"), no libcap |
 | 37 ✅ | JSON supervisor-event log | S | ● ● ○ ○ | SHIPPED (Tier 10 #48) — offline = plain `[mandor]` stdout lines; online = OTLP lifecycle events + metrics to photon. No separate sink |
 | 38 ✅ | `RLIMIT_CORE` in bundle | XS | ● ○ ○ ○ | SHIPPED v0.16 (`limits.core`) |

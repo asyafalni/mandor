@@ -25,8 +25,8 @@ const relay_timeout_s = 10;
 // The largest OTLP message mandor ever builds is an incident bundle embedded
 // raw as the `mandor.bundle` attribute. A bundle is capped at 128 KB (spool's
 // bundle_buf) and protobuf embeds strings UNESCAPED, so that message is the
-// bundle plus ~1 KB of framing. Every other encoder is far smaller: process /
-// host / GPU metrics are tens of KB, and the streamed-log batch is bounded by
+// bundle plus ~1 KB of framing. Every other encoder is far smaller: per-worker
+// process metrics are tens of KB, and the streamed-log batch is bounded by
 // the 64 KB log_arena. So the body buffer only needs the bundle cap plus a
 // generous OTLP-framing margin; a message that would exceed it returns
 // error.TooLarge and is dropped (the incident stays durable on the spool).
@@ -697,8 +697,8 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
 /// the pipe still wakes us, so a correlated incident ships within one interval,
 /// and the idle tick (below) is the safety-net scan.
 const spool_scan_ms = 1000;
-/// How often an otherwise idle daemon wakes to rescan the spool. 5s, the cadence
-/// the node sampler used to give the loop for free before it moved out.
+/// How often an otherwise idle daemon wakes to rescan the spool. 5s, the
+/// supervisor's sampler cadence.
 const idle_tick_ms = 5000;
 
 // Shipped-set watermark.
@@ -910,10 +910,11 @@ fn batchDigest(d: frame.DigestEntry) bool {
     return true;
 }
 
-// Host identity for the `system.*` resource, read ONCE at daemon start (it does
-// not change for the daemon's life) into these fixed buffers; the node-sample
-// ship path (runDaemon) and the per-worker metric batch (drainPipe, host.name)
-// both reuse the slices below, so neither re-reads /proc or allocates. Default
+// Host identity, read ONCE at daemon start (it does not change for the
+// daemon's life) into these fixed buffers. It only LABELS per-worker data —
+// host.name/host.id on each worker's metrics and logs, so photon joins a
+// worker to the photon-agent on its node; mandor measures nothing about the
+// host. drainPipe reuses the slices, so nothing re-reads /proc or allocates. Default
 // to "unknown" until runDaemon populates them.
 var daemon_host_name_buf: [256]u8 = undefined;
 var daemon_host_id_buf: [256]u8 = undefined;
