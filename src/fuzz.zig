@@ -15,7 +15,7 @@
 //! a one-line change per target.
 //!
 //! Seeds vary per run (`std.testing.random_seed`); the test runner prints the
-//! seed, and `zig build test -- --seed=0x…` replays a failure exactly.
+//! seed, and `zig build test --seed=0x…` replays a failure exactly.
 
 const std = @import("std");
 

@@ -145,7 +145,7 @@ capture ring buffer, and the cost accumulators. It runs as part of
 `zig build test`, with a different seed each invocation.
 
 ```console
-zig build test --seed 0xdeadbeef   # replay a specific seed
+zig build test --seed=0xdeadbeef  # replay a specific seed
 ```
 
 A failure prints the seed it ran with — pass it back to reproduce exactly.

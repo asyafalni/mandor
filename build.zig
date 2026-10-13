@@ -39,6 +39,10 @@ pub fn build(b: *std.Build) void {
         });
     }
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    // The fuzz harness draws from the runner's --seed, so a run is only a
+    // repeat if the seed is: never serve it from cache, or a multi-seed sweep
+    // quietly runs once (Zig 0.17 caches a passing run regardless of seed).
+    run_exe_tests.has_side_effects = true;
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_tests.step);
 }
