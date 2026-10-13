@@ -1,8 +1,9 @@
-//! `mandor relay <bundle.json>` — ships an incident bundle to photon's
-//! OTLP/HTTP logs endpoint (PHOTON_OTLP=ip:port, default 127.0.0.1:4318).
-//! Runs ONLY when explicitly invoked as this subcommand — the supervisor
-//! itself never opens outbound connections. Wire it up with
-//! `on_incident = "/mandor relay"`. Mapping: docs/INTEGRATION-PHOTON.md.
+//! OTLP to photon. Two entry points: `mandor relay --daemon`, the one
+//! long-lived child the supervisor spawns when `photon` is set (owns the
+//! socket, ships the spool, drains the telemetry pipe), and the one-shot
+//! `mandor relay <bundle.json>` (endpoint from PHOTON_OTLP=host:port, default
+//! 127.0.0.1:4318). The supervisor itself never opens an outbound connection.
+//! Mapping: docs/INTEGRATION-PHOTON.md.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -40,7 +41,7 @@ pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const
     const bundle = readFile(path) catch |e| {
         err(switch (e) {
             error.Unreadable => "cannot read bundle",
-            error.TooLarge => "bundle exceeds 256KB — refusing to ship a truncated incident",
+            error.TooLarge => "bundle exceeds 128KB — refusing to ship a truncated incident",
         });
         return 1;
     };
@@ -765,18 +766,48 @@ const Shipped = struct {
     }
 };
 
-/// Read one bundle, encode it, ship it. Returns true only on a 2xx.
-fn shipOne(spool_dir: []const u8, name: []const u8, host: u32, port: u16, token: []const u8) bool {
+const ShipResult = enum {
+    shipped,
+    /// The send failed: photon is down or rejecting. Retry next cycle.
+    failed,
+    /// The bundle itself can never encode — unreadable, empty, over the cap,
+    /// or a broken JSON escape. Retrying cannot help, and stopping on it would
+    /// hold back every newer incident, so the caller skips it.
+    unshippable,
+};
+
+/// Read one bundle, encode it, ship it.
+fn shipOne(spool_dir: []const u8, name: []const u8, host: u32, port: u16, token: []const u8) ShipResult {
     var path_buf: [640]u8 = undefined;
-    const path = std.mem.printSentinel(&path_buf, "{s}/incidents/{s}", .{ spool_dir, name }, 0) catch return false;
-    const bundle = readFile(path.ptr) catch return false;
-    const body = buildOtlp(bundle) catch return false;
-    return post(host, port, "/v1/logs", body, token) == 0;
+    const path = std.mem.printSentinel(&path_buf, "{s}/incidents/{s}", .{ spool_dir, name }, 0) catch
+        return skip(name, "path too long");
+    const bundle = readFile(path.ptr) catch |e| return skip(name, switch (e) {
+        error.Unreadable => "unreadable or empty",
+        error.TooLarge => "exceeds 128KB",
+    });
+    const body = buildOtlp(bundle) catch |e| return skip(name, switch (e) {
+        error.TooLarge => "too large for one OTLP record",
+        error.Malformed => "malformed JSON string escape",
+    });
+    return if (post(host, port, "/v1/logs", body, token) == 0) .shipped else .failed;
+}
+
+/// Say once, on stderr, which bundle is being left out of photon and why. It
+/// stays on the spool for `mandor report` and the sidecar; a restarted daemon
+/// looks at it afresh.
+fn skip(name: []const u8, why: []const u8) ShipResult {
+    var buf: [384]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "relay: not shipping incident {s}: {s}", .{ name, why }) catch
+        "relay: not shipping an incident: unshippable";
+    err(msg);
+    return .unshippable;
 }
 
 /// Ship every spooled bundle not yet shipped, oldest first. Returns false if a
 /// send failed (photon unreachable/rejecting) so the caller can re-resolve.
-/// Never advances past a failed bundle: incidents are durable and retried.
+/// Never advances past a failed send: incidents are durable and retried. A
+/// bundle that can never encode is passed over (tracked as handled) instead,
+/// so one bad file cannot hold back every newer incident.
 fn shipSpool(shipped: *Shipped, spool_dir: []const u8, host: u32, port: u16, token: []const u8) bool {
     // Oldest-first, newest-wins on the (rare) overflow — mirrors spool.prune.
     const n = spool.listIncidents(spool_dir, &dir_entries, .newest);
@@ -791,13 +822,15 @@ fn shipSpool(shipped: *Shipped, spool_dir: []const u8, host: u32, port: u16, tok
     for (dir_entries[0..n]) |*e| {
         const name = e.name[0..e.name_len];
         if (shipped.find(name) != null) continue; // already shipped
-        if (shipOne(spool_dir, name, host, port, token)) {
-            shipped.add(name);
-        } else {
-            // photon is down or rejecting: stop this cycle (one bounded connect
-            // rather than one per bundle), leave the rest for the next cycle.
-            ok = false;
-            break;
+        switch (shipOne(spool_dir, name, host, port, token)) {
+            .shipped, .unshippable => shipped.add(name),
+            .failed => {
+                // photon is down or rejecting: stop this cycle (one bounded
+                // connect rather than one per bundle), leave the rest for the
+                // next cycle.
+                ok = false;
+                break;
+            },
         }
     }
     shipped.sweep();
@@ -828,7 +861,7 @@ var event_names: [event_batch_cap][ship_name_cap]u8 = undefined;
 // slices point into pipe_buf/scratch, both reused on the next decode), and when
 // the record cap OR the arena is exhausted the line is DROPPED with a counter —
 // never spooled, never blocking. Sizing: 128 records × up to ~4KB lines would
-// overflow the arena, so the 64KB arena is the real bound and body_buf (320KB)
+// overflow the arena, so the 64KB arena is the real bound and body_buf (160KB)
 // always fits a full batch.
 const max_log_batch = 128;
 var log_arena: [64 * 1024]u8 = undefined;
@@ -1725,6 +1758,50 @@ test "Shipped set tracks names and sweeps entries no longer on disk" {
     try testing.expect(s.find("100-api-1.json") == null); // pruned → forgotten
     try testing.expect(s.find("100-api-2.json") != null);
     try testing.expect(s.find("101-api-3.json") != null);
+}
+
+fn writeTestFile(path: [*:0]const u8, text: []const u8) !void {
+    const rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (posix.errno(rc) != .SUCCESS) return error.TestUnexpectedResult;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    _ = linux.write(fd, text.ptr, text.len);
+}
+
+test "an unshippable bundle is skipped, not retried forever ahead of the queue" {
+    // A bundle that can never encode (broken JSON escape, oversized, empty) used
+    // to fail like a down photon: the cycle stopped on it, every cycle, so every
+    // newer incident stayed behind it for the daemon's whole life.
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.mem.printSentinel(&dir_buf, "/tmp/mandor-poison-{d}", .{linux.getpid()}, 0);
+    var inc_buf: [160]u8 = undefined;
+    const inc = try std.mem.printSentinel(&inc_buf, "{s}/incidents", .{dir}, 0);
+    _ = linux.mkdirat(linux.AT.FDCWD, dir.ptr, 0o755);
+    _ = linux.mkdirat(linux.AT.FDCWD, inc.ptr, 0o755);
+    var bad_buf: [200]u8 = undefined;
+    const bad = try std.mem.printSentinel(&bad_buf, "{s}/1000-api-1.json", .{inc}, 0);
+    var good_buf: [200]u8 = undefined;
+    const good = try std.mem.printSentinel(&good_buf, "{s}/2000-api-2.json", .{inc}, 0);
+    defer {
+        _ = linux.unlinkat(linux.AT.FDCWD, bad.ptr, 0);
+        _ = linux.unlinkat(linux.AT.FDCWD, good.ptr, 0);
+        _ = linux.unlinkat(linux.AT.FDCWD, inc.ptr, linux.AT.REMOVEDIR);
+        _ = linux.unlinkat(linux.AT.FDCWD, dir.ptr, linux.AT.REMOVEDIR);
+    }
+    try writeTestFile(bad.ptr, "{\"v\":8,\"name\":\"api\",\"verdict\":\"broken \\q escape\"}");
+    try writeTestFile(good.ptr, "{\"v\":8,\"name\":\"api\",\"kind\":\"exit\",\"verdict\":\"exit 1\"}");
+
+    // Nothing listens on 127.0.0.1:1, so the good bundle's send fails at once.
+    var shipped: Shipped = .{};
+    try testing.expect(!shipSpool(&shipped, dir, 0x7f000001, 1, ""));
+    try testing.expect(shipped.find("1000-api-1.json") != null); // skipped for good
+    try testing.expect(shipped.find("2000-api-2.json") == null); // still queued, retried
+
+    // With only the unshippable bundle left, a cycle is not a delivery failure
+    // (that would make the daemon re-resolve photon for nothing).
+    _ = linux.unlinkat(linux.AT.FDCWD, good.ptr, 0);
+    var only_bad: Shipped = .{};
+    try testing.expect(shipSpool(&only_bad, dir, 0x7f000001, 1, ""));
 }
 
 test "buildOtlpEvent renders body, severity, and service.name" {

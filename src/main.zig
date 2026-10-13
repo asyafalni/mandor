@@ -42,9 +42,11 @@ const usage_text =
     \\usage:
     \\  mandor [flags] [--] "CMD" ["CMD" ...]     supervise workers
     \\  mandor report [NAME|PID] [--json]         live worker status
-    \\  mandor report --incidents [NAME]          crash history (--incident=N dumps one)
-    \\  mandor report --cost                      per-worker resource cost + right-sizing
-    \\  mandor validate [--config=PATH]           check config without running
+    \\  mandor report --incidents [NAME] [--since=DUR]
+    \\                                            crash history (--incident=N dumps one)
+    \\  mandor report --cost [--json]             per-worker resource cost + right-sizing
+    \\  mandor validate [--config=PATH] [-- "CMD" ...]
+    \\                                            check config without running
     \\  mandor --help | --version
     \\
     \\flags:
@@ -270,9 +272,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
-    const state_dir = cfg.state_dir orelse
-        (spawner.findEnv(environ, "MANDOR_STATE_DIR") orelse
-            (file_cfg.state_dir orelse cli.default_state_dir));
+    const state_dir = env.resolveStateDir(
+        cfg.state_dir,
+        spawner.findEnv(environ, "MANDOR_STATE_DIR"),
+        file_cfg.state_dir,
+        cli.default_state_dir,
+    );
 
     if (cfg.mode == .report) {
         if (cfg.cost) return runCostReport(state_dir, cfg.json);

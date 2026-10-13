@@ -1,6 +1,7 @@
 //! Pure resolution of mandor's deploy-varying config from ENV/TOML sources.
 //! No syscalls, no allocation — the caller supplies the already-read values.
-//! Precedence: ENV > TOML > default (no deploy-varying key has a CLI flag). See
+//! Precedence: ENV > TOML > default; state_dir alone also has a CLI flag, which
+//! wins. See
 //! docs/superpowers/specs/2026-08-10-env-config-deploy-varying-keys-design.md.
 
 const std = @import("std");
@@ -41,6 +42,14 @@ pub fn resolveServicePrefix(env_v: ?[]const u8, toml_v: ?[]const u8) []const u8 
     return presentEnv(env_v) orelse toml_v orelse "";
 }
 
+/// Resolve state_dir: CLI `--state-dir` > ENV `MANDOR_STATE_DIR` > TOML >
+/// default. The one deploy-varying key that also has a CLI flag. An empty env
+/// var is ignored like the others — `MANDOR_STATE_DIR=` must not point the
+/// spool, state file and history at "" (relative paths off the cwd).
+pub fn resolveStateDir(cli_v: ?[]const u8, env_v: ?[]const u8, toml_v: ?[]const u8, default: []const u8) []const u8 {
+    return cli_v orelse presentEnv(env_v) orelse toml_v orelse default;
+}
+
 const testing = std.testing;
 
 test "stripScheme drops http/https, leaves bare host:port" {
@@ -71,4 +80,14 @@ test "resolveServicePrefix: ENV > TOML > empty, empty env ignored" {
     // An EMPTY env var must NOT wipe the TOML tenant prefix.
     try testing.expectEqualStrings("t-", resolveServicePrefix("", "t-"));
     try testing.expectEqualStrings("", resolveServicePrefix(null, null));
+}
+
+test "resolveStateDir: CLI > ENV > TOML > default, empty env ignored" {
+    try testing.expectEqualStrings("/c", resolveStateDir("/c", "/e", "/t", "/d"));
+    try testing.expectEqualStrings("/e", resolveStateDir(null, "/e", "/t", "/d"));
+    try testing.expectEqualStrings("/t", resolveStateDir(null, null, "/t", "/d"));
+    try testing.expectEqualStrings("/d", resolveStateDir(null, null, null, "/d"));
+    // An EMPTY env var must NOT replace the TOML dir (or the default) with "".
+    try testing.expectEqualStrings("/t", resolveStateDir(null, "", "/t", "/d"));
+    try testing.expectEqualStrings("/d", resolveStateDir(null, "", null, "/d"));
 }
