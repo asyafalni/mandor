@@ -1554,6 +1554,125 @@ if [ "$starts86" = "1" ] && grep -q "prober 'p'" "$TMP/86out" 2>/dev/null; then
   ok "prober: reports a failing check without ever restarting the worker"
 else bad "prober no-restart" "starts=[$starts86] probed=[$(grep -c "prober 'p'" "$TMP/86out" 2>/dev/null)]"; fi
 
+# 87-88. The daemon's durable incident tier against a photon that answers per
+# bundle. ship_photon.py serves any number of connections: a body carrying
+# REJECTME gets 400 Bad Request (OTLP: a client MUST NOT retry it), anything
+# else 200; each delivered body is appended to the deliveries file.
+cat > "$TMP/ship_photon.py" <<'PY'
+import socket, sys
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(16)
+srv.settimeout(60)
+with open(sys.argv[1], "w") as f:
+    f.write(str(srv.getsockname()[1]))
+out = open(sys.argv[2], "ab")
+while True:
+    try:
+        conn, _ = srv.accept()
+    except Exception:
+        break
+    conn.settimeout(5)
+    buf, clen = b"", 0
+    try:
+        while True:
+            head, sep, body = buf.partition(b"\r\n\r\n")
+            if sep:
+                for line in head.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        clen = int(line.split(b":", 1)[1])
+                if len(body) >= clen:
+                    break
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        if b"REJECTME" in buf:
+            conn.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+        else:
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            out.write(buf.partition(b"\r\n\r\n")[2] + b"\n---FRAME---\n"); out.flush()
+    except Exception:
+        pass
+    conn.close()
+PY
+
+ship_photon_start() {   # $1=tag -> sets $sp_pid, $sp_port; deliveries in $TMP/$1.got
+  rm -f "$TMP/$1.port" "$TMP/$1.got"; : > "$TMP/$1.got"
+  python3 "$TMP/ship_photon.py" "$TMP/$1.port" "$TMP/$1.got" >/dev/null 2>&1 &
+  sp_pid=$!
+  for _ in $(seq 1 100); do [ -s "$TMP/$1.port" ] && break; sleep 0.1; done
+  sp_port=$(cat "$TMP/$1.port" 2>/dev/null)
+}
+
+seed_bundle() {   # $1=dir $2=file $3=verdict marker
+  mkdir -p "$1/incidents"
+  printf '{"v":8,"name":"api","kind":"exit","verdict":"%s"}' "$3" > "$1/incidents/$2"
+}
+
+# 87. A bundle photon rejects (400) must not hold back the incidents behind it.
+# Retrying a 400 forever stopped every spool cycle on it, so a newer incident
+# never shipped for the daemon's whole life.
+ship_photon_start s87
+if [ -z "$sp_port" ]; then bad "photon 400 skip" "listener never bound (harness setup)"
+else
+  seed_bundle "$TMP/st87" "1000-api-1.json" "REJECTME old"
+  seed_bundle "$TMP/st87" "2000-api-2.json" "DELIVERME87 new"
+  MANDOR_STATE_DIR="$TMP/st87" PHOTON_OTLP_HTTP_ENDPOINT="127.0.0.1:$sp_port" \
+    "$MANDOR" "sleep 30" >"$TMP/87out" 2>&1 &
+  mpid=$!
+  for _ in $(seq 1 100); do grep -q DELIVERME87 "$TMP/s87.got" && break; sleep 0.1; done
+  kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+  if grep -q DELIVERME87 "$TMP/s87.got" && grep -q "1000-api-1.json" "$TMP/87out"; then
+    ok "a bundle photon rejects (400) is skipped, and the incident behind it ships"
+  else bad "photon 400 skip" "delivered=$(grep -c DELIVERME87 "$TMP/s87.got") log=$(grep relay "$TMP/87out" | head -2)"; fi
+fi
+kill $sp_pid 2>/dev/null; wait $sp_pid 2>/dev/null
+
+# 88. A delivered incident is not delivered again by the next daemon. The
+# shipped set lived only in memory, so every restart on a persistent state
+# volume re-sent the whole spool (up to 200 bundles) to photon.
+ship_photon_start s88
+if [ -z "$sp_port" ]; then bad "no re-ship after restart" "listener never bound (harness setup)"
+else
+  seed_bundle "$TMP/st88" "1000-api-1.json" "ONCEONLY88"
+  for run in 1 2; do
+    MANDOR_STATE_DIR="$TMP/st88" PHOTON_OTLP_HTTP_ENDPOINT="127.0.0.1:$sp_port" \
+      "$MANDOR" "sleep 30" >"$TMP/88out$run" 2>&1 &
+    mpid=$!
+    # Run 1: until it lands. Run 2: three spool scans (1s each) to re-send it.
+    if [ $run -eq 1 ]; then
+      for _ in $(seq 1 100); do grep -q ONCEONLY88 "$TMP/s88.got" && break; sleep 0.1; done
+    else
+      sleep 3.5
+    fi
+    kill -TERM "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+  done
+  # Count delivered requests carrying the marker, not matches: one OTLP record
+  # holds it twice (the log body and the embedded mandor.bundle).
+  n88=$(python3 -c 'import sys; print(sum(b"ONCEONLY88" in f for f in open(sys.argv[1], "rb").read().split(b"\n---FRAME---\n")))' "$TMP/s88.got")
+  if [ "$n88" -eq 1 ]; then
+    ok "a delivered incident is not re-sent to photon after a restart"
+  else bad "no re-ship after restart" "delivered $n88 times (want 1)"; fi
+fi
+kill $sp_pid 2>/dev/null; wait $sp_pid 2>/dev/null
+
+# 89. The one-shot `mandor relay <bundle>` takes its endpoint from the same
+# PHOTON_OTLP_HTTP_ENDPOINT the supervisor reads (a URL, scheme stripped), not
+# the undocumented PHOTON_OTLP it used to.
+rm -f "$TMP/rport"
+python3 "$TMP/responder.py" "$TMP/rport" accepted >/dev/null 2>&1 &
+rp=$!
+for _ in $(seq 1 100); do [ -s "$TMP/rport" ] && break; sleep 0.1; done
+PHOTON_OTLP_HTTP_ENDPOINT="http://127.0.0.1:$(cat "$TMP/rport" 2>/dev/null)" \
+  timeout 40 "$MANDOR" relay "$TMP/b65.json" >"$TMP/89" 2>&1
+c=$?
+wait $rp 2>/dev/null
+if [ $c -eq 0 ]; then
+  ok "one-shot relay reads PHOTON_OTLP_HTTP_ENDPOINT (URL form)"
+else bad "one-shot relay env endpoint" "exit $c: $(head -2 "$TMP/89")"; fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

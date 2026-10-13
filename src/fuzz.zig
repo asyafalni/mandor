@@ -908,6 +908,27 @@ test "seed valid: relay log batch" {
     try std.testing.expect(std.mem.indexOf(u8, dbody, "mandor.last_ts") != null);
 }
 
+/// The relay daemon's saved delivered-names list (`<state_dir>/relay-shipped`):
+/// one name per line, exactly what saveShipped writes.
+const shipped_seed = "1000-api-1.json\n1000-api-2.json\n2000-worker-3.json\n";
+
+fn shippedTarget(text: []const u8) void {
+    var s: relay.Shipped = .{};
+    relay.parseShipped(&s, text);
+}
+
+test "seed valid: relay shipped list" {
+    var s: relay.Shipped = .{};
+    relay.parseShipped(&s, shipped_seed);
+    try std.testing.expectEqual(@as(usize, 3), s.n);
+}
+
+test "fuzz: relay shipped list survives a mutated file" {
+    var p = prng();
+    const rnd = p.random();
+    for (0..iterations) |_| shippedTarget(mutate(rnd, shipped_seed, &buf));
+}
+
 test "fuzz: relay log encoder survives mutated log lines" {
     var p = prng();
     const rnd = p.random();

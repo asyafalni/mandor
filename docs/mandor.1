@@ -104,6 +104,10 @@ Per-worker resource-cost profiles (see \fBmandor report --cost\fR).
 .I <state-dir>/history.json
 Incident-signature history across restarts and releases (release correlation).
 .TP
+.I <state-dir>/relay-shipped
+Incidents already delivered to photon, so a restart does not send them again
+(only with \fBphoton\fR set).
+.TP
 .I /dev/termination-log
 When present (Kubernetes), receives the latest incident verdict.
 .SH SEE ALSO

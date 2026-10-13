@@ -1,8 +1,8 @@
 //! OTLP to photon. Two entry points: `mandor relay --daemon`, the one
 //! long-lived child the supervisor spawns when `photon` is set (owns the
 //! socket, ships the spool, drains the telemetry pipe), and the one-shot
-//! `mandor relay <bundle.json>` (endpoint from PHOTON_OTLP=host:port, default
-//! 127.0.0.1:4318). The supervisor itself never opens an outbound connection.
+//! `mandor relay <bundle.json> [endpoint]` (else PHOTON_OTLP_HTTP_ENDPOINT,
+//! the same variable the supervisor reads; default 127.0.0.1:4318). The supervisor itself never opens an outbound connection.
 //! Mapping: docs/INTEGRATION-PHOTON.md.
 
 const std = @import("std");
@@ -16,6 +16,7 @@ const hostid = @import("hostid.zig");
 const sampler = @import("sampler.zig");
 const summarize = @import("summarize.zig");
 const otlp = @import("otlp.zig");
+const env = @import("env.zig");
 const proto = @import("nilo_proto");
 
 /// Wall-clock ceiling on each blocking socket call. Generous enough that a
@@ -48,7 +49,12 @@ pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const
 
     var host: u32 = 0x7f000001; // 127.0.0.1
     var port: u16 = 4318;
-    const spec = endpoint_arg orelse spawner.findEnv(environ, "PHOTON_OTLP");
+    // Same source and rules as the supervisor's photon: a URL or host:port,
+    // scheme stripped, an empty variable ignored.
+    const spec = if (endpoint_arg) |a| env.stripScheme(a) else env.resolvePhoton(
+        spawner.findEnv(environ, "PHOTON_OTLP_HTTP_ENDPOINT"),
+        null,
+    );
     if (spec) |s| {
         if (parseHostPort(s)) |hp| {
             host = hp.host;
@@ -68,7 +74,7 @@ pub fn run(path: [*:0]const u8, endpoint_arg: ?[]const u8, environ: [:null]const
     };
     // photon requires a bearer token; inherited env keeps it off /proc cmdline.
     const token = photonToken(environ);
-    return post(host, port, "/v1/logs", body, token);
+    return if (post(host, port, "/v1/logs", body, token) == .ok) 0 else 1;
 }
 
 fn err(msg: []const u8) void {
@@ -568,6 +574,18 @@ fn statusOk(resp: []const u8) bool {
     return resp[9] == '2';
 }
 
+/// A non-2xx that rejects THIS payload, not the endpoint: OTLP/HTTP says a
+/// client MUST NOT retry `400 Bad Request`, and 413 / 422 are the same verdict
+/// on the body. Everything else — 401/403 (token), 404/415 (wrong endpoint or
+/// encoding), 429, 5xx — is photon or its config, which the operator fixes, so
+/// the durable tier keeps retrying those.
+fn rejectedForGood(resp: []const u8) bool {
+    if (resp.len < 12 or !std.mem.startsWith(u8, resp, "HTTP/")) return false;
+    const code = resp[9..12];
+    return std.mem.eql(u8, code, "400") or std.mem.eql(u8, code, "413") or
+        std.mem.eql(u8, code, "422");
+}
+
 /// Does a 2xx response come from a web UI rather than an OTLP receiver? photon's
 /// UI answers `200 OK` with an SPA (`Content-Type: text/html`) for any unknown
 /// path, so a mandor pointed at the UI port (not the OTLP ingest port, e.g. :4318)
@@ -585,11 +603,19 @@ fn looksLikeHtml(resp: []const u8) bool {
 /// (incidents fire per restart — a crash loop must not spam stderr).
 var warned_html_endpoint: bool = false;
 
-fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const u8) u8 {
+const Delivery = enum {
+    ok,
+    /// Not delivered for a reason outside this payload: retry it.
+    retry,
+    /// photon refused this payload itself (`rejectedForGood`): never retry it.
+    rejected,
+};
+
+fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const u8) Delivery {
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (posix.errno(rc) != .SUCCESS) {
         err("socket failed");
-        return 1;
+        return .retry;
     }
     const fd: i32 = @intCast(rc);
     defer _ = linux.close(fd);
@@ -608,7 +634,7 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
     };
     if (posix.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
         err("connect failed — is photon listening?");
-        return 1;
+        return .retry;
     }
     var auth_buf: [300]u8 = undefined;
     const auth: []const u8 = if (token.len > 0)
@@ -620,7 +646,7 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
         path, auth, body.len, body,
     }) catch {
         err("request too large to send");
-        return 1;
+        return .retry;
     };
     var off: usize = 0;
     while (off < req.len) {
@@ -631,11 +657,11 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
             .INTR => continue,
             .AGAIN => {
                 err("send timed out — photon accepted the connection but stopped reading");
-                return 1;
+                return .retry;
             },
             else => {
                 err("send failed");
-                return 1;
+                return .retry;
             },
         }
         off += n;
@@ -646,7 +672,7 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
     const got = linux.read(fd, &resp, resp.len);
     if (posix.errno(got) == .AGAIN) {
         err("photon accepted the connection but never answered (timed out) — see docs/INTEGRATION-PHOTON.md");
-        return 1;
+        return .retry;
     }
     if (posix.errno(got) == .SUCCESS and got > 0) {
         const rslice = resp[0..@min(@as(usize, @intCast(got)), resp.len)];
@@ -656,12 +682,12 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
             // OTLP ingest port: the SPA catch-all 200s and the payload is
             // dropped. Treat that as NOT delivered (so the durable incident tier
             // keeps retrying and nothing is falsely marked shipped) and warn once.
-            if (!looksLikeHtml(rslice)) return 0;
+            if (!looksLikeHtml(rslice)) return .ok;
             if (!warned_html_endpoint) {
                 warned_html_endpoint = true;
                 err("photon answered 200 with an HTML page, not OTLP — the address is likely photon's web UI, not its OTLP ingest port (e.g. :4318). Nothing is being ingested. See docs/INTEGRATION-PHOTON.md");
             }
-            return 1;
+            return .retry;
         }
         // Non-2xx: echo the status line. "did not accept the payload" alone gives
         // the operator nothing to act on, and the most likely cause is a receiver
@@ -671,10 +697,11 @@ fn post(host: u32, port: u16, path: []const u8, body: []const u8, token: []const
         const cut = std.mem.indexOfScalar(u8, line, '\r') orelse line.len;
         err("photon rejected the payload — see docs/INTEGRATION-PHOTON.md");
         err(line[0..cut]);
+        if (rejectedForGood(rslice)) return .rejected;
     } else {
         err("photon rejected the payload (no response) — see docs/INTEGRATION-PHOTON.md");
     }
-    return 1;
+    return .retry;
 }
 
 // ------------------------------------------------------- long-lived daemon
@@ -721,13 +748,19 @@ const dir_cap = spool.max_incidents + 32;
 
 var dir_entries: [dir_cap]spool.DirEntry = undefined;
 
-const Shipped = struct {
+pub const Shipped = struct {
     names: [ship_cap][ship_name_cap]u8 = undefined,
     lens: [ship_cap]u8 = undefined,
     /// Per-cycle mark for the sweep: reset to false, set true for every set
     /// entry still present on disk, then survivors are compacted down.
     present: [ship_cap]bool = undefined,
+    /// Delivered (true) vs skipped (false). Only delivered names are saved, so
+    /// a restarted daemon retries a skipped bundle — after the operator fixes
+    /// photon, it gets another chance.
+    delivered: [ship_cap]bool = undefined,
     n: usize = 0,
+    /// The delivered subset changed since the last save.
+    dirty: bool = false,
 
     fn find(self: *const Shipped, name: []const u8) ?usize {
         var i: usize = 0;
@@ -742,11 +775,23 @@ const Shipped = struct {
     /// silently not tracked — the bundle simply gets re-shipped later (a
     /// duplicate at photon, never a dropped incident).
     fn add(self: *Shipped, name: []const u8) void {
-        if (name.len > ship_name_cap or self.n >= ship_cap) return;
+        self.addAs(name, true);
+    }
+
+    /// Track a bundle passed over this daemon's life, never saved.
+    fn addSkipped(self: *Shipped, name: []const u8) void {
+        self.addAs(name, false);
+    }
+
+    fn addAs(self: *Shipped, name: []const u8, delivered: bool) void {
+        if (name.len == 0 or name.len > ship_name_cap or self.n >= ship_cap) return;
+        if (self.find(name) != null) return;
         @memcpy(self.names[self.n][0..name.len], name);
         self.lens[self.n] = @intCast(name.len);
         self.present[self.n] = true;
+        self.delivered[self.n] = delivered;
         self.n += 1;
+        if (delivered) self.dirty = true;
     }
 
     /// Drop entries not marked present this cycle (their files were pruned),
@@ -755,10 +800,14 @@ const Shipped = struct {
         var w: usize = 0;
         var i: usize = 0;
         while (i < self.n) : (i += 1) {
-            if (!self.present[i]) continue;
+            if (!self.present[i]) {
+                if (self.delivered[i]) self.dirty = true;
+                continue;
+            }
             if (w != i) {
                 @memcpy(self.names[w][0..self.lens[i]], self.names[i][0..self.lens[i]]);
                 self.lens[w] = self.lens[i];
+                self.delivered[w] = self.delivered[i];
             }
             w += 1;
         }
@@ -770,11 +819,66 @@ const ShipResult = enum {
     shipped,
     /// The send failed: photon is down or rejecting. Retry next cycle.
     failed,
-    /// The bundle itself can never encode — unreadable, empty, over the cap,
-    /// or a broken JSON escape. Retrying cannot help, and stopping on it would
-    /// hold back every newer incident, so the caller skips it.
+    /// The bundle itself can never go — unreadable, empty, over the cap, a
+    /// broken JSON escape, or refused by photon as a payload. Retrying cannot
+    /// help, and stopping on it would hold back every newer incident, so the
+    /// caller skips it.
     unshippable,
 };
+
+/// `<state_dir>/relay-shipped`: the delivered names, one per line, so a
+/// restarted daemon does not send the whole spool to photon again. It sits
+/// beside incidents/, not in it — the sidecar watches that directory.
+const shipped_file = "relay-shipped";
+var shipped_text: [ship_cap * (ship_name_cap + 1)]u8 = undefined;
+
+/// Add every name in a saved list as delivered. The file is mandor's own, but
+/// a truncated or hand-edited one must not trap: lines that are empty or too
+/// long are ignored, and a name that is not on disk is swept next cycle.
+pub fn parseShipped(s: *Shipped, text: []const u8) void {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| s.add(line);
+    s.dirty = false; // what was just read is what is on disk
+}
+
+fn loadShipped(s: *Shipped, state_dir: []const u8) void {
+    var path_buf: [640]u8 = undefined;
+    const path = std.mem.printSentinel(&path_buf, "{s}/" ++ shipped_file, .{state_dir}, 0) catch return;
+    const text = readFile(path.ptr) catch return; // absent / empty / oversized: start empty
+    parseShipped(s, text);
+}
+
+/// Write the delivered names atomically (tmp + rename) when they changed. A
+/// failed write leaves the old file; the worst case is a re-send after a
+/// restart, the behavior before this file existed.
+fn saveShipped(s: *Shipped, state_dir: []const u8) void {
+    if (!s.dirty) return;
+    var len: usize = 0;
+    for (0..s.n) |i| {
+        if (!s.delivered[i]) continue;
+        const name = s.names[i][0..s.lens[i]];
+        @memcpy(shipped_text[len..][0..name.len], name);
+        len += name.len;
+        shipped_text[len] = '\n';
+        len += 1;
+    }
+    var path_buf: [640]u8 = undefined;
+    var tmp_buf: [640]u8 = undefined;
+    const path = std.mem.printSentinel(&path_buf, "{s}/" ++ shipped_file, .{state_dir}, 0) catch return;
+    const tmp = std.mem.printSentinel(&tmp_buf, "{s}/." ++ shipped_file ++ ".tmp", .{state_dir}, 0) catch return;
+    const rc = linux.openat(linux.AT.FDCWD, tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (posix.errno(rc) != .SUCCESS) return;
+    const fd: i32 = @intCast(rc);
+    var off: usize = 0;
+    while (off < len) {
+        const w = linux.write(fd, shipped_text[off..].ptr, len - off);
+        if (posix.errno(w) != .SUCCESS or w == 0) break;
+        off += w;
+    }
+    _ = linux.close(fd);
+    if (off != len) return;
+    if (posix.errno(linux.rename(tmp.ptr, path.ptr)) == .SUCCESS) s.dirty = false;
+}
 
 /// Read one bundle, encode it, ship it.
 fn shipOne(spool_dir: []const u8, name: []const u8, host: u32, port: u16, token: []const u8) ShipResult {
@@ -789,7 +893,11 @@ fn shipOne(spool_dir: []const u8, name: []const u8, host: u32, port: u16, token:
         error.TooLarge => "too large for one OTLP record",
         error.Malformed => "malformed JSON string escape",
     });
-    return if (post(host, port, "/v1/logs", body, token) == 0) .shipped else .failed;
+    return switch (post(host, port, "/v1/logs", body, token)) {
+        .ok => .shipped,
+        .retry => .failed,
+        .rejected => skip(name, "photon rejected it (HTTP 400/413/422, not retryable)"),
+    };
 }
 
 /// Say once, on stderr, which bundle is being left out of photon and why. It
@@ -823,7 +931,8 @@ fn shipSpool(shipped: *Shipped, spool_dir: []const u8, host: u32, port: u16, tok
         const name = e.name[0..e.name_len];
         if (shipped.find(name) != null) continue; // already shipped
         switch (shipOne(spool_dir, name, host, port, token)) {
-            .shipped, .unshippable => shipped.add(name),
+            .shipped => shipped.add(name),
+            .unshippable => shipped.addSkipped(name),
             .failed => {
                 // photon is down or rejecting: stop this cycle (one bounded
                 // connect rather than one per bundle), leave the rest for the
@@ -834,6 +943,7 @@ fn shipSpool(shipped: *Shipped, spool_dir: []const u8, host: u32, port: u16, tok
         }
     }
     shipped.sweep();
+    saveShipped(shipped, spool_dir);
     return ok;
 }
 
@@ -1156,6 +1266,7 @@ pub fn runDaemon(
     var next_idle_tick_ms: u64 = monoMs() +| idle_tick_ms;
 
     var shipped: Shipped = .{};
+    loadShipped(&shipped, spool_dir); // what earlier daemons already delivered
     var last_spool_ms: u64 = 0;
 
     while (true) {
@@ -1782,9 +1893,12 @@ test "an unshippable bundle is skipped, not retried forever ahead of the queue" 
     const bad = try std.mem.printSentinel(&bad_buf, "{s}/1000-api-1.json", .{inc}, 0);
     var good_buf: [200]u8 = undefined;
     const good = try std.mem.printSentinel(&good_buf, "{s}/2000-api-2.json", .{inc}, 0);
+    var saved_buf: [200]u8 = undefined;
+    const saved = try std.mem.printSentinel(&saved_buf, "{s}/" ++ shipped_file, .{dir}, 0);
     defer {
         _ = linux.unlinkat(linux.AT.FDCWD, bad.ptr, 0);
         _ = linux.unlinkat(linux.AT.FDCWD, good.ptr, 0);
+        _ = linux.unlinkat(linux.AT.FDCWD, saved.ptr, 0);
         _ = linux.unlinkat(linux.AT.FDCWD, inc.ptr, linux.AT.REMOVEDIR);
         _ = linux.unlinkat(linux.AT.FDCWD, dir.ptr, linux.AT.REMOVEDIR);
     }
@@ -1802,6 +1916,70 @@ test "an unshippable bundle is skipped, not retried forever ahead of the queue" 
     _ = linux.unlinkat(linux.AT.FDCWD, good.ptr, 0);
     var only_bad: Shipped = .{};
     try testing.expect(shipSpool(&only_bad, dir, 0x7f000001, 1, ""));
+    // A skipped bundle is never saved as delivered: a restarted daemon (after
+    // the operator fixes photon) gets to try it again.
+    try testing.expect(readFile(saved.ptr) == error.Unreadable);
+}
+
+test "rejectedForGood: only payload verdicts, never endpoint or outage" {
+    try testing.expect(rejectedForGood("HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(rejectedForGood("HTTP/1.1 413 Payload Too Large\r\n"));
+    try testing.expect(rejectedForGood("HTTP/1.1 422 Unprocessable\r\n"));
+    // Token, endpoint, encoding, throttling and outages stay retryable.
+    for ([_][]const u8{ "401", "403", "404", "415", "429", "500", "502", "503" }) |c| {
+        var buf: [32]u8 = undefined;
+        const resp = try std.fmt.bufPrint(&buf, "HTTP/1.1 {s} X\r\n", .{c});
+        try testing.expect(!rejectedForGood(resp));
+    }
+    try testing.expect(!rejectedForGood("garbage 400 response"));
+    try testing.expect(!rejectedForGood("HTTP/1.1 4"));
+}
+
+test "shipped set: delivered names survive a save and load, skipped ones do not" {
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.mem.printSentinel(&dir_buf, "/tmp/mandor-shipped-{d}", .{linux.getpid()}, 0);
+    _ = linux.mkdirat(linux.AT.FDCWD, dir.ptr, 0o755);
+    var saved_buf: [200]u8 = undefined;
+    const saved = try std.mem.printSentinel(&saved_buf, "{s}/" ++ shipped_file, .{dir}, 0);
+    defer {
+        _ = linux.unlinkat(linux.AT.FDCWD, saved.ptr, 0);
+        _ = linux.unlinkat(linux.AT.FDCWD, dir.ptr, linux.AT.REMOVEDIR);
+    }
+
+    var a: Shipped = .{};
+    a.add("100-api-1.json");
+    a.addSkipped("150-api-x.json");
+    a.add("200-api-2.json");
+    saveShipped(&a, dir);
+    try testing.expect(!a.dirty);
+
+    var b: Shipped = .{};
+    loadShipped(&b, dir);
+    try testing.expectEqual(@as(usize, 2), b.n);
+    try testing.expect(b.find("100-api-1.json") != null);
+    try testing.expect(b.find("200-api-2.json") != null);
+    try testing.expect(b.find("150-api-x.json") == null); // skipped: retried next life
+
+    // A pruned bundle falls out of the saved list on the next save.
+    for (b.present[0..b.n]) |*p| p.* = false;
+    if (b.find("200-api-2.json")) |i| b.present[i] = true;
+    b.sweep();
+    try testing.expect(b.dirty);
+    saveShipped(&b, dir);
+    var c: Shipped = .{};
+    loadShipped(&c, dir);
+    try testing.expectEqual(@as(usize, 1), c.n);
+}
+
+test "parseShipped tolerates a damaged file" {
+    var s: Shipped = .{};
+    const junk: [ship_name_cap + 10]u8 = @splat('n');
+    var text_buf: [256]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, "a.json\n\n\n{s}\nb.json", .{&junk});
+    parseShipped(&s, text);
+    try testing.expectEqual(@as(usize, 2), s.n); // empty and over-long lines dropped
+    try testing.expect(s.find("b.json") != null); // last line needs no newline
+    try testing.expect(!s.dirty);
 }
 
 test "buildOtlpEvent renders body, severity, and service.name" {

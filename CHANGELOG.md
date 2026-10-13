@@ -3,6 +3,26 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+### Fixed
+- **A bundle photon rejects no longer holds back the incidents behind it.** Any non-2xx used to
+  stop the spool cycle and retry, so a payload photon refuses for good (400 / 413 / 422 — OTLP
+  says a client MUST NOT retry a 400) blocked every newer incident and logged the rejection every
+  second. It is now skipped with one stderr line. 401/403 (token), 404/415 (endpoint), 429 and
+  5xx are photon or its config and still retry.
+- **Restarts no longer re-send the whole spool to photon.** The set of delivered incidents lived
+  only in memory, so each restart on a persistent state volume re-sent up to 200 bundles (every
+  crash-loop iteration, in Kubernetes). Delivered names are now kept in `<state_dir>/relay-shipped`
+  (atomic write, beside `incidents/`, never in it). Skipped bundles are not saved, so a restart
+  after photon is fixed retries them.
+- The one-shot `mandor relay <bundle>` reads its endpoint from `PHOTON_OTLP_HTTP_ENDPOINT` (URL or
+  host:port), like the supervisor, instead of the undocumented `PHOTON_OTLP`.
+
+### Changed
+- CI and release workflows move to the current major of every action (Node 24 runtime); builds use
+  Zig 0.17's `-Doptimize=safe` spelling (`ReleaseSafe` is deprecated after 0.18).
+
 ## [1.17.1] - 2026-10-13
 
 ### Fixed
