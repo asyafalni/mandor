@@ -76,7 +76,7 @@ test "finalize dedups with a -N suffix" {
 
 test "finalize caps a long base leaving room for the suffix" {
     var buf: [cap]u8 = undefined;
-    const long = "a" ** 40;
+    const long = &@as([40]u8, @splat('a'));
     const out = finalize(long, &.{}, &buf);
     try t.expectEqual(@as(usize, cap - 4), out.len); // 28
 }

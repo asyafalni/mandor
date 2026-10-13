@@ -17,9 +17,9 @@ pub const idle_threshold_pct: u16 = 5;
 /// One worker's accumulated cost profile. ~400 bytes; lives in a parallel
 /// array (NOT the Worker struct, which resets on restart — cost is lifetime).
 pub const Profile = struct {
-    rss_idle: [buckets]u32 = .{0} ** buckets, // RSS histogram, idle samples
-    rss_active: [buckets]u32 = .{0} ** buckets, // RSS histogram, active samples
-    cpu_active: [buckets]u32 = .{0} ** buckets, // CPU histogram, active samples
+    rss_idle: [buckets]u32 = @splat(0), // RSS histogram, idle samples
+    rss_active: [buckets]u32 = @splat(0), // RSS histogram, active samples
+    cpu_active: [buckets]u32 = @splat(0), // CPU histogram, active samples
     peak_rss_kb: u64 = 0,
     peak_cpu_pct: u16 = 0,
     peak_fds: u16 = 0,
@@ -304,7 +304,7 @@ pub fn serialize() ?[]const u8 {
 
 pub fn readState(state_dir: []const u8) ?[]const u8 {
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/cost.json", .{state_dir}) catch return null;
+    const path = std.mem.printSentinel(&path_buf, "{s}/cost.json", .{state_dir}, 0) catch return null;
     const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
     if (posix.errno(rc) != .SUCCESS) return null;
     const fd: i32 = @intCast(rc);
@@ -340,8 +340,8 @@ pub fn save(state_dir: []const u8) void {
     };
     var path_buf: [512]u8 = undefined;
     var tmp_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/cost.json", .{state_dir}) catch return;
-    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/.cost.tmp", .{state_dir}) catch return;
+    const path = std.mem.printSentinel(&path_buf, "{s}/cost.json", .{state_dir}, 0) catch return;
+    const tmp = std.mem.printSentinel(&tmp_buf, "{s}/.cost.tmp", .{state_dir}, 0) catch return;
     const rc = linux.openat(linux.AT.FDCWD, tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     if (posix.errno(rc) != .SUCCESS) return;
     const fd: i32 = @intCast(rc);
@@ -422,9 +422,9 @@ test "a full worker table still serializes and round-trips" {
         p.rss_kb_ms = std.math.maxInt(u64);
         p.first_ms = std.math.maxInt(u64);
         p.last_ms = std.math.maxInt(u64);
-        p.rss_idle = .{std.math.maxInt(u32)} ** buckets;
-        p.rss_active = .{std.math.maxInt(u32)} ** buckets;
-        p.cpu_active = .{std.math.maxInt(u32)} ** buckets;
+        p.rss_idle = @splat(std.math.maxInt(u32));
+        p.rss_active = @splat(std.math.maxInt(u32));
+        p.cpu_active = @splat(std.math.maxInt(u32));
     }
 
     const json = serialize();

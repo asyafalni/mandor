@@ -230,7 +230,7 @@ fn applyConfig(
 /// spawning anything, then report. Exit 0 = config is sound.
 pub fn validate(cfg: *const cli.Config) u8 {
     const workers = workers_buf[0..cfg.commands.len];
-    var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
+    var dep_of: [cli.max_workers]?u8 = @splat(null);
     var oneshot_count: usize = 0;
     if (applyConfig(cfg, workers, &dep_of, &oneshot_count)) |code| {
         logmod.print("[mandor] config invalid\n", .{});
@@ -363,7 +363,7 @@ fn wipeSecrets() void {
 
 pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const ?[*:0]const u8) u8 {
     const workers = workers_buf[0..cfg.commands.len];
-    var dep_of: [cli.max_workers]?u8 = .{null} ** cli.max_workers;
+    var dep_of: [cli.max_workers]?u8 = @splat(null);
     var oneshot_count: usize = 0;
     if (applyConfig(cfg, workers, &dep_of, &oneshot_count)) |code| return code;
     printPlan(cfg, workers, &dep_of);
@@ -412,7 +412,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         digest_threshold = cfg.logs.digest_threshold;
     }
 
-    var waiting: [cli.max_workers]bool = .{false} ** cli.max_workers;
+    var waiting: [cli.max_workers]bool = @splat(false);
 
     var sd: Shutdown = .{};
     const run_start_ms = nowMs();
@@ -721,9 +721,9 @@ fn applyHealthStart(w: *spawner.Worker, v: []const u8) bool {
     return true;
 }
 fn applyExpected(w: *spawner.Worker, v: []const u8) bool {
-    var set = [1]bool{true} ++ [1]bool{false} ** 255;
+    var set = [1]bool{true} ++ @as([255]bool, @splat(false));
     if (!cli.parseExpectedExit(v, &set)) return false; // reject junk at startup
-    w.expected_bits = .{0} ** 32;
+    w.expected_bits = @splat(0);
     for (set, 0..) |ok, code| {
         if (ok) w.expected_bits[code >> 3] |= @as(u8, 1) << @intCast(code & 7);
     }
@@ -1852,15 +1852,15 @@ test "prober on_fail=incident spools exactly once per cooldown window; on_fail=r
         const n = spool.listIncidents(state_dir, &out, .newest);
         for (out[0..n]) |*e| {
             var pb: [256]u8 = undefined;
-            const pp = std.fmt.bufPrintZ(&pb, "{s}/incidents/{s}", .{ state_dir, e.name[0..e.name_len] }) catch continue;
+            const pp = std.mem.printSentinel(&pb, "{s}/incidents/{s}", .{ state_dir, e.name[0..e.name_len] }, 0) catch continue;
             _ = linux.unlinkat(linux.AT.FDCWD, pp.ptr, 0);
         }
         var ib: [160]u8 = undefined;
-        if (std.fmt.bufPrintZ(&ib, "{s}/incidents", .{state_dir})) |ip|
+        if (std.mem.printSentinel(&ib, "{s}/incidents", .{state_dir}, 0)) |ip|
             _ = linux.unlinkat(linux.AT.FDCWD, ip.ptr, linux.AT.REMOVEDIR)
         else |_| {}
         var db: [160]u8 = undefined;
-        if (std.fmt.bufPrintZ(&db, "{s}", .{state_dir})) |dp|
+        if (std.mem.printSentinel(&db, "{s}", .{state_dir}, 0)) |dp|
             _ = linux.unlinkat(linux.AT.FDCWD, dp.ptr, linux.AT.REMOVEDIR)
         else |_| {}
     }
@@ -1974,7 +1974,7 @@ test "prober scheduling: runProbers spawns a due probe and advances next_ms by i
 
     // Clean up the real child directly — reap/threshold behavior is covered
     // by the tests above, this one is only about the schedule.
-    var st: u32 = 0;
+    var st: i32 = 0;
     var tries: u32 = 0;
     while (tries < 5000) : (tries += 1) {
         const rc = linux.waitpid(pid, &st, linux.W.NOHANG);
@@ -2008,7 +2008,7 @@ test "prober scheduling: a probe still running past timeout_ms is SIGKILLed" {
 
     runProbers(&cfg, t0 +| 5_000, envp, ""); // well past timeout_ms=50 -> SIGKILL
 
-    var st: u32 = 0;
+    var st: i32 = 0;
     var reaped = false;
     var tries: u32 = 0;
     while (tries < 5000 and !reaped) : (tries += 1) {
@@ -2016,6 +2016,6 @@ test "prober scheduling: a probe still running past timeout_ms is SIGKILLed" {
         if (posix.errno(rc) == .SUCCESS and rc == pid) reaped = true else testSleepMs(1);
     }
     try testing.expect(reaped);
-    try testing.expect(linux.W.IFSIGNALED(st)); // killed, never exited cleanly
+    try testing.expect(linux.W.IFSIGNALED(@bitCast(st))); // killed, never exited cleanly
     prober_state[0].pid = 0;
 }

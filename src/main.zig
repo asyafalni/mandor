@@ -316,9 +316,9 @@ var incident_entries: [256]@import("spool.zig").DirEntry = undefined;
 /// restarts when the state dir is a mounted volume).
 fn readIncidentFile(state_dir: []const u8, e: *const @import("spool.zig").DirEntry) ?[]const u8 {
     var path_buf: [640]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
+    const path = std.mem.printSentinel(&path_buf, "{s}/incidents/{s}", .{
         state_dir, e.name[0..e.name_len],
-    }) catch return null;
+    }, 0) catch return null;
     return @import("report.zig").readWhole(path.ptr, &report_read_buf) catch |err| {
         if (err == error.TooLarge) {
             logmod.print("[mandor] incident file is larger than {d}KB — refusing to print a truncated bundle\n", .{report_read_buf.len / 1024});
@@ -382,7 +382,7 @@ fn runIncidentList(state_dir: []const u8, filter: ?[]const u8, since_ms: ?u64, i
 
 fn readSmallFile(path: []const u8, buf: []u8) ?[]const u8 {
     var path_buf: [512]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
+    const path_z = std.mem.printSentinel(&path_buf, "{s}", .{path}, 0) catch return null;
     return @import("report.zig").readWhole(path_z.ptr, buf) catch null;
 }
 

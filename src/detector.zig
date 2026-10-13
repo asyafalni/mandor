@@ -45,7 +45,7 @@ pub const StallState = struct {
 };
 
 pub const State = struct {
-    death_times: [restart_loop_threshold]u64 = .{0} ** restart_loop_threshold,
+    death_times: [restart_loop_threshold]u64 = @splat(0),
     death_next: u8 = 0,
     loop_fired_at_ms: u64 = 0,
     leak_fired_at_ms: u64 = 0,

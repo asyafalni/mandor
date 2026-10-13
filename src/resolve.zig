@@ -265,7 +265,7 @@ test "buildQuery encodes a well-formed A question" {
     try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, q[28..30], .big)); // IN
 
     // A label over 63 bytes, an empty label, and an oversize buffer are refused.
-    try testing.expect(buildQuery(&buf, "a" ** 64, 1) == null);
+    try testing.expect(buildQuery(&buf, &@as([64]u8, @splat('a')), 1) == null);
     try testing.expect(buildQuery(&buf, "a..b", 1) == null);
     var tiny: [8]u8 = undefined;
     try testing.expect(buildQuery(&tiny, "photon", 1) == null);

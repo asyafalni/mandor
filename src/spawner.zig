@@ -106,7 +106,7 @@ pub const Worker = struct {
     /// (32 bytes). Keeping the parse out of the death path matters: inlining
     /// the string parser into the supervision loop cost ~20 KB of .text.
     /// `expected_set = false` means fall back to the global set.
-    expected_bits: [32]u8 = .{0} ** 32,
+    expected_bits: [32]u8 = @splat(0),
     expected_set: bool = false,
     /// Set when mandor TERMs a worker for failing its health probe. The death
     /// that follows is a failure regardless of the exit code it reports.
@@ -246,7 +246,7 @@ pub fn spawnPreStop(
     const rc = linux.fork();
     if (posix.errno(rc) != .SUCCESS) return false;
     if (rc == 0) {
-        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(posix.SIG.KILL), 0, 0, 0);
         if (linux.getppid() != supervisor_pid) linux.exit(1);
         const empty = posix.sigemptyset();
         posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
@@ -323,7 +323,7 @@ pub fn spawnCheck(
     if (posix.errno(rc) != .SUCCESS) return false;
     if (rc == 0) {
         // Probes die with the supervisor — hard, they hold no state.
-        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(posix.SIG.KILL), 0, 0, 0);
         if (linux.getppid() != supervisor_pid) linux.exit(1);
         const empty = posix.sigemptyset();
         posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
@@ -367,7 +367,7 @@ pub fn spawnCheckArgv(
     if (posix.errno(rc) != .SUCCESS) return 0;
     if (rc == 0) {
         // Probes die with the supervisor — hard, they hold no state.
-        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(posix.SIG.KILL), 0, 0, 0);
         if (linux.getppid() != supervisor_pid) linux.exit(1);
         const empty = posix.sigemptyset();
         posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
@@ -402,7 +402,7 @@ fn killAndReap(pid: i32) u8 {
     posix.kill(pid, .KILL) catch {};
     var tries: u32 = 0;
     while (tries < 2000) : (tries += 1) {
-        var st: u32 = 0;
+        var st: i32 = 0;
         const wrc = linux.waitpid(pid, &st, linux.W.NOHANG);
         if (posix.errno(wrc) != .SUCCESS or wrc == pid) break;
         sleepMs(1);
@@ -436,7 +436,7 @@ pub fn runCheck(
     if (posix.errno(rc) != .SUCCESS) return 255;
     if (rc == 0) {
         // Dies with the supervisor — it holds no state worth draining.
-        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.KILL), 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(posix.SIG.KILL), 0, 0, 0);
         if (linux.getppid() != supervisor_pid) linux.exit(1);
         const empty = posix.sigemptyset();
         posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
@@ -460,16 +460,16 @@ pub fn runCheck(
         _ = linux.close(pidfd);
         if (pr == 0) return killAndReap(pid); // timed out
         // Ready ⇒ the child has exited; a blocking reap returns immediately.
-        var st: u32 = 0;
+        var st: i32 = 0;
         _ = linux.waitpid(pid, &st, 0);
-        if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
+        if (linux.W.IFEXITED(@bitCast(st))) return linux.W.EXITSTATUS(@bitCast(st));
         return 255; // signaled/abnormal
     }
 
     // Fallback (no pidfd): bounded waitpid poll, as before.
     const deadline = monoMs() +| timeout_ms;
     while (true) {
-        var st: u32 = 0;
+        var st: i32 = 0;
         const wrc = linux.waitpid(pid, &st, linux.W.NOHANG);
         switch (posix.errno(wrc)) {
             .SUCCESS => {},
@@ -477,7 +477,7 @@ pub fn runCheck(
             else => return 255, // fail-closed
         }
         if (wrc == pid) {
-            if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
+            if (linux.W.IFEXITED(@bitCast(st))) return linux.W.EXITSTATUS(@bitCast(st));
             return 255;
         }
         if (monoMs() >= deadline) return killAndReap(pid);
@@ -583,13 +583,13 @@ pub fn findPath(environ: [:null]const ?[*:0]const u8) []const u8 {
 pub fn onPath(name: []const u8, path_env: []const u8) bool {
     var cand: [4200]u8 = undefined;
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        const p = std.fmt.bufPrintZ(&cand, "{s}", .{name}) catch return false;
+        const p = std.mem.printSentinel(&cand, "{s}", .{name}, 0) catch return false;
         return posix.errno(linux.faccessat(linux.AT.FDCWD, p.ptr, 1, 0)) == .SUCCESS; // X_OK
     }
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
         if (dir.len == 0 or dir.len + 1 + name.len + 1 > cand.len) continue;
-        const path = std.fmt.bufPrintZ(&cand, "{s}/{s}", .{ dir, name }) catch continue;
+        const path = std.mem.printSentinel(&cand, "{s}/{s}", .{ dir, name }, 0) catch continue;
         if (posix.errno(linux.faccessat(linux.AT.FDCWD, path.ptr, 1, 0)) == .SUCCESS) return true; // X_OK
     }
     return false;
@@ -629,7 +629,7 @@ pub fn spawn(
         // Child: if the supervisor dies unexpectedly (non-PID-1 use), take
         // the worker down with it — no orphans. Guard the classic race:
         // parent may already be gone before prctl lands.
-        _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(posix.SIG.TERM), 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(posix.SIG.TERM), 0, 0, 0);
         if (linux.getppid() != supervisor_pid) linux.exit(1);
         // Own process group so signals reach shell-spawned grandchildren
         // too (dumb-init behavior), then route stdout/stderr into the
@@ -745,7 +745,7 @@ fn resolveExe(w: *Worker, path_env: []const u8) void {
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
         if (dir.len == 0 or dir.len + 1 + argv0.len + 1 > cand.len) continue;
-        const path = std.fmt.bufPrintZ(&cand, "{s}/{s}", .{ dir, argv0 }) catch continue;
+        const path = std.mem.printSentinel(&cand, "{s}/{s}", .{ dir, argv0 }, 0) catch continue;
         if (posix.errno(linux.faccessat(linux.AT.FDCWD, path.ptr, 1, 0)) == .SUCCESS) { // X_OK
             const len = @min(path.len, w.exe_buf.len);
             @memcpy(w.exe_buf[0..len], path[0..len]);
@@ -769,7 +769,7 @@ var merged_env: [513 + 17 + 1 + cli.max_secrets]?[*:0]const u8 = undefined;
 var worker_env_buf: [16 + name_cap + 1]u8 = undefined;
 
 fn fmtWorkerEnv(name: []const u8, out: []u8) ?[:0]const u8 {
-    return std.fmt.bufPrintZ(out, "MANDOR_WORKER={s}", .{name}) catch null;
+    return std.mem.printSentinel(out, "MANDOR_WORKER={s}", .{name}, 0) catch null;
 }
 
 fn mergeEnv(envp: [*:null]const ?[*:0]const u8, w: *const Worker, nsec: usize) [*:null]const ?[*:0]const u8 {
@@ -813,7 +813,7 @@ var secret_n: usize = 0; // secrets delivered this spawn (also prepSecrets' retu
 /// (no syscalls) so the env formatting is testable without a pipe. Returns null
 /// on overflow — the caller treats that as a skip (fail-closed), never a panic.
 fn fmtFdEnv(env: []const u8, fd: i32, out: []u8) ?[:0]const u8 {
-    return std.fmt.bufPrintZ(out, "{s}={d}", .{ env, fd }) catch null;
+    return std.mem.printSentinel(out, "{s}={d}", .{ env, fd }, 0) catch null;
 }
 
 /// Write `bytes` in full to `fd`. Handles short writes; false on any error or a
@@ -893,17 +893,17 @@ fn applyHardening(w: *const Worker) void {
     if (w.drop_all_caps) {
         var b: u8 = 0;
         while (b <= caps.last_cap) : (b += 1) {
-            _ = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), b, 0, 0, 0);
+            _ = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), b, 0, 0, 0);
         }
     } else if (w.cap_drop_mask != 0) {
         var b: u6 = 0;
         while (b < 64) : (b += 1) {
             if (w.cap_drop_mask & (@as(u64, 1) << b) != 0)
-                _ = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), b, 0, 0, 0);
+                _ = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), b, 0, 0, 0);
         }
     }
     if (w.drop_uid != null or w.drop_all_caps or w.cap_drop_mask != 0)
-        _ = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
 }
 
 fn closePair(pair: ?capture.PipePair) void {
@@ -1038,7 +1038,7 @@ test "name override rejects empty and all-invalid" {
     setName(&w, "./worker", &.{});
     try std.testing.expect(!setNameOverride(&w, "", &.{})); // empty
     try std.testing.expect(!setNameOverride(&w, "\"\\\t", &.{})); // all neutralize
-    const too_long = "x" ** (name_cap - 3);
+    const too_long = &@as([name_cap - 3]u8, @splat('x'));
     try std.testing.expect(!setNameOverride(&w, too_long, &.{})); // too long
     // A rejected override never touched the derived name.
     try std.testing.expectEqualStrings("worker", w.nameSlice());
@@ -1068,7 +1068,7 @@ test "fmtWorkerEnv names the worker for whoever inherits its environment" {
     try std.testing.expectEqualStrings("MANDOR_WORKER=api-2", s);
     try std.testing.expectEqual(@as(u8, 0), buf[s.len]);
     // The longest name mandor can produce still fits.
-    const long = "a" ** name_cap;
+    const long = &@as([name_cap]u8, @splat('a'));
     try std.testing.expect(fmtWorkerEnv(long, &buf) != null);
 }
 

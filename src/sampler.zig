@@ -130,7 +130,7 @@ fn readFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
 }
 
 fn countFds(pid: i32, path_buf: *[64]u8) u16 {
-    const path = std.fmt.bufPrintZ(path_buf, "/proc/{d}/fd", .{pid}) catch return 0;
+    const path = std.mem.printSentinel(path_buf, "/proc/{d}/fd", .{pid}, 0) catch return 0;
     const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{ .DIRECTORY = true }, 0);
     if (posix.errno(rc) != .SUCCESS) return 0;
     const fd: i32 = @intCast(rc);
@@ -176,7 +176,7 @@ pub fn readPsi() Psi {
 pub fn sample(window: *Window, pid: i32, now_ms: u64, psi: Psi) void {
     var path_buf: [64]u8 = undefined;
     var stat_buf: [1024]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return;
+    const path = std.mem.printSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return;
     const text = readFile(path.ptr, &stat_buf) orelse return;
     const fields = parseStat(text) orelse return;
 

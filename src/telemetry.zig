@@ -67,24 +67,24 @@ pub fn spawnDaemon(
     var ep_buf: [96]u8 = undefined;
     var sd_buf: [512]u8 = undefined;
     var sp_buf: [96]u8 = undefined;
-    const fd_str = std.fmt.bufPrintZ(&fd_buf, "{d}", .{read_fd}) catch {
+    const fd_str = std.mem.printSentinel(&fd_buf, "{d}", .{read_fd}, 0) catch {
         _ = linux.close(read_fd);
         _ = linux.close(write_end);
         return;
     };
-    const ep_str = std.fmt.bufPrintZ(&ep_buf, "{s}", .{endpoint}) catch {
+    const ep_str = std.mem.printSentinel(&ep_buf, "{s}", .{endpoint}, 0) catch {
         _ = linux.close(read_fd);
         _ = linux.close(write_end);
         return;
     };
-    const sd_str = std.fmt.bufPrintZ(&sd_buf, "{s}", .{state_dir}) catch {
+    const sd_str = std.mem.printSentinel(&sd_buf, "{s}", .{state_dir}, 0) catch {
         _ = linux.close(read_fd);
         _ = linux.close(write_end);
         return;
     };
     // Service prefix as one trailing argv string (the origin tag, "" = none).
     // Capped upstream (cli.max_service_prefix) so it always fits sp_buf.
-    const sp_str = std.fmt.bufPrintZ(&sp_buf, "{s}", .{service_prefix}) catch {
+    const sp_str = std.mem.printSentinel(&sp_buf, "{s}", .{service_prefix}, 0) catch {
         _ = linux.close(read_fd);
         _ = linux.close(write_end);
         return;
@@ -329,7 +329,7 @@ pub fn shutdown(budget_ms: u64) void {
     posix.kill(daemon_pid, .TERM) catch {};
     var waited: u64 = 0;
     while (waited < budget_ms) {
-        var st: u32 = undefined;
+        var st: i32 = undefined;
         const rc = linux.waitpid(daemon_pid, &st, linux.W.NOHANG);
         if (posix.errno(rc) == .SUCCESS and rc != 0) {
             daemon_pid = 0;

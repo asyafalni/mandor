@@ -5,7 +5,7 @@ features is high, but fixes, tests, parsers, and docs are always welcome.
 
 ## Build & test
 
-Requires [Zig 0.16.0](https://ziglang.org/download/#release-0.16.0) exactly
+Requires [Zig 0.17.0](https://ziglang.org/download/#release-0.17.0) exactly
 (pinned in `.zigversion`).
 
 ```console
@@ -180,13 +180,13 @@ mutator from byte flips (1-in-5 detection) to a boundary-value dictionary plus
 a structured ELF generator (8-in-8).
 
 Note: coverage-guided `zig build test --fuzz` is unusable on the pinned Zig
-0.16.0 (its fuzz-mode test runner fails to compile with error tracing on, and
-instruments zero PCs with it off), which is why the harness is in-repo.
+(0.16.0, re-checked on 0.17.0: its fuzz-mode test runner fails to compile with
+error tracing on, and instruments zero PCs with it off), which is why the harness is in-repo.
 
 ## Ground rules
 
 - **Size is a feature.** The stripped ReleaseSafe binary must stay under
-  500 KB (CI gates it, per-commit); it currently sits near ~359 KB (the opt-in
+  500 KB (CI gates it, per-commit); it currently sits near ~334 KB (the opt-in
   telemetry / node + GPU metrics subsystem is most of the growth since 1.6). A
   new dependency or a large `std` pull-in needs a very good story.
 - **PID 1 must not die.** No panics on the supervision path; every syscall

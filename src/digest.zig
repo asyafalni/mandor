@@ -55,7 +55,7 @@ pub const Entry = struct {
 
 // --------------------------------------------------------- module-level state
 
-var entries: [max_sigs]Entry = [_]Entry{.{}} ** max_sigs;
+var entries: [max_sigs]Entry = @splat(.{});
 var live: usize = 0;
 /// Distinct-signature lines that arrived while the table was full — the
 /// "+N more warn/error lines" bucket. Counted, never dropped silently.
@@ -256,8 +256,8 @@ test "digest: table-full flood collapses to overflow, live entries still update"
 
 test "digest: over-cap name and line are stored truncated" {
     clear();
-    const long_name = "n" ** (name_cap + 50);
-    const long_line = "L" ** (sample_cap + 100); // digit-free
+    const long_name = &@as([name_cap + 50]u8, @splat('n'));
+    const long_line = &@as([sample_cap + 100]u8, @splat('L')); // digit-free
     record(long_name, 2, 5, long_line);
 
     const e = get(0);

@@ -163,7 +163,7 @@ var file_buf: [16 * 1024]u8 = undefined;
 
 pub fn load(state_dir: []const u8) void {
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/history.json", .{state_dir}) catch return;
+    const path = std.mem.printSentinel(&path_buf, "{s}/history.json", .{state_dir}, 0) catch return;
     const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
     if (posix.errno(rc) != .SUCCESS) return;
     const fd: i32 = @intCast(rc);
@@ -189,8 +189,8 @@ pub fn save(state_dir: []const u8) void {
     const json = serialize(&file_buf) orelse return;
     var path_buf: [512]u8 = undefined;
     var tmp_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/history.json", .{state_dir}) catch return;
-    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/.history.tmp", .{state_dir}) catch return;
+    const path = std.mem.printSentinel(&path_buf, "{s}/history.json", .{state_dir}, 0) catch return;
+    const tmp = std.mem.printSentinel(&tmp_buf, "{s}/.history.tmp", .{state_dir}, 0) catch return;
     const rc = linux.openat(linux.AT.FDCWD, tmp.ptr, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,

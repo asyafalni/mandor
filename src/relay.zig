@@ -1161,7 +1161,7 @@ const Shipped = struct {
 /// Read one bundle, encode it, ship it. Returns true only on a 2xx.
 fn shipOne(spool_dir: []const u8, name: []const u8, host: u32, port: u16, token: []const u8) bool {
     var path_buf: [640]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{ spool_dir, name }) catch return false;
+    const path = std.mem.printSentinel(&path_buf, "{s}/incidents/{s}", .{ spool_dir, name }, 0) catch return false;
     const bundle = readFile(path.ptr) catch return false;
     const body = buildOtlp(bundle) catch return false;
     return post(host, port, "/v1/logs", body, token) == 0;
@@ -1968,7 +1968,7 @@ test "log batch refuses lines once the arena is full" {
     // log_arena — a safe-mode trap — so this test pins that bound. The accepted
     // prefix must still encode cleanly, proving the arena copies are intact.
     resetLogBatch();
-    const big = "y" ** 4000;
+    const big = &@as([4000]u8, @splat('y'));
     var added: usize = 0;
     var refused = false;
     var i: usize = 0;
@@ -2069,7 +2069,7 @@ test "digest batch refuses entries once the arena is full" {
     // the "arena can't fit → refuse" check would let batchDigest's @memcpy run off
     // log_arena. The accepted prefix must still encode (with its digest ints).
     resetLogBatch();
-    const big = "y" ** 4000;
+    const big = &@as([4000]u8, @splat('y'));
     var added: usize = 0;
     var refused = false;
     var i: usize = 0;
@@ -2180,7 +2180,7 @@ test "buildOtlpEvents truncates the batch at the first un-renderable event" {
     // only the events already counted (ephemeral "drop the rest"). This locks in
     // the partial-batch accounting: pass 2 writes exactly nfit events and the
     // w.pos == total assert must still hold (a divergence would panic here).
-    const huge = "x" ** 250; // "worker " ++ huge ++ " started" > 256 → TooLarge
+    const huge = &@as([250]u8, @splat('x')); // "worker " ++ huge ++ " started" > 256 → TooLarge
     const evs = [_]frame.Lifecycle{
         .{ .name = "api", .ev = .started, .t_unix_ns = 1_700_000_000_000_000_000 },
         .{ .name = huge, .ev = .started, .t_unix_ns = 1_700_000_000_000_000_001 },
@@ -2291,7 +2291,7 @@ test "empty service_prefix leaves service.name byte-identical (bare name)" {
 }
 
 test "setServicePrefix clamps an over-long prefix to the cap" {
-    const long = "p" ** (service_prefix_cap + 10);
+    const long = &@as([service_prefix_cap + 10]u8, @splat('p'));
     setServicePrefix(long);
     defer setServicePrefix("");
     // Copied into the fixed BSS buffer, clamped — never overflows, never traps.

@@ -7,8 +7,8 @@
 //! panics**. Return values are deliberately ignored.
 //!
 //! Why not `std.testing.fuzz`: coverage-guided fuzzing is broken in the pinned
-//! Zig 0.16.0 (the fuzz-mode test runner fails to compile with error tracing
-//! on, and instruments zero PCs with it off). Mutating a real crash corpus is
+//! Zig (0.16.0, still in 0.17.0: the fuzz-mode test runner fails to compile
+//! with error tracing on, and instruments zero PCs with it off). Mutating a real crash corpus is
 //! a better fit here regardless — random bytes would essentially never produce
 //! `goroutine 1 [running]:`, so the seeds matter more than the guidance. Each
 //! target is a plain `fn (bytes) void`, so wiring the real fuzzer in later is

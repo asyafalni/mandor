@@ -313,7 +313,7 @@ test "b10 rejection is unbiased" {
     // exactly 25 times.
     var stream: [250]u8 = undefined;
     for (&stream, 0..) |*b, k| b.* = @intCast(k);
-    var counts = [_]usize{0} ** 10;
+    var counts = @as([10]usize, @splat(0));
     var src2 = SliceSource{ .bytes = &stream };
     var out2: [250]u8 = undefined;
     const d2 = try b10Encode(&src2, 250, &out2);

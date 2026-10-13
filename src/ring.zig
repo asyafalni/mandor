@@ -141,7 +141,7 @@ test "eviction keeps newest records" {
 
 test "record larger than ring is rejected" {
     var r: T = .{};
-    const big = "x" ** 100;
+    const big = &@as([100]u8, @splat('x'));
     try std.testing.expect(!r.push(big, 0, 0));
     try std.testing.expectEqual(@as(usize, 0), r.count());
 }

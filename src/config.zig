@@ -831,9 +831,9 @@ test "service_prefix parses and rejects an over-long value" {
     try t.expectEqual(@as(?[]const u8, null), none.service_prefix);
     // Exactly at the cap is accepted; one past it is a hard BadValue (no silent
     // truncation — the daemon's copy buffer is fixed at cli.max_service_prefix).
-    const at_cap = "service_prefix = \"" ++ ("p" ** cli.max_service_prefix) ++ "\"";
+    const at_cap = "service_prefix = \"" ++ @as([cli.max_service_prefix]u8, @splat('p')) ++ "\"";
     _ = try parseTest(at_cap, &storage);
-    const over = "service_prefix = \"" ++ ("p" ** (cli.max_service_prefix + 1)) ++ "\"";
+    const over = "service_prefix = \"" ++ @as([cli.max_service_prefix + 1]u8, @splat('p')) ++ "\"";
     try t.expectError(error.BadValue, parseTest(over, &storage));
 }
 

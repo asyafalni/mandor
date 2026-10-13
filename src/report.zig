@@ -229,11 +229,11 @@ pub fn writeState(state_dir: []const u8, workers: []const spawner.Worker, now_ms
 
     var path_buf: [512]u8 = undefined;
     var tmp_buf: [512]u8 = undefined;
-    const final_path = std.fmt.bufPrintZ(&path_buf, "{s}/state.json", .{state_dir}) catch return;
-    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "{s}/state.json.tmp", .{state_dir}) catch return;
+    const final_path = std.mem.printSentinel(&path_buf, "{s}/state.json", .{state_dir}, 0) catch return;
+    const tmp_path = std.mem.printSentinel(&tmp_buf, "{s}/state.json.tmp", .{state_dir}, 0) catch return;
 
     var dir_buf: [512]u8 = undefined;
-    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}", .{state_dir}) catch return;
+    const dir_z = std.mem.printSentinel(&dir_buf, "{s}", .{state_dir}, 0) catch return;
     _ = linux.mkdirat(linux.AT.FDCWD, dir_z.ptr, 0o755); // EEXIST is fine
 
     const rc = linux.openat(linux.AT.FDCWD, tmp_path.ptr, .{
@@ -289,7 +289,7 @@ pub fn readWhole(path_z: [*:0]const u8, buf: []u8) ReadError![]const u8 {
 
 pub fn readState(state_dir: []const u8, buf: []u8) ReadError![]const u8 {
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/state.json", .{state_dir}) catch
+    const path = std.mem.printSentinel(&path_buf, "{s}/state.json", .{state_dir}, 0) catch
         return error.Unreadable;
     return readWhole(path.ptr, buf);
 }

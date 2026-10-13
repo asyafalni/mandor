@@ -51,21 +51,21 @@ pub const Signals = struct {
             const n = posix.read(self.fd, std.mem.sliceAsBytes(&buf)) catch return ev;
             const count = n / @sizeOf(linux.signalfd_siginfo);
             for (buf[0..count]) |*si| {
-                if (si.signo == @intFromEnum(posix.SIG.TERM)) {
+                if (si.signo == @backingInt(posix.SIG.TERM)) {
                     ev.term_or_int = .TERM;
-                } else if (si.signo == @intFromEnum(posix.SIG.INT)) {
+                } else if (si.signo == @backingInt(posix.SIG.INT)) {
                     ev.term_or_int = .INT;
-                } else if (si.signo == @intFromEnum(posix.SIG.CHLD)) {
+                } else if (si.signo == @backingInt(posix.SIG.CHLD)) {
                     ev.chld = true;
-                } else if (si.signo == @intFromEnum(posix.SIG.HUP)) {
+                } else if (si.signo == @backingInt(posix.SIG.HUP)) {
                     ev.addPass(.HUP);
-                } else if (si.signo == @intFromEnum(posix.SIG.QUIT)) {
+                } else if (si.signo == @backingInt(posix.SIG.QUIT)) {
                     ev.addPass(.QUIT);
-                } else if (si.signo == @intFromEnum(posix.SIG.USR1)) {
+                } else if (si.signo == @backingInt(posix.SIG.USR1)) {
                     ev.addPass(.USR1);
-                } else if (si.signo == @intFromEnum(posix.SIG.USR2)) {
+                } else if (si.signo == @backingInt(posix.SIG.USR2)) {
                     ev.addPass(.USR2);
-                } else if (si.signo == @intFromEnum(posix.SIG.WINCH)) {
+                } else if (si.signo == @backingInt(posix.SIG.WINCH)) {
                     ev.addPass(.WINCH);
                 }
             }

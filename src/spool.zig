@@ -297,9 +297,9 @@ pub fn write(state_dir: []const u8, in: BundleInput) ?[]const u8 {
     const json = serialize(&bundle_buf, in) orelse return null;
 
     var dir_buf: [512]u8 = undefined;
-    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}/incidents", .{state_dir}) catch return null;
+    const dir_z = std.mem.printSentinel(&dir_buf, "{s}/incidents", .{state_dir}, 0) catch return null;
     var root_buf: [512]u8 = undefined;
-    const root_z = std.fmt.bufPrintZ(&root_buf, "{s}", .{state_dir}) catch return null;
+    const root_z = std.mem.printSentinel(&root_buf, "{s}", .{state_dir}, 0) catch return null;
     _ = linux.mkdirat(linux.AT.FDCWD, root_z.ptr, 0o755);
     _ = linux.mkdirat(linux.AT.FDCWD, dir_z.ptr, 0o755);
 
@@ -309,10 +309,10 @@ pub fn write(state_dir: []const u8, in: BundleInput) ?[]const u8 {
     const epoch_ms = @as(u64, @intCast(now_ts.sec)) * 1000 +
         @as(u64, @intCast(now_ts.nsec)) / 1_000_000;
     var tmp_buf: [640]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&last_path_buf, "{s}/incidents/{d}-{s}-{d}.json", .{
+    const path = std.mem.printSentinel(&last_path_buf, "{s}/incidents/{d}-{s}-{d}.json", .{
         state_dir, epoch_ms, in.name, seq,
-    }) catch return null;
-    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/incidents/.tmp-{d}", .{ state_dir, seq }) catch return null;
+    }, 0) catch return null;
+    const tmp = std.mem.printSentinel(&tmp_buf, "{s}/incidents/.tmp-{d}", .{ state_dir, seq }, 0) catch return null;
 
     const rc = linux.openat(linux.AT.FDCWD, tmp.ptr, .{
         .ACCMODE = .WRONLY,
@@ -345,7 +345,7 @@ pub const Keep = enum { newest, oldest };
 /// List incident files sorted oldest-first by their epoch-ms prefix.
 pub fn listIncidents(state_dir: []const u8, out: []DirEntry, keep: Keep) usize {
     var dir_buf: [512]u8 = undefined;
-    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}/incidents", .{state_dir}) catch return 0;
+    const dir_z = std.mem.printSentinel(&dir_buf, "{s}/incidents", .{state_dir}, 0) catch return 0;
     const rc = linux.openat(linux.AT.FDCWD, dir_z.ptr, .{ .DIRECTORY = true }, 0);
     if (posix.errno(rc) != .SUCCESS) return 0;
     const fd: i32 = @intCast(rc);
@@ -412,7 +412,7 @@ var prune_entries: [max_incidents + 16]DirEntry = undefined;
 /// sized from how far over the cap the directory actually is.
 fn countIncidents(state_dir: []const u8) usize {
     var dir_buf: [512]u8 = undefined;
-    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}/incidents", .{state_dir}) catch return 0;
+    const dir_z = std.mem.printSentinel(&dir_buf, "{s}/incidents", .{state_dir}, 0) catch return 0;
     const rc = linux.openat(linux.AT.FDCWD, dir_z.ptr, .{ .DIRECTORY = true }, 0);
     if (posix.errno(rc) != .SUCCESS) return 0;
     const fd: i32 = @intCast(rc);
@@ -452,9 +452,9 @@ fn prune(state_dir: []const u8) void {
         var done: usize = 0;
         for (prune_entries[0..del]) |*e| {
             var path_buf: [640]u8 = undefined;
-            const p = std.fmt.bufPrintZ(&path_buf, "{s}/incidents/{s}", .{
+            const p = std.mem.printSentinel(&path_buf, "{s}/incidents/{s}", .{
                 state_dir, e.name[0..e.name_len],
-            }) catch continue;
+            }, 0) catch continue;
             if (posix.errno(linux.unlinkat(linux.AT.FDCWD, p.ptr, 0)) == .SUCCESS) done += 1;
         }
         if (done == 0) return; // cannot make progress (read-only volume)
@@ -470,9 +470,9 @@ test "prune keeps the newest incidents even when the dir overflows the listing b
     // state dir, or a lowered max_incidents -- and the failure is perverse:
     // the *recent* incidents get deleted while ancient ones become immortal.
     var dir_buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/mandor-prune-{d}", .{linux.getpid()});
+    const dir = try std.mem.printSentinel(&dir_buf, "/tmp/mandor-prune-{d}", .{linux.getpid()}, 0);
     var inc_buf: [160]u8 = undefined;
-    const inc = try std.fmt.bufPrintZ(&inc_buf, "{s}/incidents", .{dir});
+    const inc = try std.mem.printSentinel(&inc_buf, "{s}/incidents", .{dir}, 0);
     _ = linux.mkdirat(linux.AT.FDCWD, dir.ptr, 0o755);
     _ = linux.mkdirat(linux.AT.FDCWD, inc.ptr, 0o755);
 
@@ -480,7 +480,7 @@ test "prune keeps the newest incidents even when the dir overflows the listing b
     const first_key: u64 = 1_000_000;
     for (0..total) |i| {
         var name_buf: [256]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&name_buf, "{s}/{d}-api.json", .{ inc, first_key + i });
+        const path = try std.mem.printSentinel(&name_buf, "{s}/{d}-api.json", .{ inc, first_key + i }, 0);
         const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
@@ -493,7 +493,7 @@ test "prune keeps the newest incidents even when the dir overflows the listing b
         const left = listIncidents(dir, &after_buf, .newest);
         for (after_buf[0..left]) |*e| {
             var pb: [256]u8 = undefined;
-            const pp = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ inc, e.name[0..e.name_len] }) catch continue;
+            const pp = std.mem.printSentinel(&pb, "{s}/{s}", .{ inc, e.name[0..e.name_len] }, 0) catch continue;
             _ = linux.unlinkat(linux.AT.FDCWD, pp.ptr, 0);
         }
         _ = linux.unlinkat(linux.AT.FDCWD, inc.ptr, linux.AT.REMOVEDIR);

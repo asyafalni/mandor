@@ -74,7 +74,7 @@ var read_buf: [8192]u8 = undefined;
 /// Read the exe's prefix and extract its build-id (spawn-time cold path).
 pub fn readBuildId(exe_path: []const u8, out: *[64]u8) ?[]const u8 {
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{exe_path}) catch return null;
+    const path = std.mem.printSentinel(&path_buf, "{s}", .{exe_path}, 0) catch return null;
     const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{}, 0);
     if (posix.errno(rc) != .SUCCESS) return null;
     const fd: i32 = @intCast(rc);

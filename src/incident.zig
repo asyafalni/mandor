@@ -101,7 +101,7 @@ pub fn setPhoton(endpoint: []const u8) bool {
 // and drained separately by telemetry.shutdown.)
 
 const max_forwards = 16;
-var forward_pids: [max_forwards]i32 = .{0} ** max_forwards;
+var forward_pids: [max_forwards]i32 = @splat(0);
 
 fn noteForward(pid: i32) void {
     if (pid <= 0) return;
@@ -127,7 +127,7 @@ pub fn drainForwards(budget_ms: u64) usize {
         var live: usize = 0;
         for (&forward_pids) |*slot| {
             if (slot.* == 0) continue;
-            var st: u32 = undefined;
+            var st: i32 = undefined;
             const rc = linux.waitpid(slot.*, &st, linux.W.NOHANG);
             if (std.posix.errno(rc) == .SUCCESS and rc != 0) {
                 slot.* = 0;

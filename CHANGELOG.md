@@ -3,6 +3,15 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [1.16.2] - 2026-10-13
+
+### Changed
+- **Built with Zig 0.17.0** (was 0.16.0; `.zigversion` and `minimum_zig_version` bumped).
+  Source migration only, no behavior change: array repetition `**` → `@splat`,
+  `std.fmt.bufPrintZ` → `std.mem.printSentinel`, `linux.waitpid` status is now `i32`,
+  `@intFromEnum` → `@backingInt` (via `zig fmt`), lowercase `std.lang.Optimize` fields.
+  The stripped x86_64 ReleaseSafe binary shrank from ~359 KB to ~334 KB.
+
 ## [1.16.1] - 2026-09-16
 
 ### Changed

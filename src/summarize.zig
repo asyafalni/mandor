@@ -259,8 +259,8 @@ fn knownPattern(lines: []const LogLine) ?[]const u8 {
 
 /// Most-repeated error-ish line (digit-insensitive), when it fired >= 3 times.
 fn repeatedError(lines: []const LogLine, rep_buf: *[96]u8) ?[]const u8 {
-    var hashes: [16]u64 = .{0} ** 16;
-    var counts: [16]u32 = .{0} ** 16;
+    var hashes: [16]u64 = @splat(0);
+    var counts: [16]u32 = @splat(0);
     var reps: [16][]const u8 = undefined;
     var n: usize = 0;
     for (lines) |l| {
@@ -425,15 +425,13 @@ test "statsAnomaly does not overflow on a severe fd leak" {
     _ = statsAnomaly(&samples, false, &buf);
 
     // Every extreme at once, both killed and not.
-    const maxed = [_]sampler.Sample{
-        .{
-            .t_ms = std.math.maxInt(u64),
-            .rss_kb = std.math.maxInt(u64),
-            .cpu_pct = std.math.maxInt(u16),
-            .fds = std.math.maxInt(u16),
-            .threads = std.math.maxInt(u16),
-        },
-    } ** 4;
+    const maxed: [4]sampler.Sample = @splat(.{
+        .t_ms = std.math.maxInt(u64),
+        .rss_kb = std.math.maxInt(u64),
+        .cpu_pct = std.math.maxInt(u16),
+        .fds = std.math.maxInt(u16),
+        .threads = std.math.maxInt(u16),
+    });
     _ = statsAnomaly(&maxed, true, &buf);
     _ = statsAnomaly(&maxed, false, &buf);
 }

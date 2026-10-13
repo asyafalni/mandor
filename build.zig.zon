@@ -2,7 +2,7 @@
     .name = .mandor,
     .version = "0.1.0-dev",
     .fingerprint = 0x69b3676ed4d53147, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

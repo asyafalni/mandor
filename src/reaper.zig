@@ -36,7 +36,7 @@ pub const ReapSummary = struct {
 pub fn drain(workers: []spawner.Worker, sweep_kill: bool, prober_pids: []const i32) ReapSummary {
     var summary: ReapSummary = .{};
     while (true) {
-        var st: u32 = 0;
+        var st: i32 = 0;
         const rc = linux.waitpid(-1, &st, linux.W.NOHANG);
         switch (posix.errno(rc)) {
             .SUCCESS => {},
@@ -59,7 +59,7 @@ pub fn drain(workers: []spawner.Worker, sweep_kill: bool, prober_pids: []const i
             if (w.health_pid == pid) {
                 w.health_pid = 0;
                 w.health_done = true;
-                w.health_ok = linux.W.IFEXITED(st) and linux.W.EXITSTATUS(st) == 0;
+                w.health_ok = linux.W.IFEXITED(@bitCast(st)) and linux.W.EXITSTATUS(@bitCast(st)) == 0;
                 matched = true;
                 break;
             }
@@ -71,12 +71,12 @@ pub fn drain(workers: []spawner.Worker, sweep_kill: bool, prober_pids: []const i
             }
             if (w.pid != pid) continue;
             w.pid = 0;
-            if (linux.W.IFEXITED(st)) {
-                const code = linux.W.EXITSTATUS(st);
+            if (linux.W.IFEXITED(@bitCast(st))) {
+                const code = linux.W.EXITSTATUS(@bitCast(st));
                 w.status = .{ .exited = code };
                 w.final_code = code;
-            } else if (linux.W.IFSIGNALED(st)) {
-                const sig: u8 = @truncate(@intFromEnum(linux.W.TERMSIG(st)));
+            } else if (linux.W.IFSIGNALED(@bitCast(st))) {
+                const sig: u8 = @truncate(@backingInt(linux.W.TERMSIG(@bitCast(st))));
                 w.status = .{ .signaled = sig };
                 w.final_code = 128 +| sig;
                 w.core_dumped = (st & 0x80) != 0; // WCOREDUMP bit
@@ -97,7 +97,7 @@ pub fn drain(workers: []spawner.Worker, sweep_kill: bool, prober_pids: []const i
             if (summary.prober_reaped_n < summary.prober_reaped.len) {
                 summary.prober_reaped[summary.prober_reaped_n] = .{
                     .idx = @intCast(pi),
-                    .ok = linux.W.IFEXITED(st) and linux.W.EXITSTATUS(st) == 0,
+                    .ok = linux.W.IFEXITED(@bitCast(st)) and linux.W.EXITSTATUS(@bitCast(st)) == 0,
                 };
                 summary.prober_reaped_n += 1;
             }
@@ -141,7 +141,7 @@ test "spawn, reap, classify exit and signal deaths" {
     try std.testing.expectEqual(@as(u8, 2), reaped);
     try std.testing.expectEqual(spawner.Status{ .exited = 0 }, workers[0].status);
     try std.testing.expectEqual(
-        spawner.Status{ .signaled = @intFromEnum(posix.SIG.SEGV) },
+        spawner.Status{ .signaled = @backingInt(posix.SIG.SEGV) },
         workers[1].status,
     );
     try std.testing.expectEqual(@as(u8, 139), workers[1].final_code);

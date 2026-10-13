@@ -136,8 +136,8 @@ pub fn closeFd(fd: *i32) void {
 
 const TestSink = struct {
     lines: [8][max_line]u8 = undefined,
-    lens: [8]usize = .{0} ** 8,
-    flags: [8]u8 = .{0} ** 8,
+    lens: [8]usize = @splat(0),
+    flags: [8]u8 = @splat(0),
     n: usize = 0,
 
     fn sink(self: *TestSink, text: []const u8, flags: u8) void {
@@ -190,7 +190,7 @@ test "fast path: contiguous complete lines, then a straddling partial" {
 test "oversized line splits with continuation flag" {
     var a: Assembler = .{};
     var s: TestSink = .{};
-    const big = "x" ** 5000;
+    const big = &@as([5000]u8, @splat('x'));
     a.feed(0, big ++ "\n", &s, TestSink.sink);
     try std.testing.expectEqual(@as(usize, 2), s.n);
     try std.testing.expectEqual(@as(usize, max_line), s.lens[0]);

@@ -4,10 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse
-        (optimize != .Debug);
+        (optimize != .debug);
 
     // Version stamped into the binary; overridable in CI: -Dversion=v1.7.2.
-    const version = b.option([]const u8, "version", "Version string") orelse "1.16.1";
+    const version = b.option([]const u8, "version", "Version string") orelse "1.16.2";
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "version", version);
 

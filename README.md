@@ -7,9 +7,9 @@
 > **the foreman for your containers** — a tiny PID-1 process supervisor that
 > watches your workers, captures their logs, and tells you *why* they died.
 
-[![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.16.0)
+[![Zig 0.17.0](https://img.shields.io/badge/zig-0.17.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.17.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Static binary](https://img.shields.io/badge/binary-static%2C%20~359KB-success)
+![Static binary](https://img.shields.io/badge/binary-static%2C%20~334KB-success)
 ![No dependencies](https://img.shields.io/badge/dependencies-zero-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
@@ -42,7 +42,7 @@ $ mandor --max-restarts=3 -- "./api --port 8080" "./worker" "./cron-loop"
 | Release correlation ("did the fix hold?") | ✅ | ❌ | ❌ |
 | OTLP telemetry to an observability backend | ✅ opt-in | ❌ | ❌ |
 | Node + GPU host metrics (node-exporter style) | ✅ opt-in | ❌ | ❌ |
-| Size | **~359 KB** | ~50 KB | MBs + runtime |
+| Size | **~334 KB** | ~50 KB | MBs + runtime |
 | Network access | **off by default** (opt-in OTLP) | never | varies |
 
 The `mandor` binary is **offline by default** and self-contained: no accounts,
@@ -288,7 +288,7 @@ Design rules the code lives by:
 
 ## Building from source
 
-Requires [Zig 0.16.0](https://ziglang.org/download/#release-0.16.0) exactly
+Requires [Zig 0.17.0](https://ziglang.org/download/#release-0.17.0) exactly
 (pinned in `.zigversion`).
 
 ```console

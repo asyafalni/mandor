@@ -92,7 +92,7 @@ pub fn encodeMetric(out: []u8, s: MetricSample) error{Overflow}![]const u8 {
     const total = header + payload_len;
     if (total > out.len) return error.Overflow;
 
-    out[0] = @intFromEnum(Kind.metric_sample);
+    out[0] = @backingInt(Kind.metric_sample);
     std.mem.writeInt(u16, out[1..][0..2], @intCast(payload_len), .little);
     var p: usize = header;
     out[p] = nl;
@@ -123,14 +123,14 @@ pub fn encodeLifecycle(out: []u8, e: Lifecycle) error{Overflow}![]const u8 {
     const total = header + payload_len;
     if (total > out.len) return error.Overflow;
 
-    out[0] = @intFromEnum(Kind.lifecycle_event);
+    out[0] = @backingInt(Kind.lifecycle_event);
     std.mem.writeInt(u16, out[1..][0..2], @intCast(payload_len), .little);
     var p: usize = header;
     out[p] = nl;
     p += 1;
     @memcpy(out[p..][0..nl], e.name);
     p += nl;
-    out[p] = @intFromEnum(e.ev);
+    out[p] = @backingInt(e.ev);
     p += 1;
     std.mem.writeInt(i32, out[p..][0..4], e.code, .little);
     p += 4;
@@ -156,7 +156,7 @@ pub fn encodeLog(out: []u8, l: LogLine) error{Overflow}![]const u8 {
     const total = header + payload_len;
     if (total > out.len) return error.Overflow;
 
-    out[0] = @intFromEnum(Kind.log_line);
+    out[0] = @backingInt(Kind.log_line);
     std.mem.writeInt(u16, out[1..][0..2], @intCast(payload_len), .little);
     var p: usize = header;
     out[p] = nl;
@@ -190,7 +190,7 @@ pub fn encodeDigest(out: []u8, d: DigestEntry) error{Overflow}![]const u8 {
     const total = header + payload_len;
     if (total > out.len) return error.Overflow;
 
-    out[0] = @intFromEnum(Kind.digest_entry);
+    out[0] = @backingInt(Kind.digest_entry);
     std.mem.writeInt(u16, out[1..][0..2], @intCast(payload_len), .little);
     var p: usize = header;
     out[p] = nl;
@@ -226,10 +226,10 @@ pub fn decode(buf: []const u8, name_scratch: []u8) ?struct { rec: Decoded, used:
     const payload = buf[header..total];
 
     const kind: Kind = switch (buf[0]) {
-        @intFromEnum(Kind.metric_sample) => .metric_sample,
-        @intFromEnum(Kind.lifecycle_event) => .lifecycle_event,
-        @intFromEnum(Kind.log_line) => .log_line,
-        @intFromEnum(Kind.digest_entry) => .digest_entry,
+        @backingInt(Kind.metric_sample) => .metric_sample,
+        @backingInt(Kind.lifecycle_event) => .lifecycle_event,
+        @backingInt(Kind.log_line) => .log_line,
+        @backingInt(Kind.digest_entry) => .digest_entry,
         else => return null,
     };
 
@@ -268,13 +268,13 @@ pub fn decode(buf: []const u8, name_scratch: []u8) ?struct { rec: Decoded, used:
             @memcpy(name_scratch[0..nl], payload[1..][0..nl]);
             var p: usize = 1 + @as(usize, nl);
             const ev: Event = switch (payload[p]) {
-                @intFromEnum(Event.started) => .started,
-                @intFromEnum(Event.exited_ok) => .exited_ok,
-                @intFromEnum(Event.exited_err) => .exited_err,
-                @intFromEnum(Event.restarting) => .restarting,
-                @intFromEnum(Event.oom) => .oom,
-                @intFromEnum(Event.health_up) => .health_up,
-                @intFromEnum(Event.health_down) => .health_down,
+                @backingInt(Event.started) => .started,
+                @backingInt(Event.exited_ok) => .exited_ok,
+                @backingInt(Event.exited_err) => .exited_err,
+                @backingInt(Event.restarting) => .restarting,
+                @backingInt(Event.oom) => .oom,
+                @backingInt(Event.health_up) => .health_up,
+                @backingInt(Event.health_down) => .health_down,
                 else => return null,
             };
             p += 1;
@@ -414,8 +414,8 @@ test "log line survives encode -> decode" {
 
 test "log line at max name and max line length round-trips" {
     var out: [8192]u8 = undefined;
-    const name = "n" ** name_cap; // 255
-    const line = "x" ** line_cap; // 4095
+    const name = &@as([name_cap]u8, @splat('n')); // 255
+    const line = &@as([line_cap]u8, @splat('x')); // 4095
     const bytes = try encodeLog(&out, .{ .name = name, .iostream = 0, .severity = 0, .t_unix_ns = 42, .line = line });
 
     var scratch: [256]u8 = undefined;
@@ -467,7 +467,7 @@ test "digest entry survives encode -> decode" {
 
 test "encodeDigest refuses a sample longer than line_cap" {
     var out: [8192]u8 = undefined;
-    const big = "x" ** (line_cap + 1);
+    const big = &@as([line_cap + 1]u8, @splat('x'));
     try testing.expectError(error.Overflow, encodeDigest(&out, .{ .name = "api", .severity = 1, .count = 1, .first_unix_ns = 0, .last_unix_ns = 0, .sample = big }));
 }
 

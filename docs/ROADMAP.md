@@ -460,7 +460,7 @@ clamping logic is itself the bug — the one site that forgot `@min` was the
 crash. The harness was
 itself validated by mutation testing: with the fixes reverted it catches both
 bugs on 8 of 8 seeds. Coverage-guided `zig build test --fuzz` is unusable on
-the pinned Zig 0.16.0, so the harness is in-repo and runs under plain
+the pinned Zig (0.16.0, still on 0.17.0), so the harness is in-repo and runs under plain
 `zig build test`.
 
 **Soak test: done (v1.0.3).** `test/harness/soak.sh` runs capture at full
