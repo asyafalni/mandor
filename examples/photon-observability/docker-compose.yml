@@ -1,10 +1,9 @@
 # mandor + photon (sister project): with a single config key, mandor pushes
-# incidents, per-process + node metrics, and lifecycle events to photon over
-# OTLP (no collector), and a shared volume persists crash history across
-# container restarts. mandor stays offline until `photon` is set. To also report
-# the host + GPU (superseding a standalone node agent), mount /proc, /sys,
-# /etc/machine-id (and /dev/nvidia* for GPU) into `app` — GPU metrics are
-# auto-detected (no toggle: on when a device is present, off otherwise).
+# incidents, per-process metrics, lifecycle events and a warn/error digest to
+# photon over OTLP (no collector), and a shared volume persists crash history
+# across container restarts. mandor stays offline until `photon` is set. It
+# reports only its workers: the host (and each worker's GPU share) is
+# photon-agent's, running on the host.
 services:
   app:
     build: .            # image ENTRYPOINT: ["/mandor", "--config=/mandor.toml"]
@@ -25,6 +24,5 @@ volumes:
 #   photon       = "photon:4318"
 #   workers      = ["./api --port 3000", "./worker"]
 #   # service_prefix = "tenant-a-"     # tag service.name per origin (multi-tenant photon)
-#   # GPU metrics auto-detect (NVIDIA/AMD/Intel) when a device + /dev/nvidia* is present
 #   # a curated warn/error digest ships to /v1/logs by default when photon= is set
 #   # [worker.api]  stream  = true     # opt-in FULL per-line streaming for one worker

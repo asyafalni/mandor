@@ -37,7 +37,7 @@ mandor (PID 1, this repo)
 ├── reaper         waitpid loop, zombie reaping, exit-cause classification
 ├── signals        signalfd: forward TERM/INT/HUP to workers, graceful shutdown
 ├── capture        per-worker stdout/stderr pipes → ring buffers (default 256KB)
-├── sampler        /proc/<pid>/{stat,status} poll (default 5s): CPU%, RSS, fds, threads
+├── sampler        /proc/<pid>/{stat,fd} poll (every 5s): CPU%, RSS, fds, threads
 ├── detector       incident triggers: nonzero exit, fatal signal, cgroup OOM,
 │                  restart-loop (N in M min), monotonic RSS climb
 ├── summarize      heuristic engine (NO LLM): error dedup by signature,
@@ -107,7 +107,7 @@ forever). New work follows the same discipline — compile early, size-gate, shi
    Offline-by-default is unchanged — none of this activates without `photon=`.
    Since then: ✅ v1.12.0 — the four deploy-varying keys read from ENV
    (`PHOTON_OTLP_HTTP_ENDPOINT`, `PHOTON_INGEST_TOKEN` — alias `PHOTON_OTLP_TOKEN`, `MANDOR_SERVICE_PREFIX`,
-   `MANDOR_STATE_DIR`; ENV overrides TOML) and GPU became auto-detected; ✅
+   `MANDOR_STATE_DIR`; ENV overrides TOML); ✅
    v1.13.0 — the TOML is a name-keyed behavior overlay over the CLI-chosen worker
    set (orphan sections tolerated, secrets degrade to the present subset).
 6. **v1.x — premium sidecar** (separate repo/binary, possibly Rust for rustls):
@@ -122,10 +122,9 @@ forever). New work follows the same discipline — compile early, size-gate, shi
   allocator APIs, verify signatures against the LOCAL installed std source
   (`zig env` → std_dir) instead of assuming. Compile early, compile often —
   `zig build` after every module, not after every feature.
-- Allocators: single `GeneralPurposeAllocator` in debug, `page_allocator` or
-  fixed buffers in release. Every alloc has a `defer`/`errdefer` free at the
-  call site. Ring buffers are fixed-size preallocated — the steady state of
-  PID 1 must be **zero allocations**.
+- No heap allocator in the binary: fixed buffers and BSS only (tests may use
+  `std.testing.allocator`). Ring buffers are fixed-size preallocated — the
+  steady state of PID 1 must be **zero allocations**.
 - No `unreachable` and no panics on the supervision path. Every syscall error
   is handled; worst case = log to stderr and keep supervising. PID 1 dying
   kills the container — reliability beats elegance everywhere.
@@ -174,8 +173,9 @@ ENTRYPOINT ["/mandor", "./api", "./worker"]
 
 - Unit: trace parsers (fixture files with real Go/Rust/Python crash output
   in `test/fixtures/`), ring buffer, backoff math, signature dedup.
-- Integration: `test/harness/` tiny crasher programs (exit-code, segfault,
-  mem-hog, log-spammer) + shell scripts asserting supervisor behavior.
+- Integration: `test/harness/run_tests.sh` (crash cases are inline `sh -c`
+  workers) and `soak.sh` (steady-state RSS/fd/thread flatness); the container
+  PID-1 suite is `test/container/run.sh`.
   Run inside a container in CI (GitHub Actions) — signal/PID-1 semantics
   differ outside containers.
 - Every incident-bundle change bumps `"v"` and gets a fixture test.
@@ -190,15 +190,17 @@ mandor/
 │   ├── spawner.zig  reaper.zig  signals.zig  backoff.zig  names.zig
 │   ├── capture.zig  ring.zig  sampler.zig  detector.zig  cgroup.zig
 │   ├── summarize.zig  incident.zig  spool.zig  history.zig
-│   ├── report.zig  cost.zig  metrics.zig  elf.zig  caps.zig  secret.zig
-│   ├── telemetry.zig  relay.zig  otlp.zig  frame.zig  hostid.zig  resolve.zig
+│   ├── report.zig  cost.zig  metrics.zig  elf.zig  caps.zig  secret.zig  env.zig
+│   ├── telemetry.zig  relay.zig  otlp.zig  frame.zig  digest.zig  hostid.zig  resolve.zig
 │   ├── log.zig  jsonbuf.zig  fuzz.zig
 │   └── parsers/ (go.zig  rust.zig  python.zig  node.zig  java.zig  zigp.zig)
 └── test/ (fixtures/  harness/  container/  photon/)
 ```
 
 The telemetry cluster (`telemetry.zig` emit path, `relay.zig` OTLP encoders +
-the `relay --daemon`, `otlp.zig` the OTLP message structs for `nilo_proto`, `frame.zig` pipe wire format, `hostid.zig` host identity,
+the `relay --daemon`, `otlp.zig` the OTLP message structs for `nilo_proto`,
+`frame.zig` pipe wire format, `digest.zig` the warn/error digest table,
+`hostid.zig` host identity labels,
 `resolve.zig` DNS) is inert unless `photon=` is set.
 
 ## Product boundaries (do not blur)

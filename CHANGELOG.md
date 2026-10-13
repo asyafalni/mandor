@@ -3,6 +3,25 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+### Fixed
+- **One unshippable incident no longer holds back the rest.** The relay daemon treated a bundle
+  that can never encode (unreadable, empty, over 128 KB, a broken JSON escape) like photon being
+  down: it stopped the cycle on it, every cycle, so every newer incident queued behind it for the
+  daemon's whole life. It is now skipped with one stderr line and stays on the spool; a failed
+  *send* still stops the cycle and retries, as before.
+- **An empty `MANDOR_STATE_DIR=` is ignored**, like the other three ENV keys. It used to override
+  the TOML `state_dir` with `""`, so state, incidents and history landed relative to the cwd.
+- The one-shot `mandor relay` error said a bundle "exceeds 256KB"; the cap is 128 KB.
+
+### Docs
+- Swept the living docs against the code (README, CONFIG, INTEGRATION-PHOTON, ROADMAP,
+  CONTRIBUTING, CLAUDE.md, the man page, `--help`, examples, bench): removed node/GPU host-metrics
+  claims left from before v1.16, corrected sizes, exit codes, per-signal resource attributes, the
+  incident OTLP mapping and the digest severity rules; re-measured `bench/compare.sh`. Dropped the
+  design docs for the reversed node/GPU direction.
+
 ## [1.17.0] - 2026-10-13
 
 ### Removed

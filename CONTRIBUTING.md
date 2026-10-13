@@ -137,10 +137,10 @@ body and costs ~6 KB of `.text` for identical behaviour.
 
 `src/fuzz.zig` mutation-fuzzes everything that consumes input mandor does not
 control: worker stderr (the six trace parsers), the worker's ELF header,
-`mandor.toml`, argv, `/proc` and cgroup text, mandor's
-own state files, the incident-bundle serializer, the OTLP encoders (metrics /
-streamed-log + warn-error-digest records, and the pipe-frame decoder
-— output must stay a decodable protobuf), the
+`mandor.toml`, argv, `/proc` stat text, mandor's
+own state files, the incident-bundle serializer, the OTLP encoders (incident
+bundle and streamed-log + warn-error-digest records — output must stay a
+decodable protobuf), the pipe-frame decoder, the photon endpoint parser, the
 capture ring buffer, and the cost accumulators. It runs as part of
 `zig build test`, with a different seed each invocation.
 
@@ -180,15 +180,17 @@ mutator from byte flips (1-in-5 detection) to a boundary-value dictionary plus
 a structured ELF generator (8-in-8).
 
 Note: coverage-guided `zig build test --fuzz` is unusable on the pinned Zig
-(0.16.0, re-checked on 0.17.0: its fuzz-mode test runner fails to compile with
-error tracing on, and instruments zero PCs with it off), which is why the harness is in-repo.
+(0.17.0, as on 0.16.0: its fuzz-mode test runner fails to compile with error
+tracing on, and instruments zero PCs with it off), which is why the harness is
+in-repo.
 
 ## Ground rules
 
 - **Size is a feature.** The stripped ReleaseSafe binary must stay under
-  500 KB (CI gates it, per-commit); it currently sits near ~334 KB (the opt-in
-  telemetry / node + GPU metrics subsystem is most of the growth since 1.6). A
-  new dependency or a large `std` pull-in needs a very good story.
+  500 KB (CI gates it, per-commit); it currently sits near ~331 KB (the opt-in
+  telemetry subsystem — relay daemon and OTLP encoding — is most of the growth
+  since 1.6). A new dependency or a large `std` pull-in needs a very good story
+  (the one dependency, `nilo_proto`, is std-only and allocation-free).
 - **PID 1 must not die.** No panics on the supervision path; every syscall
   error is handled. No allocations in the steady state (fixed buffers).
 - **Offline by default.** The binary opens no network connection unless the

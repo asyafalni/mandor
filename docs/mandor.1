@@ -1,4 +1,4 @@
-.TH MANDOR 1 "2026-07-21" "mandor" "User Commands"
+.TH MANDOR 1 "2026-10-13" "mandor 1.17.0" "User Commands"
 .SH NAME
 mandor \- the foreman for your containers: a tiny PID-1 process supervisor
 .SH SYNOPSIS
@@ -24,7 +24,7 @@ mandor \- the foreman for your containers: a tiny PID-1 process supervisor
 runs as PID 1 in a container, spawns worker processes, forwards signals,
 reaps zombies, restarts what crashes, and\(emwhen a worker dies\(emwrites a
 structured JSON incident bundle explaining what happened. It is a single
-static binary (~248 KB), fully offline unless a network feature is configured.
+static binary (~331 KB), fully offline unless a network feature is configured.
 .PP
 Each \fICMD\fR is one worker: a quoted command line tokenized by mandor (no
 shell required). Workers are named by the basename of their first token.
@@ -55,7 +55,8 @@ USR1, USR2, and WINCH are passed through to workers.
 The failing worker's code once its retries are exhausted (this is the common
 case: every worker is essential unless it sets \fBessential = false\fR), or the
 oneshot worker's code when an init task fails; otherwise the worst worker exit
-code (128+N for signal deaths), honoring \fBexpected_exit\fR. 2 for a
+code (128+N for signal deaths), honoring \fBexpected_exit\fR. 1 when a
+\fB[require.NAME]\fR boot check fails (no worker is spawned). 2 for a
 configuration or startup error.
 .SH ENVIRONMENT
 .TP
@@ -99,6 +100,9 @@ Incident bundles (newest 200 retained).
 .TP
 .I <state-dir>/cost.json
 Per-worker resource-cost profiles (see \fBmandor report --cost\fR).
+.TP
+.I <state-dir>/history.json
+Incident-signature history across restarts and releases (release correlation).
 .TP
 .I /dev/termination-log
 When present (Kubernetes), receives the latest incident verdict.

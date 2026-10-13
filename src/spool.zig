@@ -1,4 +1,4 @@
-//! Incident bundles: stable JSON schema v1 written to
+//! Incident bundles: a versioned JSON schema (`bundle_version`) written to
 //! `<state-dir>/incidents/`. The premium sidecar consumes these files; any
 //! schema change MUST bump bundle_version and the fixture test.
 

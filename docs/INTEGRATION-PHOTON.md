@@ -2,8 +2,8 @@
 
 [photon](https://github.com/nevindra/photon) is mandor's sister project (at
 v1.5.0): an OTEL-native, single-binary observability platform (logs, traces,
-metrics, APM, uptime) in Rust, with an Infrastructure / Hosts view — including a
-per-host Processes table — that mandor populates. mandor is a PID-1 supervisor
+metrics, APM, uptime) in Rust, with an Infrastructure / Hosts view whose
+per-host Processes table photon-agent populates. mandor is a PID-1 supervisor
 that *produces* exactly the signals photon *displays*. This doc defines how
 mandor tells its story to photon — without breaking mandor's product boundary
 (the free binary never phones home unless the operator opts in with `photon=`,
@@ -35,11 +35,13 @@ and even then the supervision path itself opens no socket).
 
 ## The story channels
 
-Every OTLP emission below carries two identity attributes photon groups on: the
-**host** (`host.name` / `host.id`, from machine-id) and the **service**
-(`service.name` — the worker name, or `mandor` for the supervisor's own
-metrics). Both stay constant across channels so a worker's metrics, logs,
-incidents, and lifecycle events line up under one node and one service.
+Every OTLP emission below carries the **service** (`service.name` — the worker
+name, or `mandor` for the supervisor's own metrics), constant across channels so
+a worker's metrics, logs, incidents, and lifecycle events line up under one
+service. The **host** is a label, not a measurement: metrics carry `host.name`;
+digest and streamed logs carry `host.name` / `host.id` (from machine-id) /
+`os.type`; incidents add `service.version` instead; lifecycle events carry no
+host attributes.
 
 **Multi-tenancy — `service_prefix`.** photon is multi-tenant: several mandor
 origins (deployments / environments / tenants) can publish to one photon, and
@@ -64,8 +66,8 @@ service_prefix = "tenant-a-"     # service.name becomes e.g. "tenant-a-api"
 
 **With `photon=` set, mandor pushes OTLP metrics itself** (`/v1/metrics`, via the
 relay daemon) — no collector needed. One resource scope per worker, every one
-carrying the SAME `host.name`/`host.id` photon-agent reports for the host, so
-photon's Infrastructure / Hosts view groups them under one node:
+carrying the `host.name` photon-agent reports for the host, so photon's
+Infrastructure / Hosts view groups them under one node:
 
 - **Per-process + supervisor.** One `ResourceMetrics` per worker
   (`service.name=<worker>`, origin-prefixed by `service_prefix` when set) with
@@ -102,7 +104,8 @@ OTLP to `/v1/metrics` or Prometheus `remote_write` to `/api/v1/write`, no scrape
 a collector between them; you just no longer need one to reach photon. Exposed
 series (stable names): `mandor_worker_up`, `mandor_worker_restarts_total`,
 `mandor_worker_rss_kilobytes`, `mandor_worker_cpu_percent`, `mandor_worker_fds`,
-`mandor_worker_threads`, `mandor_incidents_total` — all labeled `worker="name"`.
+`mandor_worker_threads`, `mandor_incidents_total` — every per-worker series is
+labeled `worker="name"`; `mandor_incidents_total` is unlabeled.
 photon's uptime checker can also probe the metrics port: mandor answering =
 supervisor alive; `mandor_worker_up == 0` = worker down.
 
@@ -142,7 +145,7 @@ Per digest `LogRecord`:
 | field | value |
 |---|---|
 | `body` (AnyValue string) | a representative sample line for the signature (the first line seen for it) |
-| `severity_number` / `severity_text` | `ERROR` or `WARN`, classified by content: a line matching `error` / `warn` / `panic` / `fatal` / `exception` / `traceback` → `ERROR`; a bare (non-matching) stderr line → `WARN`. (info/stdout is not digested.) |
+| `severity_number` / `severity_text` | `ERROR` or `WARN`, classified by content: a line matching `error` / `panic` / `fatal` / `exception` / `traceback` → `ERROR`; a line matching `warn`, or a bare (non-matching) stderr line → `WARN`. (info/stdout is not digested.) |
 | `time_unix_nano` / `observed_time_unix_nano` | the signature's **last-seen** time (unix ns) |
 | resource attr `service.name` | the worker name, **origin-prefixed** by `service_prefix` when set |
 | attr `log.iostream` | `stderr` for digest records |
@@ -174,7 +177,7 @@ stream = true            # only `api` streams every line
 
 Each streamed line is one `LogRecord`: the line as the log `body`,
 `service.name` = worker (origin-prefixed by `service_prefix` when set),
-`log.iostream` + severity flagged, same host identity as the metrics. Leave a
+`log.iostream` + severity flagged, and `host.name` / `host.id` / `os.type`. Leave a
 flooding worker's `stream` off and the digest (2a) still surfaces its errors.
 Streamed lines ride the same non-blocking pipe as metrics, are **dropped under
 backpressure** (see below) and by the `[logs] max_rate` lines/sec cap, and are
@@ -214,9 +217,10 @@ and without the key mandor is fully offline. `photon` is a `mandor.toml` key,
 not a CLI flag — the everyday CLI stays at four flags (`--config` loads the
 TOML). As of v1.12, mandor also reads `PHOTON_OTLP_HTTP_ENDPOINT` from the
 environment — a full URL or a bare `host:port`, scheme-stripped either way —
-which **overrides** a TOML `photon=` value (CLI > ENV > TOML > default; see
-[CONFIG.md](CONFIG.md)). Auth: set `PHOTON_INGEST_TOKEN` (photon's own name for its ingest token — `PHOTON_OTLP_TOKEN` is read as an alias; the bearer env var
-was renamed in v1.12) in the environment and the relay sends
+which **overrides** a TOML `photon=` value (ENV > TOML > default; see
+[CONFIG.md](CONFIG.md)). Auth: set `PHOTON_INGEST_TOKEN` (photon's own name for its ingest token,
+v1.16.1+; `PHOTON_OTLP_TOKEN`, the v1.12–v1.16.0 name, is read as an alias) in
+the environment and the relay sends
 `Authorization: Bearer …`. The generic `on_incident` hook remains for custom
 tooling and the premium sidecar (a separate, per-incident detached process).
 
@@ -229,8 +233,9 @@ no allocator, and a message that does not fit is refused before a byte is
 written. nilo's own conformance test round-trips OTLP logs requests written by
 prost from photon-loadgen, byte for byte.
 
-The relay refuses rather than ships a payload it cannot vouch for, and says
-which on stderr: a bundle over 256KB (`refusing to ship a truncated
+The relay refuses rather than ships a payload it cannot vouch for (the
+one-shot `mandor relay <bundle>` says which on stderr; the daemon leaves the
+bundle on the spool): a bundle of 128 KB or more (`refusing to ship a truncated
 incident` — a clipped incident stored forever is worse than a missing one),
 and a bundle whose JSON string escapes are broken (`malformed JSON string
 escape`, which means the file was truncated mid-write or hand-edited). A bad
@@ -287,12 +292,12 @@ OTLP receiver answers with an `ExportLogsServiceResponse` protobuf (an empty
 > ```
 > /api/services  -> ["sh"]
 > /api/storage   -> logs: total_rows 1, bytes 7022
-> /api/search    -> mandor.bundle with the full schema-v8 incident
+> /api/search    -> mandor.bundle with the full incident bundle (schema of the day)
 > ```
 >
 > photon promoted `service.name` to its own column and stored the whole bundle,
-> `PHOTON_OTLP_TOKEN` redacted in the captured env (the bearer var's name at
-> the time of this run predates its v1.12 rename). Reproduce with
+> `PHOTON_TOKEN` redacted in the captured env (the bearer var's name at the
+> time of this run, before the v1.12 and v1.16.1 renames). Reproduce with
 > `bash test/photon/e2e.sh`.
 >
 > **Two limitations the live run exposed — both fixed in v1.6.2**, and neither
@@ -317,27 +322,26 @@ photon. That approach was dropped: in v1.6.0 the relay switched to sending OTLP
 became the spec-compliant side and photon needs no change to ingest it. (The
 recon lives in git history if the JSON path is ever wanted for its own sake.)
 
-**Proposed OTLP mapping** (for the shim / photon-side importer):
+**OTLP mapping** (as shipped by `buildOtlp`, `src/relay.zig`):
 
 | bundle field | OTLP LogRecord |
 |---|---|
-| `ts` | `time_unix_nano` |
-| `cause.kind` + `verdict` | `body` |
-| severity | `ERROR` (exit/signal/oom/unhealthy), `WARN` (leak/restart-loop) |
+| — | `time_unix_nano` / `observed_time_unix_nano` = when the relay sent it (the bundle's own `ts` is inside `mandor.bundle`) |
+| `verdict` | `body` |
+| `cause.kind` | severity: `WARN` for leak-suspect / restart-loop, else `ERROR` |
 | `process.name` | resource attr `service.name` (origin-prefixed by `service_prefix` when set) |
-| `process.build.release` / `elf_build_id` | resource attrs `service.version`, `build.id` |
-| `exception.type` / `message` | attrs `exception.type`, `exception.message` (OTEL semconv) |
-| `trace.frames` | attr `exception.stacktrace` (rendered) |
-| whole bundle | attr `mandor.bundle` (JSON string, schema-versioned) |
+| `process.build.release` | resource attr `service.version` |
+| whole bundle | attr `mandor.bundle` (JSON string, schema-versioned) — exception, trace frames and everything else ride inside it |
 
 ### 4. Process-lifecycle events — OTLP logs alongside incidents
 
 The relay daemon also emits process-lifecycle events to `/v1/logs`: `started`,
-`exited` (ok / error / OOM), `restarting` (with backoff), and `unhealthy`.
+`exited` (ok / error / OOM), `restarting` (with backoff), `healthy` and
+`unhealthy`.
 Best-effort over the same non-blocking pipe as metrics — so photon shows a
 worker's timeline (start → restart → crash) next to its metrics and any incident
-bundle, all under the same host identity and the same `service.name` (the worker,
-origin-prefixed by `service_prefix` when set).
+bundle, all under the same `service.name` (the worker, origin-prefixed by
+`service_prefix` when set; lifecycle events carry no host attributes).
 
 ## What we need, concretely — done
 
@@ -345,8 +349,8 @@ The integration is complete on mandor's side and confirmed end to end (below);
 this section is kept as the contract record.
 
 1. **`on_incident` hook / `photon=` key** — SHIPPED (ROADMAP #19). The relay
-   daemon builds on it to push incidents, metrics, host/GPU metrics, and
-   lifecycle events as OTLP.
+   daemon builds on it to push incidents, per-process/supervisor metrics, the
+   digest/streamed logs, and lifecycle events as OTLP.
 2. **Contract freeze docs** — this file + schema versioning discipline
    (enforced by golden fixture tests). photon developers code against `"v"`
    and get told loudly when it bumps.

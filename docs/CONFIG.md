@@ -24,7 +24,7 @@ names stay safe in the Prometheus exposition format.
 | `stop_grace = "10s"` | — | `10s` | TERM→KILL escalation window on shutdown |
 | `state_dir = "/path"` | `--state-dir=` / `MANDOR_STATE_DIR` | `/var/lib/mandor` | State file + incident spool + history |
 | `metrics_port = 9464` | `--metrics=` | off | Prometheus text endpoint on 127.0.0.1 |
-| `photon = "127.0.0.1:4318"` | — / `PHOTON_OTLP_HTTP_ENDPOINT` | off | Ship incidents + metrics + lifecycle events to photon as OTLP; fully offline without it. `PHOTON_OTLP_HTTP_ENDPOINT` overrides the TOML value — a full URL or a bare `host:port`, mandor strips the scheme either way. Auth via `PHOTON_INGEST_TOKEN` env (photon's name for it; `PHOTON_OTLP_TOKEN` still read). See "photon telemetry" below |
+| `photon = "127.0.0.1:4318"` | — / `PHOTON_OTLP_HTTP_ENDPOINT` | off | Ship incidents + metrics + lifecycle events + the warn/error digest to photon as OTLP; fully offline without it. `PHOTON_OTLP_HTTP_ENDPOINT` overrides the TOML value — a full URL or a bare `host:port`, mandor strips the scheme either way. Auth via `PHOTON_INGEST_TOKEN` env (photon's name for it; `PHOTON_OTLP_TOKEN` still read). See "photon telemetry" below |
 | `service_prefix = "tenant-a-"` | — / `MANDOR_SERVICE_PREFIX` | `""` | Origin/tenant tag prepended to `service.name` on **every** OTLP emission (metrics, incidents, lifecycle, streamed logs, the digest), so several mandor origins can share one multi-tenant photon without `service.name` colliding. Telemetry-only — the bare worker name is unchanged in the log `[name]` prefix, `report`, and Prometheus labels; `host.id` still distinguishes hosts. Default `""` = unchanged; inert without `photon=` |
 | `on_incident = "CMD"` | — | off | Exec CMD after each bundle write, bundle path appended |
 | `ready_fd = 5` | — | off | s6-style readiness: workers write a newline to this fd |
@@ -37,7 +37,7 @@ Setting `photon = "host:port"` is the single switch that makes mandor speak
 OTLP. With it unset, mandor opens no socket and spawns no relay child — the
 offline default is unchanged. With it set, the supervisor spawns one long-lived
 `mandor relay --daemon` child that owns the socket; the supervision path itself
-never touches one. That child ships three things to photon:
+never touches one. That child ships four things to photon:
 
 - **Incidents** → OTLP logs (`/v1/logs`). Read from the durable incident spool,
   so they are **never dropped** — a bundle that fails to send is retried next
@@ -62,16 +62,19 @@ never touches one. That child ships three things to photon:
   same pipe.
 
 By default mandor does **not** ship raw per-line worker logs and never ships
-traces: it *curates*, so log content travels only inside incident bundles. That
+traces: it *curates*, so log content travels only inside incident bundles and
+the curated warn/error digest (Tier 2, below). That
 default is opt-out only for logs — set `[worker.NAME] stream = true` (see below)
 on the specific workers whose stdout/stderr firehose you want streamed to photon's
 `/v1/logs`. Traces are
 never shipped either way. The other telemetry behaviours (metrics on when
 `photon` is set, the 5 s sample cadence, the daemon's internal buffer size) are
-fixed and intentionally not exposed as separate keys — `photon`, the per-worker
-`stream` toggle, plus the small `[logs]` rate cap are the whole telemetry surface,
+fixed and intentionally not exposed as separate keys — `photon`, `service_prefix`,
+the per-worker `stream` toggle, and the small `[logs]` section (`max_rate`,
+`digest*`) are the whole telemetry surface,
 keeping to the four-CLI-flag / minimal-key rule. `PHOTON_INGEST_TOKEN` (env, kept
-off the process cmdline; the bearer var's name changed in v1.12) sets the
+off the process cmdline; `PHOTON_OTLP_TOKEN`, its v1.12–v1.16.0 name, is still
+read as an alias) sets the
 bearer token when photon requires auth.
 
 ### Per worker only: no host, GPU or pressure sampling
@@ -135,15 +138,16 @@ Curated warn/error digest (the `[logs] digest*` keys):
 
 ### Worker log streaming (per-worker `stream`, plus the `[logs]` rate cap)
 
-Off by default — mandor **curates** (incident bundles + metrics + lifecycle) and
+Off by default — mandor **curates** (incident bundles + metrics + lifecycle +
+the digest) and
 does not ship raw per-line logs. Streaming is selected **per worker**: set
 `stream = true` inside a `[worker.NAME]` section to stream that worker's
 stdout/stderr lines to photon's `/v1/logs` as OTLP logs (one `service.name` per
 worker, the line as the log `body`, stderr/severity flagged). Only the workers you
 mark stream; every other worker stays curated. Streaming also requires `photon=`
 to be set — with no relay daemon there is nowhere to stream to, so the toggle is
-inert on its own. The `[logs]` section now holds only the global `max_rate` cap
-that applies across all streaming workers.
+inert on its own. The `[logs]` section holds the global `max_rate` cap that
+applies across all streaming workers, and the `digest*` knobs (Tier 2).
 
 This is the **ephemeral, best-effort tier**: streamed lines ride the same
 non-blocking pipe as metrics and are **dropped under backpressure** (slow/absent

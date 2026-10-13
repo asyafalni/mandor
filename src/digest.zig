@@ -1,8 +1,8 @@
 //! Tier 2 curated warn/error digest: a bounded, dedup'd, flood-proof-by-
 //! construction accumulator for warn/error log lines. Free-tier heuristic —
 //! NO LLM, NO network here. This module owns ONLY the data structure and its
-//! record/query API; the periodic emission + timer + config is Task 4 and lives
-//! elsewhere. It is NOT wired into the supervisor capture hot path yet.
+//! record/query API; the supervisor records into it from capture and owns the
+//! periodic flush timer and config.
 //!
 //! Dedup reuses `summarize.signature` (FNV-1a, digits stripped), so identical
 //! lines that differ only in numbers ("conn 17 refused" == "conn 42 refused")

@@ -88,7 +88,7 @@ Go-supervisord). Top 3 ≈ <10 KB total; build top-down.
 - File-watch auto-restart (dev-laptop workflow; prod restarts are image rollouts)
 - Control-plane API / pub-sub bus (size + attack surface; state file + report + metrics + hook suffice)
 - Condition DSLs à la god/eye (opinionated zero-config detectors beat a language)
-- pm2-style cluster fd-sharing (Node-specific; `replicas` is the honest version)
+- pm2-style cluster fd-sharing (Node-specific; replication belongs to the orchestrator — see #25)
 - FDStore-style state handoff, launchd KeepAlive conditions, cron scheduling (wrong layer)
 - `one_for_all` restart groups (= "restart the container" — the orchestrator's job)
 - Web GUI / XML-RPC control / remote syslog (Go-supervisord's additions; offline boundary + size)
@@ -316,7 +316,8 @@ all of them as a side effect, and what is left is a one-condition change.
 `essential = false` and never exits): mandor idles indefinitely with no real
 work left.
 
-**Remaining work:** the loop-exit test currently asks "is any worker still
+**SHIPPED v1.4.0** (see table) — the loop-exit test now asks only of essential
+workers. Original note: the loop-exit test asked "is any worker still
 live or pending"; it should ask that of *essential* workers only. Non-essential
 workers then get TERM'd through the normal graceful shutdown. One condition
 plus a harness case — the design thinking is done.
@@ -356,8 +357,9 @@ grandchildren rather than killing them early.
 
 ### #45 — `relay.zig` has no test coverage
 
-The photon bridge (`mandor relay`, run via the `photon = "ip:port"` key) has
-**zero fuzz targets and zero harness cases**, yet it parses two inputs it does
+**Resolved in v1.5.2** (see table). Original note: the photon bridge (`mandor
+relay`, run via the `photon = "ip:port"` key) had **zero fuzz targets and zero
+harness cases**, yet it parses two inputs it does
 not control: the `ip:port` config value (`parseHostPort`) and the incident
 bundle read back off disk (`scanStr`, `buildOtlp`).
 
@@ -380,7 +382,8 @@ sampler tick and shutdown. Splitting the death path and the health path into
 their own functions would help reviewability, and possibly `.text` too, since
 several `std.fmt` instantiations get inlined into it.
 
-Not urgent, and worth doing only alongside a change that already touches the
+**SHIPPED v1.5.0** (see table). Original note: not urgent, and worth doing only
+alongside a change that already touches the
 loop — a pure refactor of PID 1's core for its own sake carries more risk than
 it removes.
 
@@ -393,8 +396,9 @@ for `api`" is inexpressible. Small and mechanical; slots naturally into
 ## Tier 10 — self-sufficiency & observability (2026-07 → 2026-08) — ✅ SHIPPED
 
 The post-1.6 arc turned mandor from "produces the signals photon displays" into a
-self-sufficient OTLP source, and let one mandor absorb the role of a standalone
-node agent. Everything here is **opt-in** and rides a single long-lived
+self-sufficient OTLP source, and for a while let one mandor absorb the role of
+a standalone node agent (v1.9; reversed in v1.16, #64 — mandor describes its
+workers, photon-agent the host). Everything here is **opt-in** and rides a single long-lived
 `mandor relay --daemon` child — the supervision path never touches a socket, and
 with no `photon=` key none of it activates. Full contract in
 [INTEGRATION-PHOTON.md](INTEGRATION-PHOTON.md); config in [CONFIG.md](CONFIG.md).
@@ -402,22 +406,23 @@ with no `photon=` key none of it activates. Full contract in
 | # | Feature | Value | Notes |
 |---|---------|-------|-------|
 | 48 ✅ | Self-sufficient OTLP telemetry (`photon =` key) | ● ● ● ● | v1.7.0 — incidents (durable/retried) + per-process & supervisor metrics + lifecycle events pushed as OTLP by the relay daemon; no collector. This is #37 realized: offline = plain stdout, online = photon |
-| 49 ✅ | Node/host metrics + `host.name` on process metrics | ● ● ● ○ | v1.7.1/1.7.2 — `system.*` node resource; `process.*` renamed to OTel semconv; each worker attributable to its node in photon's Infrastructure view |
+| 49 ✅ | Node/host metrics + `host.name` on process metrics | ● ● ● ○ | v1.7.1/1.7.2 — `system.*` node resource; `process.*` renamed to OTel semconv; each worker attributable to its node in photon's Infrastructure view. **REMOVED v1.16** (#64): `system.*` gone; only the `host.name`/`host.id` labels remain |
 | 50 ✅ | App-shared secret store (`[secret.NAME]`) | ● ● ● ○ | v1.8.0 — per-session secrets handed to granted workers over inherited pipe fds (`$CONFD_<NAME>` = the fd number); deny-by-default; value never in env/argv/disk |
-| 51 ✅ | Absorb photon-agent: fine-grained node + GPU metrics | ● ● ● ● | v1.9.0 — per-core CPU, per-mount fs, per-interface net, swap, disk.io, uptime, load 1/5/15m, cpu temp; GPU via `nvidia-smi` (NVIDIA) + DRM sysfs (AMD/Intel), opt-in `[gpu]`. Node sampling moved into the daemon. One mandor with host `/proc`,`/sys` mounted supersedes a standalone node agent |
+| 51 ✅ | Absorb photon-agent: fine-grained node + GPU metrics | ● ● ● ● | v1.9.0 — per-core CPU, per-mount fs, per-interface net, swap, disk.io, uptime, load 1/5/15m, cpu temp; GPU via `nvidia-smi` (NVIDIA) + DRM sysfs (AMD/Intel), opt-in `[gpu]`. Node sampling moved into the daemon. One mandor with host `/proc`,`/sys` mounted supersedes a standalone node agent. **REMOVED v1.16** (#64) |
 | 52 ✅ | Opt-in full log streaming (`[logs] stream`) | ● ● ○ ○ | v1.10.0 — every worker line → OTLP `/v1/logs`, ephemeral/best-effort (dropped under backpressure, `[logs] max_rate` cap), never spooled. Default off: mandor curates (log content otherwise travels only inside incident bundles) unless explicitly asked |
 | 53 ✅ | Log signal v2 — curated digest + per-worker streaming + multi-tenancy | ● ● ● ○ | v1.11.0 — three tiers of log → photon. **Tier 2 curated warn/error digest** (default-on when `photon=`): warn/error lines deduped by signature into a bounded table, shipped as OTLP `/v1/logs` (one record per signature, `mandor.count`/`first_ts`/`last_ts`) every `digest_interval` + threshold early-flush + at shutdown — flood-proof, surfaces log trouble with no crash. Streaming (#52) is now **per worker** (`[worker.NAME] stream`, replacing the global toggle) with automatic backpressure shedding. `service_prefix` tags `service.name` per origin for multi-tenant photon. Relay warns on a 2xx-HTML reply (web-UI port mistaken for OTLP ingest) |
-| 54 ✅ | ENV config for deploy-varying keys + GPU auto-detect | ● ● ● ○ | v1.12.0/1.12.1 — the four deploy-varying keys read from the environment (`PHOTON_OTLP_HTTP_ENDPOINT`, `PHOTON_OTLP_TOKEN` [renamed from `PHOTON_TOKEN`], `MANDOR_SERVICE_PREFIX`, `MANDOR_STATE_DIR`); **ENV overrides TOML** (CLI > ENV > TOML > default), so an ENV-native deploy configures mandor with `-e` and no generated TOML. GPU became **auto-detected** — `[gpu] enabled` removed; the daemon probes once (DRM sysfs first, `nvidia-smi` only if on PATH, so a GPU-less image forks nothing) and stops checking when absent |
+| 54 ✅ | ENV config for deploy-varying keys + GPU auto-detect | ● ● ● ○ | v1.12.0/1.12.1 (GPU auto-detect removed v1.16; the token is `PHOTON_INGEST_TOKEN` since v1.16.1, `PHOTON_OTLP_TOKEN` kept as alias) — the four deploy-varying keys read from the environment (`PHOTON_OTLP_HTTP_ENDPOINT`, `PHOTON_OTLP_TOKEN` [renamed from `PHOTON_TOKEN`], `MANDOR_SERVICE_PREFIX`, `MANDOR_STATE_DIR`); **ENV overrides TOML** (CLI > ENV > TOML > default), so an ENV-native deploy configures mandor with `-e` and no generated TOML. GPU became **auto-detected** — `[gpu] enabled` removed; the daemon probes once (DRM sysfs first, `nvidia-smi` only if on PATH, so a GPU-less image forks nothing) and stops checking when absent |
 | 55 ✅ | TOML as a name-keyed behavior overlay over the CLI worker set | ● ● ● ○ | v1.13.0 — the active worker set is the CLI `--` args (else TOML `workers=`); `[worker.NAME]` sections and `[secret.*]` grants are matched to it **by name**. An orphan section/grant for a worker not spawned this run is a tolerated warning (never an error, never spawns anything), so one static superset TOML validates and runs against any CLI subset. Secrets degrade to the present listed subset (inert if none, no hard error); the CLI-workers+secrets refusal is removed. Worker command line stays CLI-only |
-| 56 ✅ | Flatten `[gpu]` to a global `gpu_interval` key | ● ● ○ ○ | v1.14.0 — the single-key `[gpu]` section (only `interval` survived after `enabled` was dropped) became the global `gpu_interval` duration key (default `15s`, good for most cases). GPU stays auto-detected (no enable toggle); an old `[gpu]` section gives a dedicated migration error. Pure config-surface simplification |
+| 56 ✅ | Flatten `[gpu]` to a global `gpu_interval` key | ● ● ○ ○ | v1.14.0 (**REMOVED v1.16** — `gpu_interval`/`[gpu]` are now migration errors) — the single-key `[gpu]` section (only `interval` survived after `enabled` was dropped) became the global `gpu_interval` duration key (default `15s`, good for most cases). GPU stays auto-detected (no enable toggle); an old `[gpu]` section gives a dedicated migration error. Pure config-surface simplification |
 | 57 ✅ | `expected_exit` / `health_interval` / `health_start_period` per-worker only | ● ● ○ ○ | v1.14.0 — three keys that *describe a binary* (its success codes, probe cadence, warm-up grace) moved from global to `[worker.NAME]` only. Fixes a footgun (a global `expected_exit` masking an unrelated worker's crash) and makes the health feature fully per-worker-coherent (the probe was already per-worker; now its timing is too). Defaults unchanged; a top-level use gives a migration error |
 | 58 ✅ | Declarative checks — `[require.*]` boot gates + `[prober.*]` monitors | ● ● ● ○ | v1.15.0 — two small "run a command and react" TOML features distilled from a supervisor-replacement grilling. `[require.*]` fail-closed boot preconditions (a GPU/driver gate whose `check` calls `nvidia-smi` etc. — no vendor code in the core); `[prober.*]` periodic report/incident monitors (mandor owns the timer; `health` stays the sole restart authority — a prober never restarts). Both reuse the non-blocking check machinery, inert without `photon=` |
-| 59 ✅ | Poll-driven relay daemon loop | ● ● ○ ○ | v1.15.1 — the `mandor relay --daemon` loop stopped waking on a fixed 1 Hz `nanosleep` and now `poll()`s the pipe + signalfd with a timeout computed from the next node/GPU sample deadline (spool scan gated to 1 s). Idle daemon burns ~0 CPU jiffies (was a per-second spin); metrics/incidents still ship on time. Off the PID-1 path. Fixed alongside: reject `gpu_interval = 0` (would collapse the poll timeout to a busy-spin) |
+| 59 ✅ | Poll-driven relay daemon loop | ● ● ○ ○ | v1.15.1 — the `mandor relay --daemon` loop stopped waking on a fixed 1 Hz `nanosleep` and now `poll()`s the pipe + signalfd with a timeout computed from the next node/GPU sample deadline (an idle-tick deadline since v1.16 removed those samplers) (spool scan gated to 1 s). Idle daemon burns ~0 CPU jiffies (was a per-second spin); metrics/incidents still ship on time. Off the PID-1 path. Fixed alongside: reject `gpu_interval = 0` (would collapse the poll timeout to a busy-spin) |
 | 60 ✅ | Relay lifecycle-event batching | ● ● ○ ○ | v1.15.2 — multiple process-lifecycle events drained in one relay cycle now ship as a single OTLP `/v1/logs` request instead of one POST each (`buildOtlpEvent` refactored into a batch encoder `buildOtlpEvents`, same two-pass sizing + ephemeral drop-the-rest discipline as the metric/log batches; single-event output byte-identical). Relay-daemon-only, offline-by-default unchanged. The companion pipe-flood item was deliberately left no-change — network-bound, already covered by emit-side backpressure shedding + `[logs] max_rate` |
-| 61 ✅ | Per-tick sampler syscall trims | ● ● ○ ○ | v1.15.3 — an optimization-audit sweep of the hot paths (found them already tight; three real trims). The node sampler resolves its CPU-temp source once and caches it (was re-walking up to 48 sysfs files every 5s node tick, always 0 on sensor-less hosts — same one-time-detection contract as GPU auto-detect; value still read fresh, selection unchanged). The PID-1 sampler's `countFds` skips `.`/`..` with a first-byte test (no strlen + two eq per dirent), and the supervisor self-metric caches `getpid()`. CPU-priority, off the size budget, no behavior change beyond the CPU-temp one-time-probe tradeoff |
+| 61 ✅ | Per-tick sampler syscall trims | ● ● ○ ○ | v1.15.3 — an optimization-audit sweep of the hot paths (found them already tight; three real trims). (The node-sampler part went with v1.16.) The node sampler resolved its CPU-temp source once and caches it (was re-walking up to 48 sysfs files every 5s node tick, always 0 on sensor-less hosts — same one-time-detection contract as GPU auto-detect; value still read fresh, selection unchanged). The PID-1 sampler's `countFds` skips `.`/`..` with a first-byte test (no strlen + two eq per dirent), and the supervisor self-metric caches `getpid()`. CPU-priority, off the size budget, no behavior change beyond the CPU-temp one-time-probe tradeoff |
 | 62 ✅ | Trim `[prober.*] fail_threshold` (config-surface gate) | ● ○ ○ ○ | v1.15.4 — the config-surface CI gate (budget 43) tripped at 48: v1.15.0's require/prober grew the surface but the budget was never raised. Rather than raise blindly, reconsidered the prober surface and dropped `fail_threshold` — over-built (report is a cheap log; the incident path is already cooldown-guarded, so it only suppressed the first blip's incident). Probers now fire `on_fail` on each failure. Budget deliberately raised 43 → 47 for the remaining, justified require/prober surface. Simplicity-over-knobs |
 | 63 ✅ | `logSeverity` per-line classifier ~2–4× cheaper (photon on) | ● ● ○ ○ | v1.15.5 — a measure-first grilling built `bench/hotline.zig` and found the one real per-line hotspot: the warn/error classifier that runs on every captured line when `photon=` is set probed six keywords per character position, re-lowercasing each byte up to 6×. Replaced with a first-char `switch` (one `toLower`/position, dispatched on the keyword initial) — byte-identical (fuzzed differential test), ~1.4 → ~0.5 µs/line (2–4× measured, VM-noisy; ~6× fewer `toLower`/byte is the structural floor). CPU (top priority) on the per-line branch that scales with log-flood load; offline path unaffected. `bench/` gained the hotline microbench + recorded finding |
 | 64 ✅ | mandor describes its workers, photon-agent describes the host | ● ● ● ○ | v1.16.0 — the v1.9 "absorb photon-agent" direction (#51) is reversed: the relay daemon's node sampler (`hostmetrics.zig`: per-core CPU, memory, swap, fs, net, disk I/O, uptime, cpu temp) and GPU sampler (`gpu.zig`: `nvidia-smi` + DRM sysfs) are removed, with `system.*`/`system.gpu.*`, the `gpu_interval` key (now a migration error) and the daemon's interval argv. photon-agent is always installed on the host and now carries a live per-process table — every process, NVML per-process GPU, and the mandor a process runs under with the worker name mandor would give it — so the host view and the supervisor view meet in photon on `host.name`. Only `hostid.zig` (host.name/host.id for the OTLP resource) stays. −40 tests, config surface 47 → 46, ~335 KB stripped |
+| 65 ✅ | Per worker only: PSI removed; OTLP encoded by `nilo_proto` | ● ● ○ ○ | v1.17.0 — pressure-stall (PSI) was one cgroup-wide number stamped onto every worker and blamed on the largest consumer: removed with the `stall:*` cause; `psi_mem_pct`/`psi_cpu_pct` are migration errors; bundle schema v8. The relay's hand-rolled OTLP protobuf became plain structs (`otlp.zig`) encoded by `nilo_proto` (mandor's one, std-only dependency). Built with Zig 0.17.0 since v1.16.2 |
 
 ## Backlog status
 
@@ -429,12 +434,14 @@ v0.20). The original feature backlog is empty.
 
 **Post-1.6 (Tier 10) is a new, user-directed arc**, not from the research
 rounds: opt-in OTLP self-sufficiency, node + GPU host metrics (absorbing the
-role of a standalone node agent), an app-shared secret store, per-worker log
+role of a standalone node agent — reversed in v1.16, #64: mandor describes its
+workers, photon-agent the host; PSI followed in v1.17, #65), an app-shared
+secret store, per-worker log
 streaming, and the log-signal-v2 curated warn/error digest with `service_prefix`
 multi-tenancy — the telemetry cluster, all gated by `photon=` (with it unset
 nothing opens a socket). Two deploy-ergonomics releases followed on the same
 arc: **v1.12.0** made the four deploy-varying keys ENV-settable (ENV overrides
-TOML) and GPU metrics auto-detected, and **v1.13.0** made the TOML a name-keyed
+TOML), and **v1.13.0** made the TOML a name-keyed
 behavior overlay over the CLI-chosen worker set (orphan sections tolerated,
 secrets degrade gracefully) so one static superset config serves every deploy.
 That closes the observability story; no feature backlog remains beyond the
@@ -442,9 +449,9 @@ non-feature work noted at the end.
 
 **v1.0 fuzz-hardening: done (v1.0.0).** `src/fuzz.zig` mutation-fuzzes the
 whole untrusted-input surface — the six trace parsers, the worker ELF header,
-`mandor.toml`, `/proc` + cgroup text, the relay's OTLP encoders and pipe-frame
+`mandor.toml`, `/proc` stat text, the relay's OTLP encoders and pipe-frame
 decoder (including the Tier-2 digest frame), and mandor's own state files —
-seeded from real crash output in `test/fixtures/`. It now runs **17 targets** and has
+seeded from real crash output in `test/fixtures/`. It now runs **16 targets** and has
 found **seven** PID-1-fatal traps plus a Prometheus label-injection bug and a
 backoff-cap violation across the v1.0.x passes; all fixed
 and pinned by regression tests. Every one was an integer overflow on a value
@@ -460,7 +467,7 @@ clamping logic is itself the bug — the one site that forgot `@min` was the
 crash. The harness was
 itself validated by mutation testing: with the fixes reverted it catches both
 bugs on 8 of 8 seeds. Coverage-guided `zig build test --fuzz` is unusable on
-the pinned Zig (0.16.0, still on 0.17.0), so the harness is in-repo and runs under plain
+the pinned Zig (0.17.0, as on 0.16.0), so the harness is in-repo and runs under plain
 `zig build test`.
 
 **Soak test: done (v1.0.3).** `test/harness/soak.sh` runs capture at full
@@ -492,6 +499,5 @@ non-essential worker. The design rule that falls out of it is in CLAUDE.md:
 up in the test suite itself, where a fuzz seed that fails to parse makes the
 suite greener rather than redder (three occurrences; now guarded).
 
-Remaining non-feature work: a benchmark page vs tini/dumb-init/s6/supervisord,
-distribution (aports/apt/AUR, announcement), and the premium sidecar
+Remaining non-feature work: distribution (aports/apt/AUR, announcement), and the premium sidecar
 (separate repo).

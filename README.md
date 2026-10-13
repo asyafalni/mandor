@@ -9,7 +9,7 @@
 
 [![Zig 0.17.0](https://img.shields.io/badge/zig-0.17.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.17.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Static binary](https://img.shields.io/badge/binary-static%2C%20~334KB-success)
+![Static binary](https://img.shields.io/badge/binary-static%2C%20~331KB-success)
 ![One dependency](https://img.shields.io/badge/dependencies-nilo__proto-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
@@ -41,8 +41,7 @@ $ mandor --max-restarts=3 -- "./api --port 8080" "./worker" "./cron-loop"
 | Per-worker cost + right-sizing report | ✅ | ❌ | ❌ |
 | Release correlation ("did the fix hold?") | ✅ | ❌ | ❌ |
 | OTLP telemetry to an observability backend | ✅ opt-in | ❌ | ❌ |
-| Node + GPU host metrics (node-exporter style) | ✅ opt-in | ❌ | ❌ |
-| Size | **~334 KB** | ~50 KB | MBs + runtime |
+| Size | **~331 KB** | ~50 KB | MBs + runtime |
 | Network access | **off by default** (opt-in OTLP) | never | varies |
 
 The `mandor` binary is **offline by default** and self-contained: no accounts,
@@ -179,7 +178,7 @@ builds each crash appeared on — a crash that survives a code change is flagged
 
 ### Shift report
 
-When mandor shuts down it prints one summary of the whole run to stdout — so
+When mandor shuts down it prints one summary of the whole run to stderr — so
 `kubectl logs` (or an AI post-mortem) shows what happened over the container's
 life without opening a single incident file. Always on, no configuration:
 
@@ -264,7 +263,7 @@ mandor (PID 1)
 ├── spool          incident bundles → /var/lib/mandor/incidents/*.json
 ├── secret         per-session app secrets → granted workers over pipe fds (opt-in)
 └── relay --daemon OTLP telemetry to photon (opt-in, off the hot path): incidents,
-                   per-process + node + GPU metrics, lifecycle, opt-in logs
+                   per-process metrics, lifecycle, warn/error digest, opt-in logs
 ```
 
 Design rules the code lives by:
@@ -310,8 +309,7 @@ unchanged — CI runs the full integration harness on all three distro bases.
 ## Status
 
 **Stable (1.x).** Core supervision has been stable since 1.0; the 1.7–1.11 line
-added opt-in OTLP telemetry, node + GPU host metrics (superseding a standalone
-node agent), an app-shared secret store, per-worker log streaming, and a curated
+added opt-in OTLP telemetry, an app-shared secret store, per-worker log streaming, and a curated
 warn/error digest that surfaces an app's own log trouble without a crash — all
 gated by `photon=`, none of it on the supervision path. The incident-bundle schema
 is a versioned contract, the untrusted-input surface is fuzz-hardened in CI, and every
@@ -340,8 +338,9 @@ What it ships when `photon` is set:
   worker: cpu/rss/fds/threads + restarts, using OTel semantic conventions).
 - **Nothing about the host.** Node and GPU metrics are photon-agent's job (it
   runs on every host and sees every process there — the mandor-supervised ones
-  included, with their GPU share). Every worker carries the node's `host.name` /
-  `host.id`, so photon shows each process against the host photon-agent reports.
+  included, with their GPU share). Every worker's metrics and logs carry the node's
+  `host.name` (logs also `host.id`), so photon shows each process against the
+  host photon-agent reports.
 - **Process-lifecycle events** → OTLP logs (started / exited / restarting /
   unhealthy).
 - **Curated warn/error digest** (on by default when `photon=` is set) → OTLP logs.
