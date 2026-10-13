@@ -1673,6 +1673,49 @@ if [ $c -eq 0 ]; then
   ok "one-shot relay reads PHOTON_OTLP_HTTP_ENDPOINT (URL form)"
 else bad "one-shot relay env endpoint" "exit $c: $(head -2 "$TMP/89")"; fi
 
+# 90. A grandchild still running its own TERM handler when its leader exits
+# must be waited for, and what it prints while draining must reach the log.
+# mandor used to treat "every leader reaped" as done: as PID 1 its exit then
+# killed the grandchild mid-drain (CI's container case 2 lost the race ~1 in N),
+# and the leader's pipes were already closed, so its last words were lost.
+r90="$TMP/gc90_ready"
+cat > "$TMP/gc90.sh" <<GCEOF
+(trap 'sleep 1; echo GC90-DRAINED; exit 0' TERM; touch $r90; while :; do sleep 0.1; done) &
+trap 'exit 0' TERM
+while :; do sleep 0.1; done
+GCEOF
+"$MANDOR" "bash $TMP/gc90.sh" >"$TMP/90" 2>&1 &
+mpid=$!
+for _ in $(seq 1 100); do [ -f "$r90" ] && break; sleep 0.1; done
+kill -TERM "$mpid"
+wait "$mpid" 2>/dev/null
+if grep -q "GC90-DRAINED" "$TMP/90"; then
+  ok "shutdown waits for a draining grandchild and keeps its output"
+else bad "grandchild drain wait" "$(tail -3 "$TMP/90" | tr '\n' ' ')"; fi
+
+# 91. ...but a grandchild that ignores TERM cannot hold shutdown past
+# stop_grace: the group is KILLed and mandor exits.
+r91="$TMP/gc91_ready"; p91="$TMP/gc91_pid"
+cat > "$TMP/gc91.sh" <<GCEOF
+(trap '' TERM; echo \$\$ > /dev/null; sh -c 'echo \$PPID' > $p91; touch $r91; while :; do sleep 0.1; done) &
+trap 'exit 0' TERM
+while :; do sleep 0.1; done
+GCEOF
+printf 'stop_grace = "1s"\n' > "$TMP/91.toml"
+"$MANDOR" --config="$TMP/91.toml" -- "bash $TMP/gc91.sh" >"$TMP/91" 2>&1 &
+mpid=$!
+for _ in $(seq 1 100); do [ -f "$r91" ] && break; sleep 0.1; done
+t0=$(date +%s%N)
+kill -TERM "$mpid"
+wait_dead "$mpid"; dead=$?
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+gcpid=$(cat "$p91" 2>/dev/null)
+sleep 0.3
+if [ $dead -eq 0 ] && [ "$ms" -lt 4000 ] && [ -n "$gcpid" ] && ! kill -0 "$gcpid" 2>/dev/null; then
+  ok "a TERM-ignoring grandchild is killed at stop_grace and shutdown completes (${ms}ms)"
+else bad "grandchild stop_grace bound" "exited=$([ $dead -eq 0 ] && echo y || echo n) after ${ms}ms, grandchild alive=$(kill -0 "$gcpid" 2>/dev/null && echo y || echo n)"
+  kill -KILL "$mpid" 2>/dev/null; kill -KILL "$gcpid" 2>/dev/null; fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

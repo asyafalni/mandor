@@ -531,6 +531,9 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         if (sd.active and !sd.killed and sd.deadline_ms != 0 and
             sd.deadline_ms < wake_at)
             wake_at = sd.deadline_ms;
+        // A draining grandchild may not be our child (no SIGCHLD outside a
+        // container), so look again shortly rather than wait for a signal.
+        if (fleet.draining) wake_at = @min(wake_at, nowMs() +| drain_poll_ms);
         if (!sd.active) {
             for (0..workers.len) |i| {
                 if (!waiting[i]) continue;
@@ -618,6 +621,8 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         }
     }
 
+    // Pipes left open for draining grandchildren: read what they wrote, close.
+    for (workers) |*w| closePipes(w);
     report.writeState(state_dir, workers, nowMs());
     cost.save(state_dir);
 
@@ -986,7 +991,24 @@ fn expectedFor(w: *const spawner.Worker, code: u8) bool {
 ///
 /// The loop's `break` stays in the caller: control flow belongs at the
 /// loop, so this returns the decision rather than taking it.
-const Fleet = struct { finished: bool, next_deadline: u64 };
+/// How often a shutdown re-checks process groups left draining.
+const drain_poll_ms: u64 = 50;
+
+const Fleet = struct { finished: bool, next_deadline: u64, draining: bool = false };
+
+/// During a shutdown, is a reaped leader's process group still running? Those
+/// are grandchildren in their own TERM handlers (v1.5.1 stopped killing them);
+/// the shutdown is not done until they finish or stop-grace KILLs them. Signal
+/// 0 probes without sending. An empty group drops the recorded pgid, so it is
+/// never probed again (and never names a recycled id).
+fn groupDraining(w: *spawner.Worker) bool {
+    if (w.pgid <= 0) return false;
+    if (posix.errno(linux.kill(-w.pgid, @fromBackingInt(@intCast(0)))) == .SRCH) {
+        w.pgid = 0;
+        return false;
+    }
+    return true;
+}
 
 fn assessFleet(
     sd: *Shutdown,
@@ -1004,10 +1026,16 @@ fn assessFleet(
     // run, not a reason to stay alive once they are all finished.
     var essential_busy: usize = 0;
     var next_deadline: u64 = 0;
+    var draining = false;
     for (workers, 0..) |*w, i| {
         var busy = true;
         if (w.pid != 0) {
             live += 1;
+        } else if (sd.active and groupDraining(w)) {
+            // Leader reaped, grandchildren still draining: exiting now would
+            // kill them as PID 1 (or orphan them outside a container).
+            live += 1;
+            draining = true;
         } else if (waiting[i]) {
             pending += 1;
         } else if (!w.done and w.next_restart_ms != 0) {
@@ -1048,7 +1076,7 @@ fn assessFleet(
         logmod.print("[mandor] all essential workers finished; stopping the rest\n", .{});
         beginShutdown(sd, workers, waiting, envp, path_env, nowMs(), cfg.stop_grace_ms, essential_code);
     }
-    return .{ .finished = false, .next_deadline = next_deadline };
+    return .{ .finished = false, .next_deadline = next_deadline, .draining = draining };
 }
 
 /// Spawn every worker whose backoff has elapsed, then — with
@@ -1278,7 +1306,10 @@ fn handleDeaths(
         w.fail_streak = if (clean)
             0
         else if (uptime_ms >= backoff.stable_uptime_ms) 1 else w.fail_streak + 1;
-        closePipes(w);
+        // During a shutdown the leader's grandchildren may still be draining
+        // and writing their last words to these pipes: leave them open until
+        // EOF (every writer gone) or the end of the run, whichever is first.
+        if (!sd.active) closePipes(w);
         logDeath(w);
         // Lifecycle: every death emits one event (clean or not, shutdown or not).
         // A worker killed by SIGKILL while the cgroup OOM counter rose is an OOM;

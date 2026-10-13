@@ -6,6 +6,14 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
 ## [1.17.2] - 2026-10-13
 
 ### Fixed
+- **A graceful shutdown waits for grandchildren still in their own TERM handler.** v1.5.1 stopped
+  the post-death sweep from killing them, but mandor still treated "every leader reaped" as done
+  and exited at once: as PID 1 that killed the grandchild mid-drain, and outside a container it
+  left a TERM-ignoring one running — stop-grace's KILL never fired because mandor was gone. A
+  reaped leader's process group now counts as live during a shutdown until it is empty or
+  stop-grace KILLs it, and its pipes stay open, so what it prints while draining reaches the log.
+  Found by CI's container case, which passed only when the drain happened to finish inside the
+  leader's own tick; that case now drains for a full second and is deterministic.
 - **A bundle photon rejects no longer holds back the incidents behind it.** Any non-2xx used to
   stop the spool cycle and retry, so a payload photon refuses for good (400 / 413 / 422 — OTLP
   says a client MUST NOT retry a 400) blocked every newer incident and logged the rejection every
