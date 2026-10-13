@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", build_opts);
+    // nilo_proto: protobuf from plain structs, std-only and allocation-free
+    // via encodeInto. The relay's OTLP encoders are built on it; nothing else
+    // of nilo is imported (its HTTP/runtime modules are not PID-1 material).
+    const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize });
+    exe.root_module.addImport("nilo_proto", nilo.module("nilo_proto"));
     b.installArtifact(exe);
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });

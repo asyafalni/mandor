@@ -577,8 +577,8 @@ const relay_seed =
 /// Walk a protobuf message, verifying every field stays inside `b` and that
 /// the walk lands exactly on the end. Returns false on any overrun.
 ///
-/// This is the invariant a hand-rolled encoder can actually violate: sizes are
-/// computed in one pass and written in another, so a mismatch produces a
+/// This is the invariant a sizing encoder can actually violate: nilo_proto
+/// computes sizes in one pass and writes in another, so a mismatch produces a
 /// length that points past its parent. Decoders reject that; so must we,
 /// before shipping it to one.
 fn protoWalk(b: []const u8, depth: u8) bool {

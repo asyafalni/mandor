@@ -132,7 +132,12 @@ forever). New work follows the same discipline — compile early, size-gate, shi
 - Signal handling via `signalfd` + poll loop, NOT async signal handlers.
   Single-threaded event loop for supervision; one extra thread only if the
   sampler needs it (prefer integrating into the poll loop with timeouts).
-- No external dependencies in the core. Trace "parsing" is line-oriented
+- One pinned dependency, and only its std-only tool module: `nilo_proto`
+  (nilo v0.8.0, `build.zig.zon`) encodes the relay's OTLP protobuf from the
+  structs in `src/otlp.zig`, via `encodeInto` into fixed buffers (no
+  allocator). Nothing else of nilo is imported: its HTTP/runtime modules need
+  an event loop, threads and allocation, which PID 1 forbids. Any further
+  dependency needs the same case made against the motto. Trace "parsing" is line-oriented
   scanning (`std.mem` functions), not regex. If a regex ever feels needed,
   the parser design is wrong.
 - ReleaseSafe (not ReleaseFast) for shipped binaries — keep safety checks;
@@ -186,14 +191,14 @@ mandor/
 │   ├── capture.zig  ring.zig  sampler.zig  detector.zig  cgroup.zig
 │   ├── summarize.zig  incident.zig  spool.zig  history.zig
 │   ├── report.zig  cost.zig  metrics.zig  elf.zig  caps.zig  secret.zig
-│   ├── telemetry.zig  relay.zig  frame.zig  hostid.zig  resolve.zig
+│   ├── telemetry.zig  relay.zig  otlp.zig  frame.zig  hostid.zig  resolve.zig
 │   ├── log.zig  jsonbuf.zig  fuzz.zig
 │   └── parsers/ (go.zig  rust.zig  python.zig  node.zig  java.zig  zigp.zig)
 └── test/ (fixtures/  harness/  container/  photon/)
 ```
 
 The telemetry cluster (`telemetry.zig` emit path, `relay.zig` OTLP encoders +
-the `relay --daemon`, `frame.zig` pipe wire format, `hostid.zig` host identity,
+the `relay --daemon`, `otlp.zig` the OTLP message structs for `nilo_proto`, `frame.zig` pipe wire format, `hostid.zig` host identity,
 `resolve.zig` DNS) is inert unless `photon=` is set.
 
 ## Product boundaries (do not blur)

@@ -222,9 +222,12 @@ tooling and the premium sidecar (a separate, per-incident detached process).
 
 Protobuf rather than JSON because OTLP/HTTP makes protobuf the mandatory
 encoding and JSON the optional one: the relay therefore works with any
-conformant collector, not just those that implemented both. The encoder is
-hand-rolled (~120 lines of varints and length-delimited fields) so the
-no-dependency rule holds.
+conformant collector, not just those that implemented both. The messages are
+plain structs (`src/otlp.zig`, the subset of opentelemetry-proto mandor
+writes) encoded by `nilo_proto` straight into the relay's fixed body buffer:
+no allocator, and a message that does not fit is refused before a byte is
+written. nilo's own conformance test round-trips OTLP logs requests written by
+prost from photon-loadgen, byte for byte.
 
 The relay refuses rather than ships a payload it cannot vouch for, and says
 which on stderr: a bundle over 256KB (`refusing to ship a truncated

@@ -9,7 +9,13 @@ arch="x86_64 aarch64"
 license="MIT"
 makedepends="zig"
 source="$pkgname-$pkgver.tar.gz::https://github.com/asyafalni/mandor/archive/refs/tags/v$pkgver.tar.gz"
-options="!check" # unit tests need the exact pinned zig; CI covers them upstream
+options="!check net" # unit tests need the exact pinned zig; CI covers them upstream.
+# net: the build fetches its one pinned dependency (nilo, for nilo_proto).
+
+prepare() {
+	default_prepare
+	zig build --fetch
+}
 
 build() {
 	zig build -Doptimize=ReleaseSafe --prefix "$builddir/out"

@@ -10,7 +10,7 @@
 [![Zig 0.17.0](https://img.shields.io/badge/zig-0.17.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.17.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Static binary](https://img.shields.io/badge/binary-static%2C%20~334KB-success)
-![No dependencies](https://img.shields.io/badge/dependencies-zero-success)
+![One dependency](https://img.shields.io/badge/dependencies-nilo__proto-success)
 
 *Mandor* (Indonesian): the site foreman — the one who supervises the workers.
 
@@ -280,7 +280,9 @@ Design rules the code lives by:
   drift**.
 - **Single thread, one poll loop.** Signals arrive via `signalfd`, not async
   handlers.
-- **No dependencies, no regex.** Trace parsing is line-oriented scanning.
+- **No regex, one small dependency.** Trace parsing is line-oriented scanning.
+  The only import is `nilo_proto` (std-only, allocation-free) for the relay's
+  OTLP protobuf.
 - **Untrusted input is fuzzed.** Worker stderr, the worker's ELF header,
   config, `/proc` text, and mandor's own state files all run through a
   mutation-fuzzing harness on every CI build — a parser panic would kill

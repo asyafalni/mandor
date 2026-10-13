@@ -14,6 +14,8 @@ const spool = @import("spool.zig");
 const hostid = @import("hostid.zig");
 const sampler = @import("sampler.zig");
 const summarize = @import("summarize.zig");
+const otlp = @import("otlp.zig");
+const proto = @import("nilo_proto");
 
 /// Wall-clock ceiling on each blocking socket call. Generous enough that a
 /// merely slow collector still succeeds, short enough that a hung one cannot
@@ -216,162 +218,41 @@ fn unescape(s: []const u8) ?[]const u8 {
     return unesc_buf[start..unesc_pos];
 }
 
-// ------------------------------------------------------- protobuf encoding
+// ------------------------------------------------------- OTLP encoding
 //
 // OTLP/HTTP requires servers to accept protobuf; JSON support is optional in
-// practice and many collectors (photon included) never implemented it. Encoding
-// by hand keeps the no-dependency rule: the wire format is varints plus
-// length-delimited fields, and mandor already hand-rolls its JSON.
+// practice and many collectors (photon included) never implemented it. The
+// messages are plain structs in otlp.zig, and nilo_proto encodes them straight
+// into body_buf: sized once, written once, no allocator, and a message that
+// does not fit is refused before a byte is written.
 //
-// Field numbers are from opentelemetry-proto (logs/v1, common/v1, resource/v1).
-// All are <= 15, so every tag fits in one byte.
+// Every value below is built on the stack and encoded before the next one is
+// built, so the slices it borrows (svc_buf, the event scratch) never outlive
+// the record they belong to.
 
-const wire_varint: u8 = 0;
-const wire_fixed64: u8 = 1;
-const wire_len: u8 = 2;
-
-fn tagByte(comptime field: u8, comptime wire: u8) u8 {
-    return (field << 3) | wire;
-}
-
-fn varintLen(v: u64) usize {
-    var n: usize = 1;
-    var x = v >> 7;
-    while (x != 0) : (x >>= 7) n += 1;
-    return n;
-}
-
-/// Bytes taken by `tag + length + payload` for a length-delimited field.
-fn delimLen(payload: usize) usize {
-    return 1 + varintLen(payload) + payload;
-}
-
-const Writer = struct {
-    buf: []u8,
-    pos: usize = 0,
-
-    fn byte(self: *Writer, b: u8) void {
-        self.buf[self.pos] = b;
-        self.pos += 1;
-    }
-
-    fn varint(self: *Writer, v: u64) void {
-        var x = v;
-        while (x >= 0x80) : (x >>= 7) self.byte(@as(u8, @truncate(x)) | 0x80);
-        self.byte(@truncate(x));
-    }
-
-    fn fixed64(self: *Writer, comptime field: u8, v: u64) void {
-        self.byte(tagByte(field, wire_fixed64));
-        var i: usize = 0;
-        while (i < 8) : (i += 1) self.byte(@truncate(v >> @intCast(i * 8)));
-    }
-
-    fn uint(self: *Writer, comptime field: u8, v: u64) void {
-        self.byte(tagByte(field, wire_varint));
-        self.varint(v);
-    }
-
-    /// Opens a length-delimited field whose payload length is already known.
-    fn delim(self: *Writer, comptime field: u8, payload: usize) void {
-        self.byte(tagByte(field, wire_len));
-        self.varint(payload);
-    }
-
-    fn string(self: *Writer, comptime field: u8, s: []const u8) void {
-        self.delim(field, s.len);
-        @memcpy(self.buf[self.pos..][0..s.len], s);
-        self.pos += s.len;
-    }
-};
-
-/// AnyValue{string_value=1}
-fn anyValueLen(v: []const u8) usize {
-    return delimLen(v.len);
-}
-
-/// KeyValue{key=1, value=AnyValue=2}
-fn keyValueLen(k: []const u8, v: []const u8) usize {
-    return delimLen(k.len) + delimLen(anyValueLen(v));
-}
-
-fn putAnyValue(w: *Writer, comptime field: u8, v: []const u8) void {
-    w.delim(field, anyValueLen(v));
-    w.string(1, v); // AnyValue.string_value
-}
-
-fn putKeyValue(w: *Writer, comptime field: u8, k: []const u8, v: []const u8) void {
-    w.delim(field, keyValueLen(k, v));
-    w.string(1, k); // KeyValue.key
-    putAnyValue(w, 2, v); // KeyValue.value
-}
-
-/// AnyValue{int_value=3} — a varint-encoded int64 (used for the Tier-2 digest's
-/// numeric attributes mandor.count / .first_ts / .last_ts). The string arm above
-/// uses field 1; this is the same AnyValue message with the int_value arm.
-fn anyValueIntLen(v: u64) usize {
-    return 1 + varintLen(v); // tag(field 3, varint) + the varint value
-}
-
-/// KeyValue{key=1, value=AnyValue(int)=2} — the int-valued sibling of keyValueLen.
-fn keyValueIntLen(k: []const u8, v: u64) usize {
-    return delimLen(k.len) + delimLen(anyValueIntLen(v));
-}
-
-fn putAnyValueInt(w: *Writer, comptime field: u8, v: u64) void {
-    w.delim(field, anyValueIntLen(v));
-    w.uint(3, v); // AnyValue.int_value
-}
-
-fn putKeyValueInt(w: *Writer, comptime field: u8, k: []const u8, v: u64) void {
-    w.delim(field, keyValueIntLen(k, v));
-    w.string(1, k); // KeyValue.key
-    putAnyValueInt(w, 2, v); // KeyValue.value
-}
-
-/// Scratch for `service_prefix ++ name`, formed and consumed within a single
-/// putServiceName call (single-threaded daemon, no cross-call state). Sized to
-/// the prefix cap plus the largest name any encoder passes: the incident path's
-/// name_txt is bounded by unesc_buf and every frame-sourced name is far smaller,
-/// so the join never truncates in practice — meaning an empty prefix yields the
-/// bare name verbatim (byte-identical to a build without this feature).
+/// Scratch for `service_prefix ++ name`, joined and consumed within one
+/// record's encode (single-threaded daemon, no cross-call state). Sized to the
+/// prefix cap plus the largest name any encoder passes: the incident path's
+/// name_txt is bounded by unesc_buf and every frame-sourced name is far
+/// smaller, so the join never truncates in practice — meaning an empty prefix
+/// yields the bare name verbatim (byte-identical to a build without it).
 var svc_buf: [service_prefix_cap + unesc_buf.len]u8 = undefined;
 
-/// Encoded value length of the prefixed `service.name` (prefix.len + name.len),
-/// clamped to the scratch so the sizing pass and the write can never disagree.
-/// Length-only: pass 1 needs no scratch and never concatenates.
-fn svcNameLen(name: []const u8) usize {
-    return @min(service_prefix.len +| name.len, svc_buf.len);
-}
-
-/// KeyValue length for `service.name = service_prefix ++ name`. Drop-in for
-/// `keyValueLen("service.name", name)` in every sizing pass. Expands to the same
-/// shape keyValueLen produces: delimLen(key.len) + delimLen(anyValueLen(vlen)),
-/// where anyValueLen(v) == delimLen(v.len).
-fn serviceKvLen(name: []const u8) usize {
-    const vlen = svcNameLen(name);
-    return delimLen("service.name".len) + delimLen(delimLen(vlen));
-}
-
-/// Write `service.name = service_prefix ++ name` as resource attribute (field 1).
-/// Forms the joined value in svc_buf and hands it to putKeyValue, so the on-wire
-/// bytes are exactly serviceKvLen(name). With an empty prefix the value is the
-/// bare name — byte-identical to the previous putKeyValue(w, 1, "service.name",
-/// name) call sites.
-fn putServiceName(w: *Writer, name: []const u8) void {
-    const vlen = svcNameLen(name);
-    const plen = @min(service_prefix.len, vlen);
+/// The `service.name` resource attribute, origin-prefixed. The ONE place the
+/// prefix is applied; it touches only service.name.
+fn serviceName(name: []const u8) otlp.KeyValue {
+    const n = @min(service_prefix.len +| name.len, svc_buf.len);
+    const plen = @min(service_prefix.len, n);
     @memcpy(svc_buf[0..plen], service_prefix[0..plen]);
-    const nlen = vlen - plen;
-    @memcpy(svc_buf[plen..][0..nlen], name[0..nlen]);
-    putKeyValue(w, 1, "service.name", svc_buf[0..vlen]);
+    @memcpy(svc_buf[plen..n], name[0 .. n - plen]);
+    return .str("service.name", svc_buf[0..n]);
 }
 
-/// OTLP SeverityNumber. INFO for routine lifecycle, WARN for recoverable
-/// trouble, ERROR for a failed/killed worker or an incident.
-const sev_info: u64 = 9;
-const sev_warn: u64 = 13;
-const sev_error: u64 = 17;
+/// A non-negative count as OTLP's int64. A bit cast, not a range check: the
+/// varint of a u64 and of the i64 with the same bits are the same bytes.
+fn int64(v: u64) i64 {
+    return @bitCast(v);
+}
 
 const BuildError = error{ TooLarge, Malformed };
 
@@ -381,10 +262,7 @@ pub fn buildOtlp(bundle: []const u8) BuildError![]const u8 {
     const kind = scanStr(bundle, "kind") orelse "unknown";
     const verdict = scanStr(bundle, "verdict") orelse "";
     const release = scanStr(bundle, "release") orelse "";
-    const severity: []const u8 = if (std.mem.eql(u8, kind, "leak-suspect") or
-        std.mem.eql(u8, kind, "restart-loop")) "WARN" else "ERROR";
-
-    const sev_num: u64 = if (std.mem.eql(u8, severity, "WARN")) sev_warn else sev_error;
+    const warn = std.mem.eql(u8, kind, "leak-suspect") or std.mem.eql(u8, kind, "restart-loop");
 
     // Decode the scanned fields: they are JSON source, and a protobuf string
     // holds raw bytes. This both unescapes and validates — a bundle truncated
@@ -399,115 +277,41 @@ pub fn buildOtlp(bundle: []const u8) BuildError![]const u8 {
     _ = linux.clock_gettime(.REALTIME, &ts);
     const ns: u64 = @as(u64, @intCast(ts.sec)) *| 1_000_000_000 +| @as(u64, @intCast(ts.nsec));
 
-    // Pass 1: sizes, innermost first. Protobuf writes a nested message's length
-    // *before* its bytes and mandor has no allocator to build-then-measure in,
-    // so two passes over a handful of known fields beats a scratch buffer.
-    const rec_len =
-        9 + // time_unix_nano (fixed64, field 1)
-        9 + // observed_time_unix_nano (fixed64, field 11)
-        1 + varintLen(sev_num) + // severity_number (field 2)
-        delimLen(severity.len) + // severity_text (field 3)
-        delimLen(anyValueLen(verdict_txt)) + // body (field 5)
-        delimLen(keyValueLen("mandor.bundle", bundle)); // attributes (field 6)
-    const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
-    const resource_len =
-        delimLen(serviceKvLen(name_txt)) +
-        delimLen(keyValueLen("service.version", release_txt));
-    const rl_len = delimLen(resource_len) + delimLen(scope_len);
-    const total = delimLen(rl_len); // ExportLogsServiceRequest.resource_logs
-    if (total > body_buf.len) return error.TooLarge;
-
-    // Pass 2: write.
-    var w = Writer{ .buf = &body_buf };
-    w.delim(1, rl_len); // resource_logs
-    w.delim(1, resource_len); //   resource
-    putServiceName(&w, name_txt); //     attributes (origin-prefixed)
-    putKeyValue(&w, 1, "service.version", release_txt);
-    w.delim(2, scope_len); //   scope_logs
-    w.delim(2, rec_len); //     log_records
-    w.fixed64(1, ns); //       time_unix_nano
-    w.fixed64(11, ns); //       observed_time_unix_nano
-    w.uint(2, sev_num); //       severity_number
-    w.string(3, severity); //       severity_text
-    putAnyValue(&w, 5, verdict_txt); //       body
-    putKeyValue(&w, 6, "mandor.bundle", bundle); //       attributes
-
-    std.debug.assert(w.pos == total); // sizing and writing must agree
-    return body_buf[0..w.pos];
+    const resource = [_]otlp.KeyValue{
+        serviceName(name_txt),
+        .str("service.version", release_txt),
+    };
+    const attrs = [_]otlp.KeyValue{.str("mandor.bundle", bundle)};
+    const record = [_]otlp.LogRecord{.{
+        .time_unix_nano = ns,
+        .observed_time_unix_nano = ns,
+        .severity_number = if (warn) .warn else .err,
+        .severity_text = if (warn) "WARN" else "ERROR",
+        .body = .str(verdict_txt),
+        .attributes = &attrs,
+    }};
+    const scope = [_]otlp.ScopeLogs{.{ .log_records = &record }};
+    return otlp.appendLogs(&body_buf, .{
+        .resource = .{ .attributes = &resource },
+        .scope_logs = &scope,
+    }) catch error.TooLarge;
 }
 
 // ------------------------------------------------------- OTLP metrics
 //
-// opentelemetry-proto metrics/v1. All field numbers <= 15 → one-byte tags.
 // One ResourceMetrics PER worker so service.name in the resource matches the
 // incident logs' service grouping. rss/cpu/fds/threads ship as Gauge, restarts
-// as a monotonic cumulative Sum. NumberDataPoint carries time_unix_nano
-// (fixed64) and as_int (fixed64 wire) — non-negative values, so a plain u64.
-
-/// NumberDataPoint { time_unix_nano = 3 (fixed64), then either as_int = 6 or
-/// as_double = 4 (both fixed64 wire) }. Every datapoint is time + one value =
-/// tag(1)+8 twice → 18, constant regardless of int-vs-double.
-fn numberDataPointLen() usize {
-    return 9 + 9;
-}
-
-/// `value` is the raw 8 bytes: a u64 for as_int, or an f64 bit pattern
-/// (@bitCast) for as_double. as_double is used for ratio metrics like
-/// process.cpu.utilization (0..1) per OTel semconv; as_int for byte/count ones.
-fn putNumberDataPoint(w: *Writer, t_ns: u64, value: u64, is_double: bool) void {
-    w.fixed64(3, t_ns); // time_unix_nano
-    if (is_double) w.fixed64(4, value) else w.fixed64(6, value); // as_double | as_int
-}
-
-/// Gauge { data_points = 1 }.
-fn gaugeBodyLen() usize {
-    return delimLen(numberDataPointLen());
-}
-
-/// Sum { data_points = 1, aggregation_temporality = 2, is_monotonic = 3 }.
-fn sumBodyLen() usize {
-    return delimLen(numberDataPointLen()) +
-        (1 + varintLen(2)) + // aggregation_temporality = CUMULATIVE
-        (1 + varintLen(1)); //  is_monotonic = true
-}
-
-/// Metric { name = 1, unit = 3, gauge = 5 } body length.
-fn gaugeMetricLen(name: []const u8, unit: []const u8) usize {
-    return delimLen(name.len) + delimLen(unit.len) + delimLen(gaugeBodyLen());
-}
-
-/// Metric { name = 1, unit = 3, sum = 7 } body length.
-fn sumMetricLen(name: []const u8, unit: []const u8) usize {
-    return delimLen(name.len) + delimLen(unit.len) + delimLen(sumBodyLen());
-}
-
-fn putGaugeMetric(w: *Writer, name: []const u8, unit: []const u8, t_ns: u64, value: u64, is_double: bool) void {
-    w.string(1, name); // Metric.name
-    w.string(3, unit); // Metric.unit
-    w.delim(5, gaugeBodyLen()); // Metric.gauge
-    w.delim(1, numberDataPointLen()); //   Gauge.data_points
-    putNumberDataPoint(w, t_ns, value, is_double);
-}
-
-fn putSumMetric(w: *Writer, name: []const u8, unit: []const u8, t_ns: u64, value: u64) void {
-    w.string(1, name); // Metric.name
-    w.string(3, unit); // Metric.unit
-    w.delim(7, sumBodyLen()); // Metric.sum
-    w.delim(1, numberDataPointLen()); //   Sum.data_points
-    putNumberDataPoint(w, t_ns, value, false); // restarts is a monotonic int counter
-    w.uint(2, 2); //   Sum.aggregation_temporality = CUMULATIVE
-    w.uint(3, 1); //   Sum.is_monotonic = true
-}
+// as a monotonic cumulative Sum.
 
 /// The four gauge metrics, in emit order (memory first — see the test that walks
 /// the first metric). OTel process semantic-convention names/units so any OTLP
 /// backend (photon, collectors) reads them without a translation table.
 /// cpu.utilization is a 0..1 fraction (as_double); the rest are byte/count ints.
-const gauge_metrics = [_]struct { name: []const u8, unit: []const u8, is_double: bool }{
-    .{ .name = "process.memory.usage", .unit = "By", .is_double = false },
-    .{ .name = "process.cpu.utilization", .unit = "1", .is_double = true },
-    .{ .name = "process.unix.file_descriptor.count", .unit = "{count}", .is_double = false },
-    .{ .name = "process.thread.count", .unit = "{thread}", .is_double = false },
+const gauge_metrics = [_]struct { name: []const u8, unit: []const u8 }{
+    .{ .name = "process.memory.usage", .unit = "By" },
+    .{ .name = "process.cpu.utilization", .unit = "1" },
+    .{ .name = "process.unix.file_descriptor.count", .unit = "{count}" },
+    .{ .name = "process.thread.count", .unit = "{thread}" },
 };
 // No OTel semconv equivalent for a supervisor restart counter — kept as a
 // mandor-specific extension (a monotonic cumulative Sum).
@@ -515,142 +319,46 @@ const restart_metric_name = "process.restarts";
 const restart_metric_unit = "{restart}";
 
 /// Encode a batch of per-worker samples as one OTLP ExportMetricsServiceRequest,
-/// one ResourceMetrics per sample. Mirrors buildOtlp's two-pass sizing: pass 1
-/// sizes innermost-first and refuses a batch that will not fit body_buf, pass 2
-/// writes, and the final assert proves the two agree.
+/// one ResourceMetrics per sample. Metrics are not the lossy tier's batch: a
+/// batch that does not fit body_buf whole is refused, never clipped.
 pub fn buildOtlpMetrics(samples: []const frame.MetricSample, host_name: []const u8) error{TooLarge}![]const u8 {
-    // scope_len is sample-invariant (a fixed metric set), so derive it ONCE
-    // instead of recomputing it per sample in BOTH the sizing and write passes.
-    var scope_len: usize = 0;
-    for (gauge_metrics) |g| scope_len += delimLen(gaugeMetricLen(g.name, g.unit));
-    scope_len += delimLen(sumMetricLen(restart_metric_name, restart_metric_unit));
-
-    // Pass 1: sizes, innermost first.
-    var total: usize = 0;
+    var pos: usize = 0;
     for (samples) |s| {
-        const resource_len = delimLen(serviceKvLen(s.name)) +
-            delimLen(keyValueLen("host.name", host_name));
-        const rm_len = delimLen(resource_len) + delimLen(scope_len);
-        total += delimLen(rm_len);
-    }
-    if (total > body_buf.len) return error.TooLarge;
-
-    // Pass 2: write.
-    var w = Writer{ .buf = &body_buf };
-    for (samples) |s| {
-        const resource_len = delimLen(serviceKvLen(s.name)) +
-            delimLen(keyValueLen("host.name", host_name));
-        const rm_len = delimLen(resource_len) + delimLen(scope_len);
-
-        w.delim(1, rm_len); // resource_metrics
-        w.delim(1, resource_len); //   resource
-        putServiceName(&w, s.name); //     attributes (origin-prefixed)
-        putKeyValue(&w, 1, "host.name", host_name); //     (so the process is attributable to its node)
-        w.delim(2, scope_len); //   scope_metrics
-
         // Values in the semconv order of gauge_metrics: memory.usage is bytes
-        // (rss is kB → ×1024, saturating), cpu.utilization is a 0..1 fraction
-        // carried as an f64 bit pattern (as_double), the counts pass through.
-        const cpu_util: f64 = @as(f64, @floatFromInt(s.cpu_pct)) / 100.0;
-        const values = [_]u64{
-            s.rss_kb *| 1024, // process.memory.usage (By)
-            @bitCast(cpu_util), // process.cpu.utilization (as_double)
-            s.fds, // process.unix.file_descriptor.count
-            s.threads, // process.thread.count
+        // (rss is kB → ×1024, saturating), cpu.utilization is a 0..1 fraction,
+        // the counts pass through.
+        const values = [gauge_metrics.len]otlp.NumberDataPoint.Value{
+            .{ .as_int = int64(s.rss_kb *| 1024) },
+            .{ .as_double = @as(f64, @floatFromInt(s.cpu_pct)) / 100.0 },
+            .{ .as_int = s.fds },
+            .{ .as_int = s.threads },
         };
-        for (gauge_metrics, 0..) |g, i| {
-            w.delim(2, gaugeMetricLen(g.name, g.unit)); //   metrics (Metric)
-            putGaugeMetric(&w, g.name, g.unit, s.t_unix_ns, values[i], g.is_double);
+        var points: [gauge_metrics.len + 1][1]otlp.NumberDataPoint = undefined;
+        var metrics: [gauge_metrics.len + 1]otlp.Metric = undefined;
+        for (gauge_metrics, values, 0..) |g, v, i| {
+            points[i] = .{.{ .time_unix_nano = s.t_unix_ns, .value = v }};
+            metrics[i] = .{ .name = g.name, .unit = g.unit, .data = .{ .gauge = .{ .data_points = &points[i] } } };
         }
-        w.delim(2, sumMetricLen(restart_metric_name, restart_metric_unit)); // metrics (Metric)
-        putSumMetric(&w, restart_metric_name, restart_metric_unit, s.t_unix_ns, s.restarts);
+        const last = gauge_metrics.len;
+        points[last] = .{.{ .time_unix_nano = s.t_unix_ns, .value = .{ .as_int = s.restarts } }};
+        metrics[last] = .{ .name = restart_metric_name, .unit = restart_metric_unit, .data = .{ .sum = .{
+            .data_points = &points[last],
+            .aggregation_temporality = .cumulative,
+            .is_monotonic = true,
+        } } };
+
+        const resource = [_]otlp.KeyValue{
+            serviceName(s.name),
+            .str("host.name", host_name), // so the process is attributable to its node
+        };
+        const scope = [_]otlp.ScopeMetrics{.{ .metrics = &metrics }};
+        const out = otlp.appendMetrics(body_buf[pos..], .{
+            .resource = .{ .attributes = &resource },
+            .scope_metrics = &scope,
+        }) catch return error.TooLarge;
+        pos += out.len;
     }
-    std.debug.assert(w.pos == total); // sizing and writing must agree
-    return body_buf[0..w.pos];
-}
-
-// ------------------------------------------------------- OTLP host metrics
-//
-// Node-level `system.*` metrics: ONE ResourceMetrics scoped to the host
-// (host.name/host.id/os.type), a mix of Gauges and one monotonic Sum. Unlike
-// the per-worker path each metric can carry MULTIPLE datapoints and each
-// datapoint carries attributes (cpu/state/direction/mountpoint), so this path
-// uses its own datapoint helpers rather than the single-point per-worker ones.
-//
-// Value encoding: NumberDataPoint.value is a oneof. Byte/count metrics use
-// as_int = field 6 (fixed64 wire, the integer verbatim). Ratio/load metrics
-// (utilization, load average) use as_double = field 4 (fixed64 wire, the IEEE-
-// 754 bits via @bitCast(f64)). Both tags are one byte and both bodies are 8
-// bytes, so a datapoint's value costs 9 bytes regardless of which arm is used —
-// which is why the sizing helper does not branch on is_double.
-
-/// One datapoint attribute (all host attrs are string-valued KeyValues).
-const HAttr = struct { k: []const u8, v: []const u8 };
-
-/// One NumberDataPoint: the pre-`@bitCast` u64 `value_bits` (as_int verbatim,
-/// or as_double bit pattern when `is_double`), plus its attribute set.
-const HDp = struct { value_bits: u64, is_double: bool, attrs: []const HAttr };
-
-const HKind = enum { gauge, sum };
-const HMetric = struct { name: []const u8, unit: []const u8, kind: HKind, dps: []const HDp };
-
-/// NumberDataPoint { time_unix_nano=3 (fixed64), as_double=4 | as_int=6
-/// (fixed64), attributes=7 (repeated KeyValue) }. time + value are 9 bytes
-/// each; is_double does not change the size (see the note above).
-fn hDataPointLen(attrs: []const HAttr) usize {
-    var n: usize = 9 + 9;
-    for (attrs) |a| n += delimLen(keyValueLen(a.k, a.v));
-    return n;
-}
-
-fn putHDataPoint(w: *Writer, t_ns: u64, value_bits: u64, is_double: bool, attrs: []const HAttr) void {
-    w.fixed64(3, t_ns); // time_unix_nano
-    if (is_double) w.fixed64(4, value_bits) else w.fixed64(6, value_bits); // as_double | as_int
-    for (attrs) |a| putKeyValue(w, 7, a.k, a.v); // attributes
-}
-
-/// Sum of every datapoint body — shared by the Gauge and Sum data messages.
-fn hDataPointsLen(dps: []const HDp) usize {
-    var n: usize = 0;
-    for (dps) |d| n += delimLen(hDataPointLen(d.attrs));
-    return n;
-}
-
-fn putHDataPoints(w: *Writer, t_ns: u64, dps: []const HDp) void {
-    for (dps) |d| {
-        w.delim(1, hDataPointLen(d.attrs)); // data_points (field 1, repeated)
-        putHDataPoint(w, t_ns, d.value_bits, d.is_double, d.attrs);
-    }
-}
-
-/// Sum body adds aggregation_temporality=CUMULATIVE and is_monotonic=true.
-fn hSumBodyLen(dps: []const HDp) usize {
-    return hDataPointsLen(dps) + (1 + varintLen(2)) + (1 + varintLen(1));
-}
-
-fn hMetricLen(m: HMetric) usize {
-    const body_len = switch (m.kind) {
-        .gauge => hDataPointsLen(m.dps),
-        .sum => hSumBodyLen(m.dps),
-    };
-    return delimLen(m.name.len) + delimLen(m.unit.len) + delimLen(body_len);
-}
-
-fn putHMetric(w: *Writer, m: HMetric, t_ns: u64) void {
-    w.string(1, m.name); // Metric.name
-    w.string(3, m.unit); // Metric.unit
-    switch (m.kind) {
-        .gauge => {
-            w.delim(5, hDataPointsLen(m.dps)); // Metric.gauge
-            putHDataPoints(w, t_ns, m.dps);
-        },
-        .sum => {
-            w.delim(7, hSumBodyLen(m.dps)); // Metric.sum
-            putHDataPoints(w, t_ns, m.dps);
-            w.uint(2, 2); // aggregation_temporality = CUMULATIVE
-            w.uint(3, 1); // is_monotonic = true
-        },
-    }
+    return body_buf[0..pos];
 }
 
 // ------------------------------------------------------- OTLP lifecycle event
@@ -678,31 +386,30 @@ fn renderEventBody(buf: []u8, e: frame.Lifecycle) error{TooLarge}![]const u8 {
     }) catch return error.TooLarge;
 }
 
-const EventAttr = struct { k: []const u8, v: []const u8 };
+const Sev = struct { num: otlp.Severity, text: []const u8 };
 
 /// Event kind → OTLP severity number + text.
-fn eventSev(ev: frame.Event) struct { num: u64, text: []const u8 } {
+fn eventSev(ev: frame.Event) Sev {
     return switch (ev) {
-        .started, .exited_ok, .health_up => .{ .num = sev_info, .text = "INFO" },
-        .restarting, .health_down => .{ .num = sev_warn, .text = "WARN" },
-        .exited_err, .oom => .{ .num = sev_error, .text = "ERROR" },
+        .started, .exited_ok, .health_up => .{ .num = .info, .text = "INFO" },
+        .restarting, .health_down => .{ .num = .warn, .text = "WARN" },
+        .exited_err, .oom => .{ .num = .err, .text = "ERROR" },
     };
 }
 
 /// Numeric context for an event as string attributes (photon reads string
-/// attrs), written into caller scratch. Both the sizing and write passes call
-/// this on the same event so they can never diverge.
-fn eventAttrs(e: frame.Lifecycle, attrs: *[2]EventAttr, num_a: *[12]u8, num_b: *[12]u8) error{TooLarge}![]EventAttr {
+/// attrs), rendered into caller scratch.
+fn eventAttrs(e: frame.Lifecycle, attrs: *[2]otlp.KeyValue, num_a: *[12]u8, num_b: *[12]u8) error{TooLarge}![]const otlp.KeyValue {
     var n: usize = 0;
     switch (e.ev) {
         .exited_err, .oom => {
-            attrs[n] = .{ .k = "exit.code", .v = std.fmt.bufPrint(num_a, "{d}", .{e.code}) catch return error.TooLarge };
+            attrs[n] = .str("exit.code", std.fmt.bufPrint(num_a, "{d}", .{e.code}) catch return error.TooLarge);
             n += 1;
         },
         .restarting => {
-            attrs[n] = .{ .k = "backoff.ms", .v = std.fmt.bufPrint(num_a, "{d}", .{e.backoff_ms}) catch return error.TooLarge };
+            attrs[n] = .str("backoff.ms", std.fmt.bufPrint(num_a, "{d}", .{e.backoff_ms}) catch return error.TooLarge);
             n += 1;
-            attrs[n] = .{ .k = "restart.count", .v = std.fmt.bufPrint(num_b, "{d}", .{e.restarts}) catch return error.TooLarge };
+            attrs[n] = .str("restart.count", std.fmt.bufPrint(num_b, "{d}", .{e.restarts}) catch return error.TooLarge);
             n += 1;
         },
         else => {},
@@ -710,106 +417,64 @@ fn eventAttrs(e: frame.Lifecycle, attrs: *[2]EventAttr, num_a: *[12]u8, num_b: *
     return attrs[0..n];
 }
 
-/// Size of one lifecycle event's resource_logs entry — the pass-1 mirror of
-/// writeEventRl. Renders the body + attrs into local scratch to measure them.
-fn eventRlLen(e: frame.Lifecycle) error{TooLarge}!usize {
+/// Encode one lifecycle event's resource_logs entry at the front of `buf`.
+fn appendEvent(buf: []u8, e: frame.Lifecycle) error{ TooLarge, NoSpaceLeft }![]u8 {
     const sev = eventSev(e.ev);
     var body_scratch: [256]u8 = undefined;
     const body_txt = try renderEventBody(&body_scratch, e);
-    var attrs: [2]EventAttr = undefined;
+    var attrs: [2]otlp.KeyValue = undefined;
     var num_a: [12]u8 = undefined;
     var num_b: [12]u8 = undefined;
     const kvs = try eventAttrs(e, &attrs, &num_a, &num_b);
-    var attr_len: usize = 0;
-    for (kvs) |kv| attr_len += delimLen(keyValueLen(kv.k, kv.v));
-    const rec_len =
-        9 + // time_unix_nano (fixed64, field 1)
-        (1 + varintLen(sev.num)) + // severity_number (field 2)
-        delimLen(sev.text.len) + // severity_text (field 3)
-        delimLen(anyValueLen(body_txt)) + // body (field 5)
-        attr_len + // attributes (field 6)
-        9; // observed_time_unix_nano (fixed64, field 11)
-    const scope_len = delimLen(rec_len);
-    const resource_len = delimLen(serviceKvLen(e.name));
-    const rl_len = delimLen(resource_len) + delimLen(scope_len);
-    return delimLen(rl_len); // ExportLogsServiceRequest.resource_logs entry
-}
 
-/// Write one lifecycle event's resource_logs entry into `w`. Re-renders body +
-/// attrs — deterministic, the same values eventRlLen sized.
-fn writeEventRl(w: *Writer, e: frame.Lifecycle) error{TooLarge}!void {
-    const sev = eventSev(e.ev);
-    var body_scratch: [256]u8 = undefined;
-    const body_txt = try renderEventBody(&body_scratch, e);
-    var attrs: [2]EventAttr = undefined;
-    var num_a: [12]u8 = undefined;
-    var num_b: [12]u8 = undefined;
-    const kvs = try eventAttrs(e, &attrs, &num_a, &num_b);
-    var attr_len: usize = 0;
-    for (kvs) |kv| attr_len += delimLen(keyValueLen(kv.k, kv.v));
-    const rec_len = 9 + (1 + varintLen(sev.num)) + delimLen(sev.text.len) +
-        delimLen(anyValueLen(body_txt)) + attr_len + 9;
-    const scope_len = delimLen(rec_len);
-    const resource_len = delimLen(serviceKvLen(e.name));
-    const rl_len = delimLen(resource_len) + delimLen(scope_len);
-    const ns = e.t_unix_ns;
-    w.delim(1, rl_len); // resource_logs
-    w.delim(1, resource_len); //   resource
-    putServiceName(w, e.name); //     attributes (origin-prefixed)
-    w.delim(2, scope_len); //   scope_logs
-    w.delim(2, rec_len); //     log_records
-    w.fixed64(1, ns); //       time_unix_nano
-    w.uint(2, sev.num); //       severity_number
-    w.string(3, sev.text); //       severity_text
-    putAnyValue(w, 5, body_txt); //       body
-    for (kvs) |kv| putKeyValue(w, 6, kv.k, kv.v); //       attributes
-    w.fixed64(11, ns); //       observed_time_unix_nano
+    const resource = [_]otlp.KeyValue{serviceName(e.name)};
+    const record = [_]otlp.LogRecord{.{
+        .time_unix_nano = e.t_unix_ns,
+        .observed_time_unix_nano = e.t_unix_ns,
+        .severity_number = sev.num,
+        .severity_text = sev.text,
+        .body = .str(body_txt),
+        .attributes = kvs,
+    }};
+    const scope = [_]otlp.ScopeLogs{.{ .log_records = &record }};
+    return otlp.appendLogs(buf, .{ .resource = .{ .attributes = &resource }, .scope_logs = &scope });
 }
 
 /// Encode one lifecycle event as an OTLP ExportLogsServiceRequest (one
 /// resource_logs). Thin wrapper over the batch encoder so both share one code
-/// path — a 1-event batch is byte-identical to the pre-batch single output.
+/// path — a 1-event batch is byte-identical to the single output.
 pub fn buildOtlpEvent(e: frame.Lifecycle) error{TooLarge}![]const u8 {
     return buildOtlpEvents(&.{e});
 }
 
 /// Encode a batch of lifecycle events as ONE OTLP ExportLogsServiceRequest, one
-/// resource_logs per event. Same two-pass sizing + ephemeral drop-the-rest
-/// discipline as buildOtlpLogs: if the batch will not fit body_buf, encode as
-/// many events as fit and drop the rest; only a first event too large alone
-/// yields error.TooLarge (caller then drops the batch).
+/// resource_logs per event. Ephemeral tier: encode events until one does not
+/// fit body_buf (or cannot be rendered) and drop the rest; only a first event
+/// that cannot go yields error.TooLarge (caller then drops the batch).
 pub fn buildOtlpEvents(events: []const frame.Lifecycle) error{TooLarge}![]const u8 {
-    // Pass 1: how many events fit, sizes innermost-first.
-    var total: usize = 0;
+    var pos: usize = 0;
     var nfit: usize = 0;
     for (events) |e| {
-        const rl = eventRlLen(e) catch break; // un-renderable (never for capped names) → ship what we have
-        if (total + rl > body_buf.len) break; // batch full → drop the rest (ephemeral tier)
-        total += rl;
+        const out = appendEvent(body_buf[pos..], e) catch break;
+        pos += out.len;
         nfit += 1;
     }
     if (nfit == 0) return error.TooLarge;
-
-    // Pass 2: write the nfit events that fit.
-    var w = Writer{ .buf = &body_buf };
-    for (events[0..nfit]) |e| try writeEventRl(&w, e);
-    std.debug.assert(w.pos == total); // sizing and writing must agree
-    return body_buf[0..w.pos];
+    return body_buf[0..pos];
 }
 
 // ------------------------------------------------------- OTLP streamed logs
 //
 // Opt-in full worker-log streaming (P3). Each batched log line becomes ONE
-// LogRecord, same nesting/encoding as buildOtlp/buildOtlpEvent: resource
+// LogRecord, same nesting as buildOtlp/buildOtlpEvent: resource
 // {service.name=<worker>, host.name, host.id, os.type} (the SAME identity as the
 // worker's process.* metrics — and as photon-agent's host metrics, so photon
 // lines a worker's logs up with its metrics and its node), scope_logs{log_records[one]} with body =
 // the line text, severity from the frame's tier, and attribute log.iostream.
 // One resource_logs entry per record: correct, and cheap enough at the bounded
-// batch sizes here (see the arena/cap in drainPipe). Reuses the Writer and the
-// putKeyValue/putAnyValue helpers verbatim — no new log_record layout.
+// batch sizes here (see the arena/cap in drainPipe).
 
-/// One batched log line, resolved to slices that outlive the sizing/write passes
+/// One batched log line, resolved to slices that outlive the encode
 /// (drainPipe copies name+line into log_arena; the fuzz/unit tests pass literals).
 pub const LogRecord = struct {
     name: []const u8, // worker name → service.name
@@ -827,11 +492,11 @@ pub const LogRecord = struct {
 
 /// Frame severity tier (0/1/2) → OTLP severity_number + text. Anything outside
 /// 0..2 (a corrupt frame byte) maps to INFO rather than trapping.
-fn logSeverity(sev: u8) struct { num: u64, text: []const u8 } {
+fn logSeverity(sev: u8) Sev {
     return switch (sev) {
-        1 => .{ .num = sev_warn, .text = "WARN" },
-        2 => .{ .num = sev_error, .text = "ERROR" },
-        else => .{ .num = sev_info, .text = "INFO" },
+        1 => .{ .num = .warn, .text = "WARN" },
+        2 => .{ .num = .err, .text = "ERROR" },
+        else => .{ .num = .info, .text = "INFO" },
     };
 }
 
@@ -839,111 +504,53 @@ fn ioStreamName(io: u8) []const u8 {
     return if (io == 1) "stderr" else "stdout";
 }
 
-/// Encoded bytes of the Tier-2 digest attributes for one record: the three int
-/// KeyValues (all field 6) when this is a digest record (count > 0), or 0 for a
-/// plain streamed line. ONE source of truth shared by pass 1 (logRlLen) and pass
-/// 2 (putDigestAttrs) so the two-pass sizing can never drift.
-fn digestAttrsLen(r: LogRecord) usize {
-    if (r.count == 0) return 0;
-    return delimLen(keyValueIntLen("mandor.count", r.count)) +
-        delimLen(keyValueIntLen("mandor.first_ts", r.first_ns)) +
-        delimLen(keyValueIntLen("mandor.last_ts", r.last_ns));
-}
-
-/// Write the Tier-2 digest attributes (count > 0) into the log_record's
-/// attributes (field 6, same as log.iostream). No-op for a plain streamed line so
-/// the streamed output is byte-identical. Writes exactly digestAttrsLen(r) bytes.
-fn putDigestAttrs(w: *Writer, r: LogRecord) void {
-    if (r.count == 0) return;
-    putKeyValueInt(w, 6, "mandor.count", r.count);
-    putKeyValueInt(w, 6, "mandor.first_ts", r.first_ns);
-    putKeyValueInt(w, 6, "mandor.last_ts", r.last_ns);
-}
-
-/// Bytes of the resource_logs entry for one record (one resource per record).
-fn logRlLen(r: LogRecord, host_name: []const u8, host_id: []const u8) usize {
+/// Encode one streamed line's resource_logs entry at the front of `buf`.
+fn appendLog(buf: []u8, r: LogRecord, host_name: []const u8, host_id: []const u8) error{NoSpaceLeft}![]u8 {
     const sev = logSeverity(r.severity);
-    var rec_len =
-        9 + // time_unix_nano (fixed64, field 1)
-        9 + // observed_time_unix_nano (fixed64, field 11)
-        (1 + varintLen(sev.num)) + // severity_number (field 2)
-        delimLen(sev.text.len) + // severity_text (field 3)
-        delimLen(anyValueLen(r.line)) + // body (field 5)
-        delimLen(keyValueLen("log.iostream", ioStreamName(r.iostream))); // attributes (field 6)
-    // Curated Tier-2 digest: a digest record (count > 0) carries three int
-    // attributes alongside log.iostream (all field 6). A plain streamed line
-    // (count == 0) adds none — byte-identical to the pre-digest output. Sized
-    // here in pass 1 and written in buildOtlpLogs pass 2 so `w.pos == total`.
-    rec_len += digestAttrsLen(r);
-    const scope_len = delimLen(rec_len); // ScopeLogs.log_records (field 2)
-    const resource_len =
-        delimLen(serviceKvLen(r.name)) +
-        delimLen(keyValueLen("host.name", host_name)) +
-        delimLen(keyValueLen("host.id", host_id)) +
-        delimLen(keyValueLen("os.type", "linux"));
-    const rl_len = delimLen(resource_len) + delimLen(scope_len);
-    return delimLen(rl_len); // ExportLogsServiceRequest.resource_logs
+    // log.iostream always; a digest record (count > 0) adds three int
+    // attributes. A plain streamed line adds none, so its output is unchanged.
+    const attrs = [_]otlp.KeyValue{
+        .str("log.iostream", ioStreamName(r.iostream)),
+        .int("mandor.count", int64(r.count)),
+        .int("mandor.first_ts", int64(r.first_ns)),
+        .int("mandor.last_ts", int64(r.last_ns)),
+    };
+    const resource = [_]otlp.KeyValue{
+        serviceName(r.name),
+        .str("host.name", host_name), // SAME identity as the worker's metrics
+        .str("host.id", host_id),
+        .str("os.type", "linux"),
+    };
+    const record = [_]otlp.LogRecord{.{
+        .time_unix_nano = r.t_ns,
+        .observed_time_unix_nano = r.t_ns,
+        .severity_number = sev.num,
+        .severity_text = sev.text,
+        .body = .str(r.line),
+        .attributes = if (r.count > 0) &attrs else attrs[0..1],
+    }};
+    const scope = [_]otlp.ScopeLogs{.{ .log_records = &record }};
+    return otlp.appendLogs(buf, .{ .resource = .{ .attributes = &resource }, .scope_logs = &scope });
 }
 
 /// Encode a batch of streamed log lines as one OTLP ExportLogsServiceRequest,
-/// one resource_logs per record. Same two-pass sizing discipline as the metric
-/// encoders: size innermost-first, and — because this is the lossy ephemeral
-/// tier — if the whole batch will not fit body_buf, encode as many records as
-/// fit and DROP the rest (counting them in `log_drops`) rather than refusing the
-/// batch. Only a first record too large to fit alone yields error.TooLarge (the
-/// caller then drops the batch). The frame decoder caps a line at 4095 bytes and
+/// one resource_logs per record. This is the lossy ephemeral tier: if the
+/// whole batch will not fit body_buf, encode as many records as fit and DROP
+/// the rest (counting them in `log_drops`) rather than refusing the batch. Only
+/// a first record too large to fit alone yields error.TooLarge (the caller then
+/// drops the batch). The frame decoder caps a line at 4095 bytes and
 /// drainPipe's arena caps the batch, so in practice the whole batch always fits.
 pub fn buildOtlpLogs(records: []const LogRecord, host_name: []const u8, host_id: []const u8) error{TooLarge}![]const u8 {
-    // Pass 1: how many records fit, sizes innermost-first.
-    var total: usize = 0;
+    var pos: usize = 0;
     var nfit: usize = 0;
     for (records) |r| {
-        const rl = logRlLen(r, host_name, host_id);
-        if (total + rl > body_buf.len) break;
-        total += rl;
+        const out = appendLog(body_buf[pos..], r, host_name, host_id) catch break;
+        pos += out.len;
         nfit += 1;
     }
     if (nfit == 0) return error.TooLarge; // not even one record fits
     if (nfit < records.len) log_drops +|= records.len - nfit; // ephemeral: drop the tail
-
-    // Pass 2: write.
-    var w = Writer{ .buf = &body_buf };
-    for (records[0..nfit]) |r| {
-        const sev = logSeverity(r.severity);
-        var rec_len =
-            9 +
-            9 +
-            (1 + varintLen(sev.num)) +
-            delimLen(sev.text.len) +
-            delimLen(anyValueLen(r.line)) +
-            delimLen(keyValueLen("log.iostream", ioStreamName(r.iostream)));
-        rec_len += digestAttrsLen(r); // digest ints (count > 0); 0 for a streamed line
-        const scope_len = delimLen(rec_len);
-        const resource_len =
-            delimLen(serviceKvLen(r.name)) +
-            delimLen(keyValueLen("host.name", host_name)) +
-            delimLen(keyValueLen("host.id", host_id)) +
-            delimLen(keyValueLen("os.type", "linux"));
-        const rl_len = delimLen(resource_len) + delimLen(scope_len);
-
-        w.delim(1, rl_len); // resource_logs
-        w.delim(1, resource_len); //   resource
-        putServiceName(&w, r.name); //     attributes (origin-prefixed)
-        putKeyValue(&w, 1, "host.name", host_name); //     (SAME identity as the worker's metrics)
-        putKeyValue(&w, 1, "host.id", host_id);
-        putKeyValue(&w, 1, "os.type", "linux");
-        w.delim(2, scope_len); //   scope_logs
-        w.delim(2, rec_len); //     log_records
-        w.fixed64(1, r.t_ns); //       time_unix_nano
-        w.fixed64(11, r.t_ns); //       observed_time_unix_nano
-        w.uint(2, sev.num); //       severity_number
-        w.string(3, sev.text); //       severity_text
-        putAnyValue(&w, 5, r.line); //       body
-        putKeyValue(&w, 6, "log.iostream", ioStreamName(r.iostream)); // attributes
-        putDigestAttrs(&w, r); //       mandor.count/.first_ts/.last_ts (digest only)
-    }
-    std.debug.assert(w.pos == total); // sizing and writing must agree
-    return body_buf[0..w.pos];
+    return body_buf[0..pos];
 }
 
 /// True only for a genuine HTTP status line reporting 2xx.
@@ -1651,6 +1258,12 @@ test "scanStr walks escapes and stops at the real closing quote" {
     try testing.expect(scanStr("{\"other\":\"x\"}", "v") == null);
 }
 
+// OTLP SeverityNumber as it appears on the wire, written out rather than read
+// from otlp.Severity so the tests check the numbers, not the enum.
+const sev_info: u64 = 9;
+const sev_warn: u64 = 13;
+const sev_error: u64 = 17;
+
 /// Minimal protobuf reader, test-only. Walks one nesting level and hands back
 /// each field so a test can assert on structure rather than on bytes that
 /// happen to appear somewhere in the payload.
@@ -2220,18 +1833,27 @@ fn firstServiceName(body: []const u8) []const u8 {
     return avStr(Fields.get(a1, 2).?.bytes);
 }
 
-test "serviceKvLen agrees with the actual encoded service.name length" {
-    // With a prefix set, serviceKvLen must equal keyValueLen for the JOINED value
-    // (prefix ++ name). This is the mutation guard: drop `service_prefix.len` from
-    // serviceKvLen and this fails directly, and every prefixed encoder's
-    // `w.pos == total` assert traps too.
-    setServicePrefix("t-");
-    defer setServicePrefix("");
-    try testing.expectEqual(keyValueLen("service.name", "t-api"), serviceKvLen("api"));
-
-    // Default empty prefix: identical to the bare keyValueLen (byte-identical).
-    setServicePrefix("");
-    try testing.expectEqual(keyValueLen("service.name", "api"), serviceKvLen("api"));
+test "a batch is one request: per-record encodes concatenate into N entries" {
+    // Every batch encoder writes one-entry requests end to end and relies on
+    // protobuf reading that as one request with a repeated field. Prove it by
+    // decoding the whole batch with nilo's own decoder, independently of the
+    // hand walker above.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const recs = [_]LogRecord{
+        .{ .name = "api", .line = "one", .iostream = 0, .severity = 0, .t_ns = 1 },
+        .{ .name = "db", .line = "two", .iostream = 1, .severity = 2, .t_ns = 2, .count = 3, .first_ns = 1, .last_ns = 2 },
+    };
+    const body = try buildOtlpLogs(&recs, "h", "id");
+    const req = try proto.decode(otlp.LogsRequest, arena.allocator(), body);
+    try testing.expectEqual(@as(usize, 2), req.resource_logs.len);
+    for (req.resource_logs, recs) |rl, want| {
+        const rec = rl.scope_logs[0].log_records[0];
+        try testing.expectEqualStrings(want.line, rec.body.?.value.?.string_value);
+        try testing.expectEqual(want.t_ns, rec.time_unix_nano);
+        try testing.expectEqualStrings(want.name, rl.resource.?.attributes[0].value.?.value.?.string_value);
+        try testing.expectEqual(@as(usize, if (want.count > 0) 4 else 1), rec.attributes.len);
+    }
 }
 
 test "service_prefix prepends to service.name in every OTLP encoder" {

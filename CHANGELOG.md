@@ -3,6 +3,19 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+### Changed
+- **The relay's OTLP protobuf is encoded by `nilo_proto`** (nilo v0.8.0), mandor's first
+  dependency. The messages are plain structs in `src/otlp.zig`; `encodeInto` writes them into
+  the same fixed body buffer, with no allocator. The hand-rolled two-pass encoder (−568 lines in
+  `relay.zig`, including the dead host-metrics helpers left over from v1.16) is gone. Payloads
+  mean the same to any OTLP receiver; fields now go out in field-number order.
+  Only `nilo_proto` is imported: nilo's HTTP server and client need an event loop, threads and
+  allocation, which a PID-1 supervisor does not take on.
+- Cost, measured: +720 bytes stripped on x86_64 (−1,536 on aarch64); encoding a 64-line log
+  batch takes ~17 µs instead of ~12.5 µs, in the relay child only — never in PID 1's loop.
+
 ## [1.16.2] - 2026-10-13
 
 ### Changed
