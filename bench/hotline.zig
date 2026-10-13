@@ -13,7 +13,7 @@
 //! digest.record cost (signature FNV over the line + linear scan of the table).
 //!
 //! Mirrors src/summarize.zig and src/digest.zig (bench/ convention: self-
-//! contained, run manually). Run: zig run bench/hotline.zig -OReleaseSafe
+//! contained, run manually). Run: zig run bench/hotline.zig -Osafe
 
 const std = @import("std");
 

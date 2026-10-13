@@ -18,7 +18,7 @@ prepare() {
 }
 
 build() {
-	zig build -Doptimize=ReleaseSafe --prefix "$builddir/out"
+	zig build -Doptimize=safe --prefix "$builddir/out"
 }
 
 package() {

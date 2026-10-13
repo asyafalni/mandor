@@ -12,7 +12,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Zig (pinned)
         run: |
@@ -23,8 +23,8 @@ jobs:
       - name: Build static binaries
         run: |
           V="${GITHUB_REF_NAME#v}"
-          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dversion="$V" -p zig-out/x64
-          zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -Dversion="$V" -p zig-out/a64
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=safe -Dversion="$V" -p zig-out/x64
+          zig build -Dtarget=aarch64-linux-musl -Doptimize=safe -Dversion="$V" -p zig-out/a64
           mkdir -p dist/amd64 dist/arm64
           cp zig-out/x64/bin/mandor dist/amd64/mandor
           cp zig-out/a64/bin/mandor dist/arm64/mandor
@@ -45,7 +45,7 @@ jobs:
           ls -la mandor_*
 
       - name: GitHub Release with binaries + packages
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             mandor-x86_64-linux
@@ -55,16 +55,16 @@ jobs:
             mandor_*.rpm
           generate_release_notes: true
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push multi-arch image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64

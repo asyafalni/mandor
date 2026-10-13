@@ -25,7 +25,7 @@ if [ -n "${MANDOR_MUSL:-}" ]; then
 else
   ZIG=${ZIG:-zig}
   command -v "$ZIG" >/dev/null 2>&1 || { echo "SKIP: no zig and no MANDOR_MUSL"; exit 0; }
-  (cd "$ROOT" && "$ZIG" build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dstrip=true -p "$HERE/out") \
+  (cd "$ROOT" && "$ZIG" build -Dtarget=x86_64-linux-musl -Doptimize=safe -Dstrip=true -p "$HERE/out") \
     || { echo "SKIP: cross build failed"; exit 0; }
   cp "$HERE/out/bin/mandor" "$HERE/mandor"
 fi

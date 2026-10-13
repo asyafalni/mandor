@@ -10,7 +10,7 @@
 //! next to.
 //!
 //! Mirrors src/supervisor.zig pumpIo (bench/ convention: self-contained).
-//! Run: zig run bench/fanout.zig -OReleaseSafe
+//! Run: zig run bench/fanout.zig -Osafe
 
 const std = @import("std");
 const linux = std.os.linux;

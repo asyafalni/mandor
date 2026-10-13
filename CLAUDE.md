@@ -140,16 +140,16 @@ forever). New work follows the same discipline — compile early, size-gate, shi
   scanning (`std.mem` functions), not regex. If a regex ever feels needed,
   the parser design is wrong.
 - ReleaseSafe (not ReleaseFast) for shipped binaries — keep safety checks;
-  the size cost is small. Strip + `-Doptimize=ReleaseSafe`.
+  the size cost is small. Strip + `-Doptimize=safe`.
 
 ## Commands
 
 ```bash
 zig build                                  # debug build
-zig build -Doptimize=ReleaseSafe           # release
+zig build -Doptimize=safe           # release
 zig build test                             # unit tests
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe    # container target
-zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe   # arm64
+zig build -Dtarget=x86_64-linux-musl -Doptimize=safe    # container target
+zig build -Dtarget=aarch64-linux-musl -Doptimize=safe   # arm64
 ls -la zig-out/bin/mandor && strip zig-out/bin/mandor && ls -la  # size check — budget 500KB
 ```
 

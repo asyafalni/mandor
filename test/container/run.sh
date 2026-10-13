@@ -46,7 +46,7 @@ else
   # measuring a failed exec.
   ZIG=${ZIG:-zig}
   echo "building x86_64-linux-musl binary..."
-  (cd "$ROOT" && "$ZIG" build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dstrip=true -p "$HERE/out") \
+  (cd "$ROOT" && "$ZIG" build -Dtarget=x86_64-linux-musl -Doptimize=safe -Dstrip=true -p "$HERE/out") \
     || skip "cross build failed"
   cp "$HERE/out/bin/mandor" "$HERE/mandor"
 fi

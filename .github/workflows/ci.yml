@@ -12,7 +12,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Zig (pinned)
         run: |
@@ -42,7 +42,7 @@ jobs:
           for i in $(seq 1 "$SEEDS"); do
             seed=$(printf '0x%08x' $(( (RANDOM << 16) | RANDOM )))
             mode=""
-            [ $((i % 2)) -eq 0 ] && mode="-Doptimize=ReleaseSafe"
+            [ $((i % 2)) -eq 0 ] && mode="-Doptimize=safe"
             echo "--- fuzz seed $seed $mode"
             zig build test --seed="$seed" $mode
           done
@@ -89,14 +89,14 @@ jobs:
           # procfs semantics differ under qemu-user); prove the arm64 binary
           # executes and supervises a worker end-to-end instead.
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user
-          zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -p zig-out/qa64
+          zig build -Dtarget=aarch64-linux-musl -Doptimize=safe -p zig-out/qa64
           qemu-aarch64 zig-out/qa64/bin/mandor --version
           qemu-aarch64 zig-out/qa64/bin/mandor --help | grep -q restart
 
       - name: Release builds + size gate (< 500 KB)
         run: |
-          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -p zig-out/x64
-          zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -p zig-out/a64
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=safe -p zig-out/x64
+          zig build -Dtarget=aarch64-linux-musl -Doptimize=safe -p zig-out/a64
           for f in zig-out/x64/bin/mandor zig-out/a64/bin/mandor; do
             size=$(stat -c%s "$f")
             echo "$f: ${size} bytes"
@@ -126,7 +126,7 @@ jobs:
           git worktree add -q /tmp/prev "$prev_sha" 2>/dev/null || {
             echo "could not check out parent; skipping delta check"; exit 0; }
           if (cd /tmp/prev && zig build -Dtarget=x86_64-linux-musl \
-                -Doptimize=ReleaseSafe -p zig-out/x64 >/dev/null 2>&1); then
+                -Doptimize=safe -p zig-out/x64 >/dev/null 2>&1); then
             old=$(stat -c%s /tmp/prev/zig-out/x64/bin/mandor)
             delta=$((new - old))
             echo "size ${old} -> ${new} (${delta} bytes)"
@@ -145,7 +145,7 @@ jobs:
           git worktree remove --force /tmp/prev 2>/dev/null || true
 
       - name: Upload binary for distro matrix
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mandor-x64
           path: zig-out/x64/bin/mandor
@@ -161,7 +161,7 @@ jobs:
         image: ["alpine:3.20", "debian:bookworm-slim", "ubuntu:24.04"]
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install harness deps
         run: |
@@ -171,7 +171,7 @@ jobs:
             apt-get update -qq && apt-get install -y -qq bash curl procps
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: mandor-x64
           path: zig-out/bin
@@ -196,11 +196,11 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Reuse the musl binary the test job already built and size-gated rather
       # than installing the toolchain a second time.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: mandor-x64
           path: prebuilt

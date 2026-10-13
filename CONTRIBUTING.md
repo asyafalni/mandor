@@ -94,8 +94,8 @@ Two footguns, both found the hard way on 30-minute runs:
 ### Speed (`bench/`)
 
 ```console
-zig run bench/scan.zig -OReleaseSafe    # substring-scan cost per incident
-zig run bench/cold.zig -OReleaseSafe    # compactor + prune sort
+zig run bench/scan.zig -Osafe    # substring-scan cost per incident
+zig run bench/cold.zig -Osafe    # compactor + prune sort
 bash bench/compare.sh                   # vs tini/dumb-init/s6/supervisord
 ```
 

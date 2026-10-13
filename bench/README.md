@@ -6,10 +6,10 @@ that needs evidence rather than assertion. This directory holds it.
 ## Complexity micro-benchmarks (algorithmic cost)
 
 ```
-zig run bench/scan.zig -OReleaseSafe
-zig run bench/cold.zig -OReleaseSafe
-zig run bench/hotline.zig -OReleaseSafe
-zig run bench/fanout.zig -OReleaseSafe
+zig run bench/scan.zig -Osafe
+zig run bench/cold.zig -Osafe
+zig run bench/hotline.zig -Osafe
+zig run bench/fanout.zig -Osafe
 ```
 
 `scan`/`cold` measure the two places with worse-than-linear *shape*, both on the
@@ -96,7 +96,7 @@ floor the constant factors erode.)
 ## Startup + spawn/reap cost (`startup.sh`)
 
 ```
-zig build -Doptimize=ReleaseSafe && MANDOR=zig-out/bin/mandor bash bench/startup.sh
+zig build -Doptimize=safe && MANDOR=zig-out/bin/mandor bash bench/startup.sh
 ```
 
 Boot→all-spawned latency and the per-restart fork/exec/reap cost are the same
@@ -166,9 +166,12 @@ The growth since is the opt-in telemetry subsystem.)
   `sigaltstack` at startup so a signal handler can print a stack trace, and
   mandor prints none (custom panic, segfault handler off, signalfd rather than
   async handlers). Setting `signal_stack_size = null` dropped idle RSS from
-  640 KB to 384 at v1.6 (it still applies). What's left is code pages —
-  intrinsic to the work — plus the ring, which faults in only as logs are
-  actually written.
+  640 KB to 384 at v1.6 (it still applies). Of today's ~500 KB, ~340 KB is the
+  binary's own code and read-only data — file-backed, shared with the page
+  cache and reclaimable, and all of it resident only because the binary is
+  small — so it tracks binary size. mandor's private memory is ~160 KB: 84 KB of
+  touched BSS (of ~21 MB reserved; the rings fault in only as logs are written)
+  plus a 72 KB stack. Measure with `/proc/<pid>/smaps` before chasing a number.
 - **Signal forwarding is fast**: 3 ms, alongside dumb-init's 2. tini's 97 ms is
   likely its default forwarding mode rather than raw speed — treat the reaper
   numbers as "all effectively instant". The 5 ms poll granularity puts

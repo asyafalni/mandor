@@ -294,9 +294,9 @@ Requires [Zig 0.17.0](https://ziglang.org/download/#release-0.17.0) exactly
 ```console
 zig build                                                  # debug
 zig build test                                             # unit tests
-zig build -Doptimize=ReleaseSafe                           # release
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe   # container
-zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe  # arm64
+zig build -Doptimize=safe                           # release
+zig build -Dtarget=x86_64-linux-musl -Doptimize=safe   # container
+zig build -Dtarget=aarch64-linux-musl -Doptimize=safe  # arm64
 ```
 
 Linux-only by design — supervision is built on `signalfd`, `/proc`, and
