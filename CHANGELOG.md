@@ -3,7 +3,7 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [Unreleased]
+## [1.17.3] - 2026-11-02
 
 ### Fixed
 - **A stalled log reader no longer freezes PID 1.** mandor echoed worker output and its own
