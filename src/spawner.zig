@@ -111,6 +111,9 @@ pub const Worker = struct {
     /// Set when mandor TERMs a worker for failing its health probe. The death
     /// that follows is a failure regardless of the exit code it reports.
     health_killed: bool = false,
+    /// A TERM sent while supervising (unhealthy, recycle) escalates to KILL of
+    /// the group at this time if the worker has not exited. 0 = none pending.
+    term_deadline_ms: u64 = 0,
     essential: bool = false, // leader semantics: its exit stops everything
     /// This worker's last spawn failed outright (fork/exec setup), so it never
     /// ran. Reported as a death so restart policy, `essential`, and `oneshot`
@@ -220,6 +223,7 @@ fn resetWorker(w: *Worker) void {
     w.recycling = false;
     w.expected_set = false;
     w.health_killed = false;
+    w.term_deadline_ms = 0;
     w.essential = false;
     w.color = 0;
     w.has_prestop = false;

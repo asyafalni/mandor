@@ -128,7 +128,7 @@ mandor's whole lifecycle model, in one table:
 | fails, retries exhausted | **stops the other workers gracefully and exits with its code** |
 | fails, but is `essential = false` | leaves it dead; the run continues |
 | is a `oneshot` and fails | aborts startup — dependents never start |
-| fails its health probe 3× | is stopped, then treated as any other failure |
+| fails its health probe 3× | is stopped (SIGTERM, then SIGKILL after `stop_grace` if it ignores it), then treated as any other failure |
 
 The default is `max_restarts = 0` — **don't retry, end the run**. That is
 deliberate: restarting is the orchestrator's job, and it can only do that job

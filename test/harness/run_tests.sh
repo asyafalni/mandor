@@ -1752,6 +1752,48 @@ if [ "$c93" -eq 5 ]; then
   ok "a closed stdout does not kill mandor (worker's exit 5 propagates)"
 else bad "closed stdout" "mandor exit $c93 (141 = killed by SIGPIPE)"; fi
 
+# 94-95. A TERM mandor sends while still supervising (unhealthy, recycle) must
+# escalate to SIGKILL after stop_grace. A wedged worker that ignores TERM - a
+# deadlock, a stuck handler - was otherwise TERMed again and again, never
+# killed, never restarted: the probe saw the hang and nothing ended it.
+cat > "$TMP/deaf.sh" <<'DEAF'
+trap '' TERM
+echo deaf-started
+while :; do sleep 0.2; done
+DEAF
+
+# 94. unhealthy: health always fails -> TERM (ignored) -> SIGKILL -> restart.
+cat > "$TMP/94.toml" <<TOML
+max_restarts = 1
+stop_grace = "1s"
+[worker.bash]
+health = "false"
+health_interval = "1s"
+health_start_period = "0s"
+TOML
+timeout 25 "$MANDOR" --config="$TMP/94.toml" --state-dir="$TMP/st94" -- "bash $TMP/deaf.sh" >"$TMP/94" 2>&1
+c=$?
+# One event, one incident: the kill mandor made is not filed again as a crash.
+crash94=$(cat "$TMP"/st94/incidents/*.json 2>/dev/null | grep -c '"kind":"signal"')
+if [ $c -ne 124 ] && grep -q "ignored SIGTERM" "$TMP/94" && [ "$(grep -c deaf-started "$TMP/94")" -ge 2 ]    && [ "$crash94" -eq 0 ]; then
+  ok "an unhealthy worker that ignores SIGTERM is SIGKILLed after stop_grace and restarted"
+else bad "unhealthy SIGKILL escalation" "exit $c (124 = never killed), kills=$(grep -c "ignored SIGTERM" "$TMP/94") starts=$(grep -c deaf-started "$TMP/94") crash_incidents=$crash94"; fi
+
+# 95. recycle: max_lifetime reached -> TERM (ignored) -> SIGKILL -> respawn.
+cat > "$TMP/95.toml" <<TOML
+stop_grace = "1s"
+[worker.bash]
+max_lifetime = "2s"
+TOML
+"$MANDOR" --config="$TMP/95.toml" -- "bash $TMP/deaf.sh" >"$TMP/95" 2>&1 &
+mpid=$!
+for _ in $(seq 1 80); do [ "$(grep -c deaf-started "$TMP/95")" -ge 2 ] && break; sleep 0.1; done
+kill -KILL "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+pkill -KILL -f "$TMP/deaf.sh" 2>/dev/null
+if grep -q "ignored SIGTERM" "$TMP/95" && [ "$(grep -c deaf-started "$TMP/95")" -ge 2 ]; then
+  ok "a recycled worker that ignores SIGTERM is SIGKILLed after stop_grace and respawned"
+else bad "recycle SIGKILL escalation" "kills=$(grep -c "ignored SIGTERM" "$TMP/95") starts=$(grep -c deaf-started "$TMP/95")"; fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"

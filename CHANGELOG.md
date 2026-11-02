@@ -17,6 +17,13 @@ versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/RO
   line reports the gap when the reader is back. Capture, incidents and the digest are unaffected.
 - **A stdout reader that goes away no longer kills mandor with SIGPIPE.** The write fails with
   EPIPE and supervision continues (every child still gets default SIGPIPE behavior).
+- **A worker mandor TERMs to restart it is SIGKILLed if it ignores the TERM.** An unhealthy
+  worker (3 failed probes) or one being recycled (`max_rss_mb` / `max_lifetime`) got SIGTERM and
+  nothing more: a wedged process that ignores TERM was TERMed again and again and never
+  restarted. Its group is now SIGKILLed once `stop_grace` passes, then the usual restart policy
+  applies. `health = "curl -fsS -m 5 http://…/healthz"` thereby force-kills a worker whose API
+  stops answering. A death that follows mandor's own health kill no longer files a second
+  incident (a `signal:SIGKILL` / `exit:143` beside the `unhealthy` one).
 - **One flooding worker can no longer starve the loop.** A pipe was drained until EAGAIN, which
   never comes when a worker writes faster than mandor parses; each drain now takes at most 1 MB
   before the loop serves everything else.

@@ -21,7 +21,7 @@ names stay safe in the Prometheus exposition format.
 | `workers = ["CMD", …]` | positional args | — | Worker command lines (tokenized by mandor; quotes supported, no shell) |
 | `backoff_max = "30s"` | — | `30s` | Exponential backoff cap (initial 200ms, ×2, reset after 10s stable uptime) |
 | `max_restarts = 3` | `--max-restarts=` | `0` | Retries for a **failed** worker. `0` = none (a failure ends the run), `-1` = forever. Clean exits are never retried |
-| `stop_grace = "10s"` | — | `10s` | TERM→KILL escalation window on shutdown |
+| `stop_grace = "10s"` | — | `10s` | TERM→KILL escalation window: on shutdown, and for a worker mandor TERMs to restart it (unhealthy, recycle) |
 | `state_dir = "/path"` | `--state-dir=` / `MANDOR_STATE_DIR` | `/var/lib/mandor` | State file + incident spool + history |
 | `metrics_port = 9464` | `--metrics=` | off | Prometheus text endpoint on 127.0.0.1 |
 | `photon = "127.0.0.1:4318"` | — / `PHOTON_OTLP_HTTP_ENDPOINT` | off | Ship incidents + metrics + lifecycle events + the warn/error digest to photon as OTLP; fully offline without it. `PHOTON_OTLP_HTTP_ENDPOINT` overrides the TOML value — a full URL or a bare `host:port`, mandor strips the scheme either way. Auth via `PHOTON_INGEST_TOKEN` env (photon's name for it; `PHOTON_OTLP_TOKEN` still read). See "photon telemetry" below |
@@ -246,7 +246,7 @@ essential = false   # a sidecar: its death should not take the app down
 
 | Key | Type | Meaning |
 |---|---|---|
-| `health` | string | Liveness probe command (exit 0 = healthy) |
+| `health` | string | Liveness probe command (exit 0 = healthy). 3 consecutive failures (a probe hung past 10s counts): an `unhealthy` incident and SIGTERM to the worker's group; still alive after `stop_grace` → SIGKILL. Then the usual restart policy. E.g. `"curl -fsS -m 5 http://127.0.0.1:8080/healthz"` to kill a worker whose API stops answering |
 | `start_after` | string | Start this worker once the named one is up (ready, or alive 1s); dead dependencies unblock |
 | `oneshot` | bool | Init task: runs first, gates all regular workers; failure aborts startup with its code. Never retried, and `essential` is rejected on it |
 | `essential` | bool | **Default `true`.** A failure that exhausts retries stops the fleet and propagates its code. Set `false` for a sidecar whose death should not end the run |
@@ -256,7 +256,7 @@ essential = false   # a sidecar: its death should not take the app down
 | `cap_drop` | string | `"NET_RAW,SYS_ADMIN"` or `"all"` — drop Linux capabilities from the bounding set; sets `no_new_privs` when a uid is also dropped |
 | `oom_score_adj` | int | Steer the kernel OOM killer (-1000..1000) |
 | `nice` | int | Scheduling niceness |
-| `max_rss_mb` | int | Recycle (graceful planned restart) beyond this RSS |
+| `max_rss_mb` | int | Recycle (graceful planned restart) beyond this RSS; SIGKILL if it ignores SIGTERM past `stop_grace` |
 | `max_lifetime` | duration string | Periodic recycle |
 | `expected_exit` | string | Exit codes that mean success for this worker — e.g. `"3"` for a job that reports "nothing to do". Default: only `0`. Per-worker only (v1.14) |
 | `health_interval` | duration string | Cadence of this worker's health probe. Default `30s`. Per-worker only (v1.14) |

@@ -382,6 +382,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
 
     // From here on PID 1 never waits on whoever reads its stdout/stderr.
     stdio.init();
+    restart_grace_ms = cfg.stop_grace_ms;
     tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
     tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
 
@@ -496,6 +497,7 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
         // Before computing the poll timeout so first probes schedule
         // immediately after a (re)spawn.
         if (!sd.active) runHealth(workers, state_dir, envp, path_env);
+        if (!sd.active) escalateTerms(workers, nowMs());
         // [prober.NAME] periodic checks: same non-blocking, poll-loop-driven
         // shape as health, but never touches a worker (see the module note
         // above runProbers).
@@ -511,6 +513,8 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
             wake_at = next_deadline;
         if (!sd.active) {
             for (workers) |*w| {
+                if (w.pid != 0 and w.term_deadline_ms != 0 and w.term_deadline_ms < wake_at)
+                    wake_at = w.term_deadline_ms;
                 if (!w.has_health or w.pid == 0) continue;
                 if (w.health_pid != 0) {
                     const to = w.health_started_ms + health_timeout_ms;
@@ -667,6 +671,35 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
 /// Planned recycling (pm2 max_memory_restart heritage): thresholds crossed
 /// ⇒ graceful TERM to the group; the death path sees `recycling` and
 /// restarts without counting failure or spooling an incident.
+/// stop_grace, copied at boot: how long a worker TERMed for a restart
+/// (unhealthy, recycle) gets before its group is KILLed.
+var restart_grace_ms: u64 = 10_000;
+
+/// TERM a worker's group so it restarts, and arm the KILL that follows if it
+/// does not exit within stop_grace. A wedged worker that ignores TERM was
+/// otherwise TERMed again and again and never restarted. A later TERM keeps
+/// the first deadline, so repeated probe failures cannot postpone the KILL.
+fn termForRestart(w: *spawner.Worker, now_ms: u64) void {
+    posix.kill(-w.pid, .TERM) catch {};
+    if (w.term_deadline_ms == 0) w.term_deadline_ms = now_ms +| restart_grace_ms;
+}
+
+/// KILL the group of every worker still alive past its restart deadline. The
+/// death path then restarts it as usual. Supervising only: a shutdown has its
+/// own stop-grace escalation.
+fn escalateTerms(workers: []spawner.Worker, now_ms: u64) void {
+    for (workers) |*w| {
+        if (w.pid <= 0 or w.term_deadline_ms == 0 or now_ms < w.term_deadline_ms) continue;
+        logmod.print("[mandor] {s} ignored SIGTERM for {d}ms, sending SIGKILL\n", .{
+            w.nameSlice(), restart_grace_ms,
+        });
+        w.term_deadline_ms = 0;
+        posix.kill(-w.pid, .KILL) catch {
+            posix.kill(w.pid, .KILL) catch {};
+        };
+    }
+}
+
 fn checkRecycle(w: *spawner.Worker, now_ms: u64) void {
     if (w.recycling) return;
     var reason: ?[]const u8 = null;
@@ -681,7 +714,7 @@ fn checkRecycle(w: *spawner.Worker, now_ms: u64) void {
     if (reason) |r| {
         logmod.print("[mandor] recycling {s}: {s}\n", .{ w.nameSlice(), r });
         w.recycling = true;
-        posix.kill(-w.pid, .TERM) catch {};
+        termForRestart(w, now_ms);
     }
 }
 
@@ -801,7 +834,7 @@ fn runHealth(
                     });
                     logmod.print("[mandor] {s} unhealthy, sending SIGTERM\n", .{w.nameSlice()});
                     w.health_killed = true;
-                    posix.kill(-w.pid, .TERM) catch {};
+                    termForRestart(w, now);
                 }
             }
         }
@@ -1296,6 +1329,10 @@ fn handleDeaths(
             clean = true; // planned recycling is never a failure
             w.final_code = 0;
         }
+        w.term_deadline_ms = 0; // it exited: no KILL pending
+        // mandor ended this one for failing its probe, and onUnhealthy already
+        // filed that incident: its death (TERM or the KILL after) is no news.
+        const ended_unhealthy = w.health_killed;
         if (w.health_killed) {
             // We killed it because its probe failed. That is a failure
             // whatever code it exited with — otherwise `expected_exit`
@@ -1345,7 +1382,7 @@ fn handleDeaths(
         var loop_detected = false;
         if (!sd.active and !clean) {
             w.det.recordDeath(now);
-            incident.onDeath(state_dir, workers, w, now, oom_hit);
+            if (!ended_unhealthy) incident.onDeath(state_dir, workers, w, now, oom_hit);
             if (w.det.restartLoopTriggered(now)) |count| {
                 incident.onRestartLoop(state_dir, workers, w, count, now);
                 loop_detected = true;
