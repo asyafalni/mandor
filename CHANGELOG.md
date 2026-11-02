@@ -3,6 +3,24 @@
 All notable changes to mandor. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions correspond to git tags. Planned work lives in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+### Fixed
+- **A stalled log reader no longer freezes PID 1.** mandor echoed worker output and its own
+  `[mandor]` lines with blocking writes. When whatever reads its stdout/stderr stalled
+  (containerd-shim, dockerd's log driver or journald, which run on the host and slow down under
+  memory pressure), the pipe filled and the supervision loop sat in `pipe_write`: no reaping, no
+  signal forwarding, no probes, no metrics, and workers blocked on their own output in turn.
+  Output now goes through private non-blocking handles (`/proc/self/fd/N` reopened, so fd 1/2
+  and the operator's terminal are untouched; `MSG_DONTWAIT` for a journald socket). What does
+  not fit is dropped and counted, and one `[mandor] output could not keep up: N line(s) dropped`
+  line reports the gap when the reader is back. Capture, incidents and the digest are unaffected.
+- **A stdout reader that goes away no longer kills mandor with SIGPIPE.** The write fails with
+  EPIPE and supervision continues (every child still gets default SIGPIPE behavior).
+- **One flooding worker can no longer starve the loop.** A pipe was drained until EAGAIN, which
+  never comes when a worker writes faster than mandor parses; each drain now takes at most 1 MB
+  before the loop serves everything else.
+
 ## [1.17.2] - 2026-10-13
 
 ### Fixed

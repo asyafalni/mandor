@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const logmod = @import("log.zig");
+const stdio = @import("out.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 const cli = @import("cli.zig");
@@ -379,6 +380,8 @@ pub fn run(cfg: *const cli.Config, state_dir: []const u8, environ: [:null]const 
     // never CSPRNG/mlock a fleet that will never start.
     if (initSecrets(cfg, workers)) |code| return code;
 
+    // From here on PID 1 never waits on whoever reads its stdout/stderr.
+    stdio.init();
     tty_out = if (posix.tcgetattr(1)) |_| true else |_| false;
     tty_err = if (posix.tcgetattr(2)) |_| true else |_| false;
 
@@ -1614,8 +1617,7 @@ var read_buf: [64 * 1024]u8 = undefined;
 
 fn flushEcho(ctx: *EchoCtx) void {
     if (echo_iov_n == 0) return;
-    const fd: usize = if (ctx.err) 2 else 1;
-    _ = linux.writev(@intCast(fd), &echo_iov, echo_iov_n);
+    stdio.writev(if (ctx.err) &stdio.err else &stdio.out, echo_iov[0..echo_iov_n]);
     echo_iov_n = 0;
     echo_used = 0;
 }
@@ -1683,7 +1685,15 @@ fn echoLine(ctx: *EchoCtx, text: []const u8, flags: u8) void {
     echo_used += p + 2 + text.len;
 }
 
-/// Drain a readable pipe until EAGAIN; on EOF flush partials and close.
+/// Most reads one drain of one pipe takes (16 × 64 KB = 1 MB) before handing
+/// the loop back. A worker that writes faster than mandor parses never lets
+/// its pipe run dry, so "drain until EAGAIN" alone would never return: the
+/// reaper, signals, probes and metrics starved behind one chatty worker. poll
+/// reports the pipe readable again next pass, so nothing is left unread.
+const max_reads_per_drain = 16;
+
+/// Drain a readable pipe until EAGAIN (or the per-pass cap); on EOF flush
+/// partials and close.
 fn readPipe(w: *spawner.Worker, is_err: bool) void {
     const fd = if (is_err) w.err_r else w.out_r;
     if (fd < 0) return;
@@ -1691,7 +1701,8 @@ fn readPipe(w: *spawner.Worker, is_err: bool) void {
     const base_flags: u8 = if (is_err) ring.flag_stderr else 0;
     var ctx: EchoCtx = .{ .w = w, .err = is_err, .t_ms = wallMs() };
     defer flushEcho(&ctx); // one writev per drained pipe
-    while (true) {
+    var reads: usize = 0;
+    while (reads < max_reads_per_drain) : (reads += 1) {
         const rc = linux.read(fd, &read_buf, read_buf.len);
         switch (posix.errno(rc)) {
             .SUCCESS => {},

@@ -1716,6 +1716,42 @@ if [ $dead -eq 0 ] && [ "$ms" -lt 4000 ] && [ -n "$gcpid" ] && ! kill -0 "$gcpid
 else bad "grandchild stop_grace bound" "exited=$([ $dead -eq 0 ] && echo y || echo n) after ${ms}ms, grandchild alive=$(kill -0 "$gcpid" 2>/dev/null && echo y || echo n)"
   kill -KILL "$mpid" 2>/dev/null; kill -KILL "$gcpid" 2>/dev/null; fi
 
+# 92. A stalled stdout reader must not freeze PID 1. mandor echoed worker output
+# with a blocking write: once the log driver stopped reading (it lives on the
+# host and stalls under memory pressure), the 64 KB pipe filled and mandor sat
+# in pipe_write: no reaping, no signals, no metrics. Echo is now non-blocking
+# and drop-counted; supervision carries on, and a notice reports the gap.
+d92="$TMP/92"; mkdir -p "$d92"; rm -f "$d92/out"; mkfifo "$d92/out"
+cat "$d92/out" > "$d92/log" &
+cpid=$!
+"$MANDOR" --metrics=19492 --state-dir="$d92/st" -- \
+  "sh -c 'sleep 1; yes spam-line | head -c 20000000; while :; do echo tick; sleep 0.2; done'" \
+  "sh -c 'sleep 3; exit 0'" \
+  > "$d92/out" 2>"$d92/err" &
+mpid=$!
+sleep 0.5
+kill -STOP "$cpid"
+sleep 5   # flood fills the pipe at ~1s; worker 2 exits (cleanly) at 3s
+code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' http://127.0.0.1:19492/metrics)
+zomb=$(ps -o stat= --ppid "$mpid" 2>/dev/null | grep -c Z)
+kill -CONT "$cpid"
+sleep 1   # worker 1 keeps ticking: the next line carries the drop notice
+kill -TERM "$mpid" 2>/dev/null; wait_dead "$mpid"
+kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+if [ "$code" = "200" ] && [ "$zomb" -eq 0 ] && grep -q "dropped" "$d92/log"; then
+  ok "a stalled stdout reader does not freeze supervision (metrics up, exits reaped, drops reported)"
+else bad "stalled stdout" "metrics=$code zombies=$zomb notice=$(grep -c dropped "$d92/log")"
+  kill -KILL "$mpid" 2>/dev/null; fi
+
+# 93. A stdout reader that goes away must not kill PID 1 with SIGPIPE: the
+# write fails with EPIPE, the output is dropped, supervision continues.
+set +o pipefail 2>/dev/null
+"$MANDOR" "sh -c 'yes x | head -c 200000; sleep 1; exit 5'" 2>"$TMP/93err" | head -c 1 >/dev/null
+c93=${PIPESTATUS[0]}
+if [ "$c93" -eq 5 ]; then
+  ok "a closed stdout does not kill mandor (worker's exit 5 propagates)"
+else bad "closed stdout" "mandor exit $c93 (141 = killed by SIGPIPE)"; fi
+
 echo
 if [ $fail -ne 0 ]; then
   echo "failing cases:"
